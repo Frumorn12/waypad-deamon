@@ -10,6 +10,7 @@ pub struct Config {
     pub control_port: u16,
     pub discovery_port: u16,
     pub require_private_lan: bool,
+    pub allow_public_pairing: bool,
     pub state_dir: PathBuf,
     pub pairing_code_ttl_seconds: u64,
     pub max_pair_attempts_per_minute: u32,
@@ -24,6 +25,7 @@ impl Default for Config {
             control_port: 47771,
             discovery_port: 47770,
             require_private_lan: true,
+            allow_public_pairing: false,
             state_dir: default_state_dir(),
             pairing_code_ttl_seconds: 300,
             max_pair_attempts_per_minute: 5,
@@ -91,6 +93,7 @@ mod tests {
     fn default_config_is_lan_only() {
         let config = Config::default();
         assert!(config.require_private_lan);
+        assert!(!config.allow_public_pairing);
         assert_eq!(config.control_port, 47771);
         assert!(!config.allow_suspend);
     }

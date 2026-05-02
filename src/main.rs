@@ -66,6 +66,7 @@ fn invite_command(config: &Config, paths: &StatePaths, trailing: &[String]) -> a
     let mut qr = false;
     let mut address: Option<String> = None;
     let mut remote_address: Option<String> = None;
+    let mut allow_public_pairing = config.allow_public_pairing;
     let mut port = config.control_port;
     let mut ttl = config.pairing_code_ttl_seconds;
     let mut args = trailing.iter();
@@ -74,6 +75,7 @@ fn invite_command(config: &Config, paths: &StatePaths, trailing: &[String]) -> a
             "--qr" => qr = true,
             "--address" => address = args.next().cloned(),
             "--remote-address" => remote_address = args.next().cloned(),
+            "--allow-public-pairing" => allow_public_pairing = true,
             "--port" => {
                 port = args
                     .next()
@@ -93,10 +95,16 @@ fn invite_command(config: &Config, paths: &StatePaths, trailing: &[String]) -> a
     invite_config.pairing_code_ttl_seconds = ttl.clamp(30, 900);
     let code = create_pairing_code(&invite_config, paths)?;
     let local_address = address.unwrap_or_else(default_invite_address);
-    let route = if remote_address.is_some() {
-        "direct-public"
+    let (route, policy) = if remote_address.is_some() {
+        let can_pair_publicly = !config.require_private_lan || allow_public_pairing;
+        let policy = if can_pair_publicly {
+            "public-pairing"
+        } else {
+            "public-reconnect"
+        };
+        ("direct-public", policy)
     } else {
-        "direct-lan"
+        ("direct-lan", "lan-only")
     };
     let payload = invite_payload(
         &discovery_hostname(),
@@ -107,6 +115,8 @@ fn invite_command(config: &Config, paths: &StatePaths, trailing: &[String]) -> a
         &code.code,
         code.expires_at,
         route,
+        policy,
+        allow_public_pairing,
     );
     println!(
         "Waypad invite expires at unix timestamp: {}",
@@ -119,10 +129,30 @@ fn invite_command(config: &Config, paths: &StatePaths, trailing: &[String]) -> a
     } else {
         println!("Run `waypad-daemon invite --qr` to print a terminal QR code.");
     }
-    if remote_address.is_some() && config.require_private_lan {
-        println!(
-            "Warning: config require_private_lan=true rejects public mobile-data clients. Set it to false only if this port is protected by pairing and firewall policy."
-        );
+    if remote_address.is_some() {
+        let can_pair_publicly = !config.require_private_lan || allow_public_pairing;
+        if !can_pair_publicly {
+            println!();
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!(" REMOTE PAIRING IS CURRENTLY BLOCKED");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            println!("This QR contains a public endpoint, but the daemon config blocks");
+            println!("pairing from public networks (require_private_lan=true and");
+            println!("allow_public_pairing=false).");
+            println!();
+            println!("Options to enable outside-LAN pairing:");
+            println!("  1) Edit ~/.config/waypad-daemon/config.json and set");
+            println!("     allow_public_pairing=true  (keeps LAN-only for reconnect).");
+            println!("  2) Set require_private_lan=false to allow all public traffic.");
+            println!();
+            println!("Only do this if TCP/{} is port-forwarded and protected by your", port);
+            println!("firewall. Pairing still requires the one-time 6-digit code.");
+            println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        } else {
+            println!();
+            println!("Remote pairing enabled for this invite. Ensure TCP/{} is reachable", port);
+            println!("from the internet and that your firewall restricts it appropriately.");
+        }
     }
     Ok(())
 }
@@ -136,6 +166,8 @@ fn invite_payload(
     code: &str,
     expires: u64,
     route: &str,
+    policy: &str,
+    allow_public_pairing: bool,
 ) -> String {
     let primary_address = remote_address.unwrap_or(address);
     let mut query = vec![
@@ -148,6 +180,8 @@ fn invite_payload(
         ("code", code.to_string()),
         ("expires", expires.to_string()),
         ("route", route.to_string()),
+        ("policy", policy.to_string()),
+        ("public_pairing_allowed", allow_public_pairing.to_string()),
     ];
     if let Some(remote) = remote_address {
         query.push(("remote_address", remote.to_string()));
@@ -306,6 +340,8 @@ fn print_help() {
   serve                         Run the daemon
   pair-code                     Create a local one-time pairing code
   invite [--qr]                 Create a waypad:// invite; add --remote-address host for mobile data
+  invite [--qr --allow-public-pairing --remote-address <host>]
+                                Allow public-network pairing for this invite
   doctor                        Print Wayland, portal, and backend diagnostics
   devices list                  List trusted Android devices
   devices revoke <device-id>    Revoke a trusted Android device
@@ -333,6 +369,8 @@ mod tests {
             "123456",
             99,
             "direct-public",
+            "public-pairing",
+            true,
         );
 
         assert!(payload.starts_with("waypad://invite?"));
@@ -341,6 +379,8 @@ mod tests {
         assert!(payload.contains("remote_address=203.0.113.10"));
         assert!(payload.contains("code=123456"));
         assert!(payload.contains("fingerprint=aa%3Abb"));
+        assert!(payload.contains("policy=public-pairing"));
+        assert!(payload.contains("public_pairing_allowed=true"));
     }
 
     #[test]

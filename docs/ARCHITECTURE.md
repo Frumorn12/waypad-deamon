@@ -66,20 +66,23 @@ Absolute pointer control uses the existing input abstraction. Hyprland maps sour
 The daemon binds to LAN by default but still treats the LAN as hostile:
 
 - Unknown clients only receive a signed handshake.
-- Pairing requires a local one-time code.
+- Pairing requires a local one-time code, rate-limited per IP.
 - Commands require authentication.
 - Device tokens can be revoked.
 - Host key rotation invalidates existing trust.
-- Public internet source addresses are rejected when `require_private_lan` is enabled.
+- Pairing from public internet source addresses is rejected when
+  `require_private_lan=true` and `allow_public_pairing=false`.
+- **Already-paired devices can reconnect from any IP** because they hold
+  cryptographically strong session tokens.
 
 QR invites are expiring pairing helpers, not permanent credentials. The
 `invite` command creates a normal one-time pairing code, embeds it in a
 `waypad://invite` payload with the host fingerprint, endpoint hints, port,
-route, and expiry, and optionally prints it as an ANSI terminal QR. When a
-remote endpoint is supplied, the payload includes both `remote_address` and
-`lan_address`; Android can try the public/direct endpoint first and then fall
-back to LAN. The app still verifies the signed daemon handshake and pins the
-host key before trusting the connection.
+route, expiry, and pairing policy (`lan-only`, `public-pairing`, or
+`public-reconnect`). When a remote endpoint is supplied, the payload includes
+both `remote_address` and `lan_address`; Android can try the public/direct
+endpoint first and then fall back to LAN. The app still verifies the signed
+daemon handshake and pins the host key before trusting the connection.
 
 ## Connectivity Model
 
@@ -88,11 +91,16 @@ Current builds support direct TCP connectivity:
 - LAN direct through discovery, manual IP entry, or `waypad-daemon invite --qr`.
 - Public direct through `waypad-daemon invite --qr --remote-address <host>` when
   the user intentionally exposes TCP `47771`.
+- Pairing from public IPs is allowed only when the user explicitly opts in
+  (`allow_public_pairing=true` or `require_private_lan=false`).
+- Reconnection from public IPs is always allowed for already-paired devices;
+  token authentication is the security boundary, not source IP.
 
-The daemon reports this in `capabilities.connectivity`. It also explicitly
-reports that relay, signaling, STUN, and TURN are not available. That keeps
-outside-LAN behavior honest: port forwarding or a VPN can work today, but
-automatic NAT traversal requires a future WebRTC/ICE/TURN backend.
+The daemon reports this in `capabilities.connectivity`, including
+`public_pairing_allowed`. It also explicitly reports that relay, signaling,
+STUN, and TURN are not available. That keeps outside-LAN behavior honest: port
+forwarding or a VPN can work today, but automatic NAT traversal requires a
+future WebRTC/ICE/TURN backend.
 
 ## Service Model
 

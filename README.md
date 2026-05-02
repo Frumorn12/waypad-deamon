@@ -162,6 +162,7 @@ Example:
   "control_port": 47771,
   "discovery_port": 47770,
   "require_private_lan": true,
+  "allow_public_pairing": false,
   "state_dir": "",
   "pairing_code_ttl_seconds": 300,
   "max_pair_attempts_per_minute": 5,
@@ -169,6 +170,9 @@ Example:
   "log_level": "info"
 }
 ```
+
+- `require_private_lan`: When `true`, already-paired devices can reconnect from any network, but **new pairing from public IPs is blocked**. This is the safe default.
+- `allow_public_pairing`: When `true`, the daemon accepts new pairing attempts from public IPs (mobile data) as long as the one-time pairing code is correct. Only enable this when your port is forwarded and protected by a firewall.
 
 If `state_dir` is empty, the daemon uses:
 
@@ -208,9 +212,11 @@ waypad-daemon invite --qr
 
 Scan the QR with the Android app's in-app scanner or paste the printed
 `waypad://invite?...` payload. The invite embeds the host fingerprint, endpoint
-hints, port, one-time pairing code, route type, and expiry. By default the
-daemon chooses the LAN source address from the active IPv4 route; override it
-with `--address` if the phone must use a different interface.
+hints, port, one-time pairing code, route type, expiry, and pairing policy.
+By default the daemon chooses the LAN source address from the active IPv4 route;
+override it with `--address` if the phone must use a different interface.
+
+### Remote / mobile-data pairing
 
 For a mobile-data/direct-public test, expose TCP `47771` through your firewall
 or router and generate:
@@ -219,16 +225,36 @@ or router and generate:
 waypad-daemon invite --qr --remote-address your-public-hostname.example
 ```
 
-This is still direct TCP, not a relay. If `require_private_lan` is true, public
-source addresses are rejected after pairing, so set it to false only when the
-port is intentionally exposed and protected by pairing, host-key pinning, and a
-reasonable firewall policy.
+The QR now contains **both** the public endpoint (`address` / `remote_address`)
+and the LAN endpoint (`lan_address`). The Android app tries the public endpoint
+first, then falls back to the LAN endpoint, so one QR works on mobile data
+and on the same Wi-Fi.
 
-When `--remote-address` is provided, the QR contains both the public endpoint
-and the LAN endpoint. Current Android clients try the public endpoint first and
-fall back to the LAN endpoint, so one QR can bootstrap both mobile-data and
-same-Wi-Fi direct connections. Full automatic NAT traversal still requires a
-future signaling/WebRTC/ICE/TURN backend.
+Pairing policy depends on daemon config:
+
+| `require_private_lan` | `allow_public_pairing` | Result for public IPs |
+|---|---|---|
+| `true` (default) | `false` (default) | **Pairing blocked.** Public clients can reconnect if already paired, but cannot pair for the first time. The QR policy will be `public-reconnect`. |
+| `true` | `true` | **Pairing allowed.** Public clients can pair using the one-time 6-digit code. The QR policy will be `public-pairing`. |
+| `false` | any | **All traffic allowed.** Public clients can pair and reconnect freely. |
+
+To enable outside-LAN pairing safely, pick one of these options:
+
+1. **Recommended** (keeps LAN-only restriction for reconnection):
+   ```bash
+   waypad-daemon write-sample-config
+   # edit ~/.config/waypad-daemon/config.json
+   # set "allow_public_pairing": true
+   # restart the daemon
+   ```
+2. **Legacy** (allows all public traffic):
+   ```bash
+   # set "require_private_lan": false
+   ```
+
+Only do this if TCP `47771` is port-forwarded and protected by a firewall.
+Pairing still requires the one-time 6-digit code, and all traffic is encrypted.
+Full automatic NAT traversal still requires a future WebRTC/ICE/TURN backend.
 
 ## Device Management
 
@@ -246,7 +272,8 @@ Supported:
 
 - Linux host on Wayland.
 - Hyprland/wlroots environments with working xdg-desktop-portal RemoteDesktop support.
-- LAN Android control plus explicit direct-public endpoint bootstrap through QR invites.
+- LAN Android control via discovery or QR invite.
+- **Remote (mobile data) QR invites with explicit config:** When `allow_public_pairing=true` or `require_private_lan=false`, new devices can pair over the internet through a port-forwarded TCP `47771`. When `require_private_lan=true` (default), already-paired devices can reconnect from any network, but new pairing from public IPs is blocked.
 - Pointer, clicks, scroll, keysyms, text, shortcuts, media, volume, brightness, clipboard set, lock.
 - External mouse and keyboard devices connected to the Android phone when the Android app is in Pad or Screen mode.
 - External Android controllers/gamepads through a Linux `uinput` virtual gamepad when `/dev/uinput` is available to the daemon user.

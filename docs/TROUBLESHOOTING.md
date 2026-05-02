@@ -149,22 +149,68 @@ The QR payload should contain the `src` address from that route, not
 waypad-daemon invite --qr --address 192.168.0.184
 ```
 
-For mobile-data testing, expose the daemon's TCP port intentionally and provide
-the reachable public endpoint:
+For mobile-data/outside-LAN pairing, expose the daemon's TCP port intentionally
+and provide the reachable public endpoint:
 
 ```bash
 waypad-daemon invite --qr --remote-address your-public-hostname.example
 ```
 
 This is direct TCP. The daemon does not provide a relay, STUN, TURN, or automatic
-ICE traversal yet. If `require_private_lan` is true, public clients are rejected
-even if they have a valid invite.
+ICE traversal yet.
+
+### Pairing policy on the QR
+
+The QR now includes a `policy` field that tells the Android app whether remote
+pairing is actually allowed:
+
+- `lan-only` — the QR has no public endpoint. Works only on the same network.
+- `public-pairing` — the QR has a public endpoint and the daemon is configured
+to accept new pairing attempts from public IPs (`allow_public_pairing=true` or
+`require_private_lan=false`).
+- `public-reconnect` — the QR has a public endpoint, but the daemon currently
+**blocks new pairing from public IPs** (`require_private_lan=true` and
+`allow_public_pairing=false`). Already-paired devices can still reconnect from
+mobile data, but a new phone scanning this QR will be rejected with a clear
+error.
+
+### Fixing "Remote pairing blocked by host policy"
+
+If the Android app shows this error after scanning a QR on mobile data, the
+daemon config is blocking public pairing. Choose one fix:
+
+**Option A — Recommended (keeps LAN-only restriction for reconnection):**
+```bash
+# edit ~/.config/waypad-daemon/config.json
+# add or set:
+#   "allow_public_pairing": true
+systemctl --user restart waypad-daemon
+```
+
+**Option B — Legacy (allows all public traffic):**
+```bash
+# edit ~/.config/waypad-daemon/config.json
+# set:
+#   "require_private_lan": false
+systemctl --user restart waypad-daemon
+```
+
+Only do this if TCP `47771` is port-forwarded and protected by your firewall.
+Pairing still requires the one-time 6-digit code, and all traffic is encrypted.
 
 With `--remote-address`, the QR also includes `lan_address`. Android clients try
 the public/direct endpoint first and then the LAN endpoint, so the same QR is
 usable when the phone is on mobile data or on the same Wi-Fi. If both fail, the
 advertised endpoint is unreachable or the daemon is rejecting that source
 address.
+
+## "Remote pairing blocked by host policy"
+
+See the section above [QR Invite Shows 127.0.0.1 Or The Phone Cannot Connect].
+The daemon is correctly telling the Android app that it refuses new pairing
+from public networks. Either pair while on the same LAN, or set
+`allow_public_pairing=true` in the daemon config after ensuring your firewall
+restricts TCP `47771` appropriately.
 
 ## 60 FPS Setting Does Not Seem To Apply
 

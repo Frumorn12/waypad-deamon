@@ -50,6 +50,7 @@ pub struct ExternalInputCapability {
 pub struct ConnectivityCapability {
     pub lan_direct: bool,
     pub public_direct: bool,
+    pub public_pairing_allowed: bool,
     pub relay: bool,
     pub signaling: bool,
     pub stun: bool,
@@ -244,6 +245,7 @@ impl Capabilities {
             connectivity: ConnectivityCapability {
                 lan_direct: true,
                 public_direct: !config.require_private_lan,
+                public_pairing_allowed: !config.require_private_lan || config.allow_public_pairing,
                 relay: false,
                 signaling: false,
                 stun: false,

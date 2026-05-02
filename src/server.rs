@@ -133,10 +133,6 @@ pub async fn run(config: Config, paths: StatePaths, identity: HostIdentity) -> a
     info!("Waypad daemon listening on tcp://{bind}");
     loop {
         let (stream, peer) = listener.accept().await?;
-        if config.require_private_lan && !is_private_or_local(peer) {
-            warn!(%peer, "rejecting connection from non-local address");
-            continue;
-        }
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_connection(stream, peer, state).await {
@@ -290,6 +286,23 @@ async fn handle_pair(
                     "rate_limited",
                     "Too many pairing attempts; wait one minute",
                     true,
+                ),
+            ),
+            None,
+        );
+    }
+    if state.config.require_private_lan
+        && !state.config.allow_public_pairing
+        && !is_private_or_local(peer)
+    {
+        warn!(%peer, "rejecting public pairing attempt because require_private_lan=true and allow_public_pairing=false");
+        return (
+            response_error(
+                request_id,
+                ApiError::new(
+                    "public_pairing_denied",
+                    "This host blocks pairing from public networks. To pair remotely, the host admin must set allow_public_pairing=true or require_private_lan=false in the daemon config.",
+                    false,
                 ),
             ),
             None,
