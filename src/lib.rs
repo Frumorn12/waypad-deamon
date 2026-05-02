@@ -2,6 +2,7 @@ pub mod capability;
 pub mod config;
 pub mod crypto;
 pub mod discovery;
+pub mod gamepad;
 pub mod input;
 pub mod platform;
 pub mod protocol;

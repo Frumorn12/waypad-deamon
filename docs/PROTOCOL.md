@@ -164,9 +164,9 @@ The Android client forwards hardware devices connected to the phone with:
 | `pointer_button` | Left/middle/right button through the active backend. |
 | `pointer_scroll` | Smooth scroll through the active backend. |
 | `keyboard_key` | XKB keysym press/release through the active backend. |
-| `controller_button` / `controller_axis` | Parsed and rejected with an explicit unsupported error unless a future backend adds virtual gamepad injection. |
+| `controller_button` / `controller_axis` | Sent to the Linux `uinput` virtual gamepad backend when `external_input.controller` is true. |
 
-`get_capabilities` includes `external_input.pointer`, `external_input.keyboard`, and `external_input.controller`. Pointer and keyboard follow the current input backend. Controller is currently `false` on Wayland portal and Hyprland IPC because neither exposes a compositor-agnostic gamepad injection API.
+`get_capabilities` includes `external_input.pointer`, `external_input.keyboard`, and `external_input.controller`. Pointer and keyboard follow the current input backend. Controller support is independent and reflects whether the daemon user can open `/dev/uinput`; current Wayland portal and Hyprland IPC APIs do not provide generic gamepad injection themselves.
 
 ## Screen Sources
 

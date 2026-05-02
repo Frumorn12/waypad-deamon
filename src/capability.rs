@@ -1,5 +1,8 @@
-use crate::platform::{
-    SessionInfo, command_exists, command_output, detect_session, hyprland_ipc_available,
+use crate::{
+    gamepad::detect_virtual_gamepad_support,
+    platform::{
+        SessionInfo, command_exists, command_output, detect_session, hyprland_ipc_available,
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +87,7 @@ impl Capabilities {
             && session.compositor_hint == "hyprland"
             && hyprland_ipc_available();
         let input_supported = portal_input_supported || hyprland_ipc_fallback;
+        let (controller_supported, controller_reason) = detect_virtual_gamepad_support();
         let (input_backend, requires_user_approval, input_reason) = if !wayland {
             (
                 "noop",
@@ -211,19 +215,17 @@ impl Capabilities {
             external_input: ExternalInputCapability {
                 pointer: input_supported,
                 keyboard: input_supported,
-                controller: false,
-                backend: if input_supported {
+                controller: controller_supported,
+                backend: if input_supported && controller_supported {
+                    format!("{input_backend}+uinput")
+                } else if controller_supported {
+                    "uinput".into()
+                } else if input_supported {
                     input_backend.into()
                 } else {
                     "noop".into()
                 },
-                reason: Some(if input_supported {
-                    "Android external mouse and keyboard events are forwarded through the active pointer/keyboard input backend. Generic controller injection is not exposed by the current Wayland portal/Hyprland IPC backends."
-                        .into()
-                } else {
-                    "External input forwarding requires a supported pointer/keyboard input backend on the host."
-                        .into()
-                }),
+                reason: Some(external_input_reason(input_supported, &controller_reason)),
             },
             capture: CaptureCapability {
                 supported: capture_supported,
@@ -247,6 +249,17 @@ impl Capabilities {
                 suspend: allow_suspend && command_exists("systemctl"),
             },
         }
+    }
+}
+
+fn external_input_reason(input_supported: bool, controller_reason: &str) -> String {
+    match input_supported {
+        true => format!(
+            "Android external mouse and keyboard events are forwarded through the active pointer/keyboard input backend. {controller_reason}"
+        ),
+        false => format!(
+            "External mouse/keyboard forwarding requires a supported pointer/keyboard input backend on the host. {controller_reason}"
+        ),
     }
 }
 

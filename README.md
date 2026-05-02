@@ -210,6 +210,7 @@ Supported:
 - LAN-only Android control.
 - Pointer, clicks, scroll, keysyms, text, shortcuts, media, volume, brightness, clipboard set, lock.
 - External mouse and keyboard devices connected to the Android phone when the Android app is in Pad or Screen mode.
+- External Android controllers/gamepads through a Linux `uinput` virtual gamepad when `/dev/uinput` is available to the daemon user.
 - Remote screen viewing through ScreenCast/PipeWire where portal streaming works.
 - Hyprland monitor viewing through an isolated `grim` fallback when portal streaming dependencies are incomplete.
 
@@ -219,7 +220,7 @@ Unsupported in MVP:
 - Root `/dev/uinput` bypass as the default backend.
 - Internet exposure or cloud relay.
 - End-to-end encrypted media stream separate from the encrypted control channel.
-- Generic virtual controller/gamepad injection on Wayland. The protocol and Android capture path exist, but current Wayland RemoteDesktop and Hyprland IPC backends do not expose a safe compositor-agnostic gamepad injection mechanism.
+- Controller forwarding when the host does not expose writable `/dev/uinput` to the daemon user.
 - WebRTC/H.264 transport, TURN, and adaptive bitrate.
 - iOS client.
 
@@ -242,6 +243,8 @@ waypad-daemon doctor
 If the daemon reports `RemoteDesktop portal not available`, the portal-safe input path cannot work until the portal/compositor stack supports it. On Hyprland, Waypad falls back to the compositor IPC socket for practical local-session input.
 
 On Hyprland, Waypad can expose the `hyprland-ipc` backend. It moves the cursor through Hyprland IPC, sends mouse button hold/release with `sendkeystate`, maps scroll to compositor mouse wheel shortcuts, and injects normal ASCII text as key events. Unsupported characters fall back to writing the requested text to `wl-copy` and sending `CTRL+V` to the active window. This keeps the daemon session-scoped and avoids root/uinput hacks, but the fallback paste path temporarily replaces the Wayland clipboard.
+
+Controller forwarding is different from pointer/keyboard forwarding: Wayland portals and Hyprland IPC do not expose a generic gamepad injection API, so the daemon creates a normal Linux virtual gamepad with `uinput`. The daemon still runs as the user session; it just needs permission to open `/dev/uinput`. On systems where that node is unavailable or restricted, `waypad-daemon doctor` reports `external_input.controller = false` with the exact reason.
 
 For remote screen mode, check the `capture` section in `waypad-daemon doctor`. Standard Wayland capture uses XDG Desktop Portal ScreenCast plus PipeWire and GStreamer. Hyprland systems can also expose monitor sources through the `hyprland-grim` fallback. If capture works but input fails, use screen viewing read-only or switch to Pad mode until RemoteDesktop or Hyprland IPC input is available.
 

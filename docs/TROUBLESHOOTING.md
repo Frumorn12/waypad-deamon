@@ -88,9 +88,19 @@ journalctl --user -u waypad-daemon -f
 
 `external_input.pointer` and `external_input.keyboard` follow the normal input backend. If they are false, fix RemoteDesktop portal approval or the Hyprland IPC fallback first. If Android logs show `external_input_unsupported`, the host is explicitly rejecting that class rather than dropping it silently.
 
-## Controller Or Gamepad Forwarding Is Unsupported
+## Controller Or Gamepad Forwarding Does Not Work
 
-Android controller detection and protocol transport are implemented, but this daemon currently reports `external_input.controller = false`. Wayland RemoteDesktop portal methods and the Hyprland IPC fallback do not provide a generic virtual gamepad injection path. This is a host backend limitation, not an Android detection issue. Future libei or compositor-specific support can be added behind the existing `external_input` command.
+Android controller detection and protocol transport are implemented. The host-side injection path uses Linux `uinput`, so first check:
+
+```bash
+waypad-daemon doctor | grep -A8 external_input
+ls -l /dev/uinput
+journalctl --user -u waypad-daemon -f
+```
+
+If `external_input.controller = true`, open the remote screen in Waypad, keep the Android app focused/fullscreen, and press a controller button. The daemon should log that an Android controller attached to the virtual gamepad, and browser tests such as `hardwaretester.com/gamepad` should see `Waypad Android Virtual Gamepad` on the PC.
+
+If `external_input.controller = false`, the reason usually says `/dev/uinput` is missing or not writable. Load the `uinput` kernel module and add a udev rule or group policy that allows the Waypad user to open `/dev/uinput`; do not run the whole daemon as root just for controller support. After changing permissions, restart `waypad-daemon`.
 
 ## Android Reports "Connection Closed" Or "Broken Pipe"
 

@@ -1016,6 +1016,7 @@ dependencies = [
  "base64",
  "futures-util",
  "hex",
+ "libc",
  "ring",
  "serde",
  "serde_json",

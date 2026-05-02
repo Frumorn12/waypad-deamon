@@ -34,7 +34,9 @@ The daemon also detects whether RemoteDesktop version 2 may expose `ConnectToEIS
 
 When Hyprland is detected and the RemoteDesktop portal is missing, the daemon can use a `hyprland-ipc` backend. This talks to Hyprland's user-session IPC socket, not root/uinput, and is isolated behind the same `InputManager` abstraction as the portal backend. It supports cursor movement, mouse button state, scroll wheel events, shortcuts, and direct ASCII text events. Unsupported text falls back to `wl-copy` paste, so only that fallback path temporarily replaces the Wayland clipboard.
 
-External Android mouse and keyboard devices use the same input abstraction as touchpad and remote-screen input. The protocol keeps Android device metadata and normalized event types, but host-side pointer and keyboard events still terminate in RemoteDesktop portal methods or the Hyprland IPC fallback. Controller/gamepad events are parsed and routed to an explicit unsupported response today because neither backend provides a safe generic virtual gamepad device. A future libei or compositor-specific backend can attach at that `external_input` routing point without changing Android device detection.
+External Android mouse and keyboard devices use the same input abstraction as touchpad and remote-screen input. The protocol keeps Android device metadata and normalized event types, but host-side pointer and keyboard events still terminate in RemoteDesktop portal methods or the Hyprland IPC fallback.
+
+Controller/gamepad forwarding uses a separate Linux `uinput` backend because current Wayland RemoteDesktop portal methods and the Hyprland IPC fallback do not expose a generic virtual gamepad injection API. When `/dev/uinput` is writable by the daemon user, controller buttons and axes are mapped to a standard "Waypad Android Virtual Gamepad" device using Linux `BTN_*` and `ABS_*` codes. This is intentionally isolated from pointer/keyboard injection so Wayland portal behavior remains compositor-scoped while gamepad support uses the kernel input API that browser Gamepad APIs already understand.
 
 ## Remote Screen Strategy
 

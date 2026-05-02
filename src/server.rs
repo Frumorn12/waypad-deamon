@@ -3,6 +3,7 @@ use crate::{
     config::Config,
     crypto::{HostIdentity, SecureChannel},
     discovery,
+    gamepad::ControllerInputManager,
     input::InputManager,
     protocol::{
         ApiError, ClientSecureMessage, Command, ExternalDeviceType, ExternalInputEvent,
@@ -38,6 +39,7 @@ pub struct AppState {
     pub identity: Arc<HostIdentity>,
     pub devices: Arc<Mutex<TrustedDevices>>,
     pub input: Arc<Mutex<InputManager>>,
+    pub gamepad: Arc<Mutex<ControllerInputManager>>,
     pub capabilities: Arc<RwLock<Capabilities>>,
     pub screen: Arc<ScreenManager>,
     pub rate_limiter: Arc<Mutex<PairRateLimiter>>,
@@ -67,10 +69,33 @@ impl PairRateLimiter {
     }
 }
 
+fn controller_manager_from_capabilities(capabilities: &Capabilities) -> ControllerInputManager {
+    ControllerInputManager::new(
+        capabilities.external_input.controller,
+        capabilities
+            .external_input
+            .reason
+            .clone()
+            .unwrap_or_else(|| "Controller forwarding unsupported on this host".into()),
+    )
+}
+
+async fn refresh_controller_manager(state: &AppState, capabilities: &Capabilities) {
+    state.gamepad.lock().await.refresh(
+        capabilities.external_input.controller,
+        capabilities
+            .external_input
+            .reason
+            .clone()
+            .unwrap_or_else(|| "Controller forwarding unsupported on this host".into()),
+    );
+}
+
 pub async fn run(config: Config, paths: StatePaths, identity: HostIdentity) -> anyhow::Result<()> {
     let devices = load_trusted_devices(&paths)?;
     let capabilities = Capabilities::detect(config.allow_suspend).await;
     let input = InputManager::from_capabilities(&capabilities).await;
+    let gamepad = controller_manager_from_capabilities(&capabilities);
     let capabilities = Arc::new(RwLock::new(capabilities.clone()));
     let screen = Arc::new(ScreenManager::new(
         capabilities.clone(),
@@ -83,6 +108,7 @@ pub async fn run(config: Config, paths: StatePaths, identity: HostIdentity) -> a
         identity: identity.clone(),
         devices: Arc::new(Mutex::new(devices)),
         input: Arc::new(Mutex::new(input)),
+        gamepad: Arc::new(Mutex::new(gamepad)),
         capabilities: capabilities.clone(),
         screen,
         rate_limiter: Arc::new(Mutex::new(PairRateLimiter::default())),
@@ -402,6 +428,7 @@ async fn handle_command(
             Command::GetCapabilities => {
                 let capabilities = Capabilities::detect(state.config.allow_suspend).await;
                 *state.capabilities.write().await = capabilities.clone();
+                refresh_controller_manager(state, &capabilities).await;
                 Ok(Some(json!(capabilities)))
             }
             Command::PrepareInput => {
@@ -411,6 +438,7 @@ async fn handle_command(
                     Err(first_error) => {
                         let capabilities = Capabilities::detect(state.config.allow_suspend).await;
                         *state.capabilities.write().await = capabilities.clone();
+                        refresh_controller_manager(state, &capabilities).await;
                         *input = InputManager::from_capabilities(&capabilities).await;
                         input.prepare().await.map(Some).map_err(|second_error| {
                             anyhow::anyhow!("{first_error}; after refresh: {second_error}")
@@ -520,10 +548,20 @@ async fn handle_external_input(
                 ?classes,
                 "android external input device connected"
             );
+            if is_controller_device(&device_type) || classes.iter().any(is_controller_device) {
+                state
+                    .gamepad
+                    .lock()
+                    .await
+                    .device_connected(&device_id, &name)?;
+            }
             Ok(())
         }
         ExternalInputEvent::DeviceDisconnected => {
             info!(%device_id, ?device_type, "android external input device disconnected");
+            if is_controller_device(&device_type) {
+                state.gamepad.lock().await.device_disconnected(&device_id)?;
+            }
             Ok(())
         }
         ExternalInputEvent::PointerMove { dx, dy } => {
@@ -546,19 +584,24 @@ async fn handle_external_input(
             state.input.lock().await.key(keysym, st).await
         }
         ExternalInputEvent::ControllerButton { button, state: st } => {
-            anyhow::bail!(
-                "Controller forwarding unsupported on this host backend: button={button} state={st:?}. Wayland RemoteDesktop and the Hyprland IPC fallback do not expose a generic virtual gamepad injection path yet."
-            )
+            debug!(%device_id, ?device_type, %button, ?st, "android external controller button");
+            state.gamepad.lock().await.button(&button, st)
         }
         ExternalInputEvent::ControllerAxis { axis, value } => {
             if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
                 anyhow::bail!("Controller axis value out of range for {axis}: {value}");
             }
-            anyhow::bail!(
-                "Controller forwarding unsupported on this host backend: axis={axis}. Wayland RemoteDesktop and the Hyprland IPC fallback do not expose a generic virtual gamepad injection path yet."
-            )
+            debug!(%device_id, ?device_type, %axis, value, "android external controller axis");
+            state.gamepad.lock().await.axis(&axis, value)
         }
     }
+}
+
+fn is_controller_device(device_type: &ExternalDeviceType) -> bool {
+    matches!(
+        device_type,
+        ExternalDeviceType::Gamepad | ExternalDeviceType::Joystick
+    )
 }
 
 async fn send_shortcut(state: &AppState, keys: Vec<String>) -> anyhow::Result<()> {
