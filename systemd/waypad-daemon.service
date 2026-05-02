@@ -1,0 +1,15 @@
+[Unit]
+Description=Waypad secure Wayland remote-control daemon
+Documentation=https://github.com/Frumorn12/waypad-deamon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/waypad-daemon serve
+Restart=on-failure
+RestartSec=2s
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

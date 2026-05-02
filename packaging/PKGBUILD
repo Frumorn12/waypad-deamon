@@ -1,0 +1,37 @@
+# Maintainer: Waypad maintainers
+pkgname=waypad-daemon
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Secure Wayland-focused remote control daemon for Android Waypad"
+arch=("x86_64" "aarch64")
+url="https://github.com/Frumorn12/waypad-deamon"
+license=("custom:NOASSERTION")
+depends=("dbus" "xdg-desktop-portal")
+makedepends=("cargo")
+optdepends=(
+  "xdg-desktop-portal-hyprland: Hyprland portal backend"
+  "brightnessctl: brightness controls"
+  "playerctl: media controls"
+  "wireplumber: wpctl volume controls"
+  "wl-clipboard: clipboard support"
+)
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=("SKIP")
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  cargo build --release --locked
+}
+
+check() {
+  cd "$srcdir/$pkgname-$pkgver"
+  cargo test --locked
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+  install -Dm755 "target/release/waypad-daemon" "$pkgdir/usr/bin/waypad-daemon"
+  install -Dm644 "systemd/waypad-daemon.service" "$pkgdir/usr/lib/systemd/user/waypad-daemon.service"
+  install -Dm644 "config/waypad-daemon.json" "$pkgdir/usr/share/doc/waypad-daemon/config.example.json"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

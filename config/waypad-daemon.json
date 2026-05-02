@@ -1,0 +1,11 @@
+{
+  "bind_address": "0.0.0.0",
+  "control_port": 47771,
+  "discovery_port": 47770,
+  "require_private_lan": true,
+  "state_dir": "",
+  "pairing_code_ttl_seconds": 300,
+  "max_pair_attempts_per_minute": 5,
+  "allow_suspend": false,
+  "log_level": "info"
+}

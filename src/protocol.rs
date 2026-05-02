@@ -1,0 +1,244 @@
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const DISCOVERY_MAGIC: &[u8] = b"WAYPAD_DISCOVER_V1";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientPlain {
+    ClientHello {
+        protocol: u16,
+        client_ephemeral_pub: String,
+        device_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerPlain {
+    ServerHello {
+        protocol: u16,
+        host_public_key: String,
+        host_fingerprint: String,
+        server_ephemeral_pub: String,
+        signature: String,
+        session_nonce: String,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientSecureMessage {
+    PairRequest {
+        request_id: String,
+        device_name: String,
+        pairing_code: String,
+        app_version: Option<String>,
+    },
+    AuthRequest {
+        request_id: String,
+        device_id: String,
+        session_token: String,
+        app_version: Option<String>,
+    },
+    Command {
+        request_id: String,
+        command: Command,
+    },
+    Ping {
+        request_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerSecureMessage {
+    Response {
+        request_id: String,
+        ok: bool,
+        data: Option<Value>,
+        error: Option<ApiError>,
+    },
+    Event {
+        name: String,
+        data: Value,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl ApiError {
+    pub fn new(code: impl Into<String>, message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            retryable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "name", rename_all = "snake_case")]
+pub enum Command {
+    GetHealth,
+    GetHostInfo,
+    GetCapabilities,
+    PrepareInput,
+    PointerMove {
+        dx: f64,
+        dy: f64,
+    },
+    PointerButton {
+        button: PointerButton,
+        state: ButtonState,
+    },
+    Scroll {
+        dx: f64,
+        dy: f64,
+        finish: bool,
+    },
+    Key {
+        keysym: u32,
+        state: ButtonState,
+    },
+    Text {
+        text: String,
+    },
+    Shortcut {
+        keys: Vec<String>,
+    },
+    Media {
+        action: MediaAction,
+    },
+    Volume {
+        action: VolumeAction,
+    },
+    Brightness {
+        action: BrightnessAction,
+    },
+    ClipboardSet {
+        text: String,
+    },
+    System {
+        action: SystemAction,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PointerButton {
+    Left,
+    Middle,
+    Right,
+}
+
+impl PointerButton {
+    pub fn evdev_code(&self) -> i32 {
+        match self {
+            Self::Left => 272,
+            Self::Right => 273,
+            Self::Middle => 274,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ButtonState {
+    Pressed,
+    Released,
+}
+
+impl ButtonState {
+    pub fn portal_state(&self) -> u32 {
+        match self {
+            Self::Released => 0,
+            Self::Pressed => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaAction {
+    PlayPause,
+    Next,
+    Previous,
+    Stop,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeAction {
+    Up,
+    Down,
+    MuteToggle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrightnessAction {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemAction {
+    Lock,
+    Suspend,
+}
+
+pub fn response_ok(request_id: impl Into<String>, data: Value) -> ServerSecureMessage {
+    ServerSecureMessage::Response {
+        request_id: request_id.into(),
+        ok: true,
+        data: Some(data),
+        error: None,
+    }
+}
+
+pub fn response_empty(request_id: impl Into<String>) -> ServerSecureMessage {
+    ServerSecureMessage::Response {
+        request_id: request_id.into(),
+        ok: true,
+        data: None,
+        error: None,
+    }
+}
+
+pub fn response_error(request_id: impl Into<String>, error: ApiError) -> ServerSecureMessage {
+    ServerSecureMessage::Response {
+        request_id: request_id.into(),
+        ok: false,
+        data: None,
+        error: Some(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_round_trips_as_tagged_json() {
+        let command = Command::PointerButton {
+            button: PointerButton::Left,
+            state: ButtonState::Pressed,
+        };
+        let raw = serde_json::to_string(&command).unwrap();
+        assert!(raw.contains("pointer_button"));
+        let decoded: Command = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(decoded, Command::PointerButton { .. }));
+    }
+}

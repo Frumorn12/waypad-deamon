@@ -1,0 +1,36 @@
+# Rust build outputs
+/target/
+**/*.rs.bk
+
+# Release archives and local package output
+/dist/
+/pkg/
+*.tar.gz
+*.zip
+*.pkg.tar.*
+
+# Coverage, profiling, and generated reports
+/coverage/
+*.profraw
+*.profdata
+lcov.info
+
+# Local runtime state, secrets, and overrides
+/.env
+/.env.local
+/state/
+/run/
+/waypad-daemon.json
+*.local.json
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs created by ad-hoc foreground runs
+*.log
