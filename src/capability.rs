@@ -48,20 +48,60 @@ impl Capabilities {
             .iter()
             .any(|d| d == "keyboard");
         let wayland = session.session_type == "wayland";
-        let input_supported = wayland && portal.remote_desktop_available && (pointer || keyboard);
-        let input_reason = if !wayland {
-            Some("Remote input is only enabled for Wayland sessions in this daemon".into())
-        } else if !portal.xdg_desktop_portal_available {
-            Some("Remote input unavailable: xdg-desktop-portal is not running".into())
-        } else if !portal.remote_desktop_available {
-            Some(
-                "Remote input unavailable: org.freedesktop.portal.RemoteDesktop not available"
-                    .into(),
+        let portal_input_supported =
+            wayland && portal.remote_desktop_available && (pointer || keyboard);
+        let hyprland_pointer_fallback = wayland
+            && !portal.remote_desktop_available
+            && session.compositor_hint == "hyprland"
+            && command_exists("hyprctl");
+        let input_supported = portal_input_supported || hyprland_pointer_fallback;
+        let (input_backend, requires_user_approval, input_reason) = if !wayland {
+            (
+                "noop",
+                false,
+                Some("Remote input is only enabled for Wayland sessions in this daemon".into()),
             )
-        } else if !(pointer || keyboard) {
-            Some("Remote input unavailable: portal exposes no pointer or keyboard devices".into())
+        } else if portal_input_supported {
+            (
+                "wayland-portal",
+                true,
+                Some(
+                    "Input injection requires RemoteDesktop portal approval on this session".into(),
+                ),
+            )
+        } else if hyprland_pointer_fallback {
+            (
+                "hyprland-hyprctl",
+                false,
+                Some(
+                    "RemoteDesktop portal unavailable; using Hyprland pointer-move fallback. Clicks, scroll, and keyboard still require RemoteDesktop portal."
+                        .into(),
+                ),
+            )
+        } else if !portal.xdg_desktop_portal_available {
+            (
+                "noop",
+                false,
+                Some("Remote input unavailable: xdg-desktop-portal is not running".into()),
+            )
+        } else if !portal.remote_desktop_available {
+            (
+                "noop",
+                false,
+                Some(
+                    "Remote input unavailable: org.freedesktop.portal.RemoteDesktop not available"
+                        .into(),
+                ),
+            )
         } else {
-            Some("Input injection requires RemoteDesktop portal approval on this session".into())
+            (
+                "noop",
+                false,
+                Some(
+                    "Remote input unavailable: portal exposes no pointer or keyboard devices"
+                        .into(),
+                ),
+            )
         };
 
         Self {
@@ -69,12 +109,8 @@ impl Capabilities {
             portal,
             input: InputCapability {
                 supported: input_supported,
-                backend: if input_supported {
-                    "wayland-portal".into()
-                } else {
-                    "noop".into()
-                },
-                requires_user_approval: input_supported,
+                backend: input_backend.into(),
+                requires_user_approval,
                 reason: input_reason,
             },
             system: SystemCapabilities {

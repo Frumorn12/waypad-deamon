@@ -1,11 +1,14 @@
 use crate::{
     capability::Capabilities,
+    platform::command_exists,
     protocol::{ButtonState, PointerButton},
 };
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
+use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
@@ -13,18 +16,30 @@ use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 pub enum InputManager {
     Noop { reason: String },
     Portal(WaylandPortalInputBackend),
+    Hyprland(HyprlandHyprctlInputBackend),
 }
 
 impl InputManager {
     pub async fn from_capabilities(capabilities: &Capabilities) -> Self {
-        if capabilities.input.backend != "wayland-portal" {
-            return Self::Noop {
-                reason: capabilities
-                    .input
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "Remote input unsupported on this host".into()),
-            };
+        match capabilities.input.backend.as_str() {
+            "wayland-portal" => {}
+            "hyprland-hyprctl" => {
+                return match HyprlandHyprctlInputBackend::new() {
+                    Ok(backend) => Self::Hyprland(backend),
+                    Err(err) => Self::Noop {
+                        reason: format!("Hyprland pointer fallback unavailable: {err}"),
+                    },
+                };
+            }
+            _ => {
+                return Self::Noop {
+                    reason: capabilities
+                        .input
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "Remote input unsupported on this host".into()),
+                };
+            }
         }
         match WaylandPortalInputBackend::new().await {
             Ok(backend) => Self::Portal(backend),
@@ -38,6 +53,7 @@ impl InputManager {
         match self {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.prepare().await,
+            Self::Hyprland(backend) => backend.prepare().await,
         }
     }
 
@@ -45,6 +61,7 @@ impl InputManager {
         match self {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.pointer_move(dx, dy).await,
+            Self::Hyprland(backend) => backend.pointer_move(dx, dy).await,
         }
     }
 
@@ -56,6 +73,7 @@ impl InputManager {
         match self {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.pointer_button(button, state).await,
+            Self::Hyprland(backend) => backend.pointer_button(button, state).await,
         }
     }
 
@@ -63,6 +81,7 @@ impl InputManager {
         match self {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.scroll(dx, dy, finish).await,
+            Self::Hyprland(backend) => backend.scroll(dx, dy, finish).await,
         }
     }
 
@@ -70,8 +89,93 @@ impl InputManager {
         match self {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.key(keysym, state).await,
+            Self::Hyprland(backend) => backend.key(keysym, state).await,
         }
     }
+}
+
+#[derive(Debug, Default)]
+pub struct HyprlandHyprctlInputBackend;
+
+#[derive(Debug, Deserialize)]
+struct CursorPosition {
+    x: i64,
+    y: i64,
+}
+
+impl HyprlandHyprctlInputBackend {
+    pub fn new() -> anyhow::Result<Self> {
+        if !command_exists("hyprctl") {
+            bail!("hyprctl is not installed");
+        }
+        Ok(Self)
+    }
+
+    pub async fn prepare(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(json!({
+            "backend": "hyprland-hyprctl",
+            "status": "ready",
+            "limitations": "pointer movement only; clicks, scroll, and keyboard require RemoteDesktop portal"
+        }))
+    }
+
+    pub async fn pointer_move(&self, dx: f64, dy: f64) -> anyhow::Result<()> {
+        let current = self.cursor_position().await?;
+        let x = clamp_cursor(current.x.saturating_add(dx.round() as i64));
+        let y = clamp_cursor(current.y.saturating_add(dy.round() as i64));
+        let output = Command::new("hyprctl")
+            .args(["dispatch", "movecursor", &x.to_string(), &y.to_string()])
+            .output()
+            .await
+            .context("failed to execute hyprctl dispatch movecursor")?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "hyprctl dispatch movecursor exited with {}: {stderr}",
+                output.status
+            )
+        }
+    }
+
+    pub async fn pointer_button(
+        &self,
+        _button: PointerButton,
+        _state: ButtonState,
+    ) -> anyhow::Result<()> {
+        bail!(
+            "Hyprland hyprctl fallback only supports pointer movement; pointer buttons require RemoteDesktop portal"
+        )
+    }
+
+    pub async fn scroll(&self, _dx: f64, _dy: f64, _finish: bool) -> anyhow::Result<()> {
+        bail!(
+            "Hyprland hyprctl fallback only supports pointer movement; scroll requires RemoteDesktop portal"
+        )
+    }
+
+    pub async fn key(&self, _keysym: u32, _state: ButtonState) -> anyhow::Result<()> {
+        bail!(
+            "Hyprland hyprctl fallback only supports pointer movement; keyboard input requires RemoteDesktop portal"
+        )
+    }
+
+    async fn cursor_position(&self) -> anyhow::Result<CursorPosition> {
+        let output = Command::new("hyprctl")
+            .args(["-j", "cursorpos"])
+            .output()
+            .await
+            .context("failed to execute hyprctl -j cursorpos")?;
+        if !output.status.success() {
+            bail!("hyprctl -j cursorpos exited with {}", output.status);
+        }
+        Ok(serde_json::from_slice(&output.stdout)?)
+    }
+}
+
+fn clamp_cursor(value: i64) -> i64 {
+    value.clamp(-100_000, 100_000)
 }
 
 #[derive(Debug)]

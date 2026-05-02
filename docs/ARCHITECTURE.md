@@ -31,6 +31,8 @@ If portal support is missing or approval is denied, input commands fail with exp
 
 The daemon also detects whether RemoteDesktop version 2 may expose `ConnectToEIS`, and whether libei appears installed, but MVP input uses portal Notify methods. libei event sending is the next backend extension point.
 
+When Hyprland is detected and the RemoteDesktop portal is missing, the daemon can use a narrow `hyprctl dispatch movecursor` backend. This is a compositor API, not a root input bypass. It only supports pointer movement; pointer buttons, scrolling, and keyboard input still require the RemoteDesktop portal.
+
 ## Security Boundaries
 
 The daemon binds to LAN by default but still treats the LAN as hostile:

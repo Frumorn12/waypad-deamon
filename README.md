@@ -28,6 +28,7 @@ Waypad is built around the real Wayland path:
 - UDP LAN discovery plus manual IP fallback.
 - Capability endpoint for Wayland, portal, libei hints, volume, media, brightness, clipboard, lock, and suspend.
 - Wayland RemoteDesktop portal backend for pointer, click, scroll, and keyboard keysyms when approved.
+- Hyprland `hyprctl` pointer-move fallback when RemoteDesktop is unavailable.
 - No X11-only injection hacks and no root-only default input path.
 - `systemd --user` unit for correct user session and portal access.
 
@@ -224,7 +225,9 @@ systemctl --user restart xdg-desktop-portal xdg-desktop-portal-hyprland
 waypad-daemon doctor
 ```
 
-If the daemon reports `RemoteDesktop portal not available`, input injection cannot work until the portal/compositor stack supports it. The Android app will still connect and show diagnostics, but pointer and keyboard commands will fail with explicit errors.
+If the daemon reports `RemoteDesktop portal not available`, full input injection cannot work until the portal/compositor stack supports it. The Android app will still connect and show diagnostics, but pointer buttons, scroll, and keyboard commands will fail with explicit errors.
+
+On Hyprland, Waypad can use a limited `hyprctl dispatch movecursor` fallback when RemoteDesktop is unavailable. This moves the cursor only. Clicks, scrolling, and keyboard input still require `org.freedesktop.portal.RemoteDesktop`.
 
 More details are in `docs/TROUBLESHOOTING.md`.
 
