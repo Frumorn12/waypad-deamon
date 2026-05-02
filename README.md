@@ -6,7 +6,7 @@ The daemon listens on the local network, pairs Android devices with explicit loc
 
 ## Status
 
-This is a shippable MVP foundation, not a finished remote-desktop suite. It implements secure pairing, encrypted sessions, trusted-device storage, discovery, diagnostics, systemd user integration, Wayland portal input, and a remote screen MVP. Cloud relay, iOS, NAT traversal, and production WebRTC/H.264 streaming are intentionally out of scope.
+This is a shippable MVP foundation, not a finished remote-desktop suite. It implements secure pairing, encrypted sessions, trusted-device storage, discovery, diagnostics, systemd user integration, Wayland portal input, external controller forwarding, QR invites, and a low-latency remote screen MVP. It supports LAN use and explicit direct-public endpoints for mobile-data tests. It does not bundle a cloud relay, automatic ICE/STUN/TURN traversal, or production WebRTC/H.264 streaming yet.
 
 ## Why Waypad Exists
 
@@ -29,9 +29,12 @@ Waypad is built around the real Wayland path:
 - Capability endpoint for Wayland, portal, libei hints, volume, media, brightness, clipboard, lock, and suspend.
 - Wayland RemoteDesktop portal backend for pointer, click, scroll, and keyboard keysyms when approved.
 - Hyprland IPC fallback for pointer movement, mouse buttons, scroll, shortcuts, direct ASCII text, and clipboard-backed text for unsupported characters when RemoteDesktop is unavailable.
-- External Android mouse and keyboard forwarding through the active pointer/keyboard backend, with explicit unsupported capability reporting for generic controller/gamepad injection.
+- External Android mouse and keyboard forwarding through the active pointer/keyboard backend.
+- External Android controller/gamepad forwarding through an isolated Linux `uinput` virtual gamepad backend when `/dev/uinput` is available.
 - Remote screen source discovery through XDG Desktop Portal ScreenCast and Hyprland monitor fallback.
-- Token-negotiated LAN JPEG frame stream for Android screen viewing.
+- Token-negotiated direct TCP JPEG frame stream for Android screen viewing, with client-requested FPS, JPEG quality, and maximum frame dimension.
+- Expiring `waypad://invite` QR payloads for terminal-driven pairing and direct-public bootstrap.
+- Connectivity capability reporting for LAN direct, public direct, and unsupported relay/signaling/ICE/TURN cases.
 - Absolute pointer command path for interaction with a displayed remote monitor.
 - No X11-only injection hacks and no root-only default input path.
 - `systemd --user` unit for correct user session and portal access.
@@ -98,6 +101,12 @@ Create a local pairing code:
 
 ```bash
 cargo run -- pair-code
+```
+
+Create a QR invite for the Android app:
+
+```bash
+cargo run -- invite --qr
 ```
 
 ## Install as a User Service
@@ -191,6 +200,30 @@ waypad-daemon pair-code
 
 6. After pairing, tap "Approve portal" in the app and approve the Linux portal prompt if one appears.
 
+Alternative QR flow:
+
+```bash
+waypad-daemon invite --qr
+```
+
+Scan the QR with the Android app or paste the printed `waypad://invite?...`
+payload. The invite embeds the host fingerprint, LAN address, port, one-time
+pairing code, route type, and expiry. By default the daemon chooses the LAN
+source address from the active IPv4 route; override it with `--address` if the
+phone must use a different interface.
+
+For a mobile-data/direct-public test, expose TCP `47771` through your firewall
+or router and generate:
+
+```bash
+waypad-daemon invite --qr --remote-address your-public-hostname.example
+```
+
+This is still direct TCP, not a relay. If `require_private_lan` is true, public
+source addresses are rejected after pairing, so set it to false only when the
+port is intentionally exposed and protected by pairing, host-key pinning, and a
+reasonable firewall policy.
+
 ## Device Management
 
 ```bash
@@ -207,7 +240,7 @@ Supported:
 
 - Linux host on Wayland.
 - Hyprland/wlroots environments with working xdg-desktop-portal RemoteDesktop support.
-- LAN-only Android control.
+- LAN Android control plus explicit direct-public endpoint bootstrap through QR invites.
 - Pointer, clicks, scroll, keysyms, text, shortcuts, media, volume, brightness, clipboard set, lock.
 - External mouse and keyboard devices connected to the Android phone when the Android app is in Pad or Screen mode.
 - External Android controllers/gamepads through a Linux `uinput` virtual gamepad when `/dev/uinput` is available to the daemon user.
@@ -218,10 +251,10 @@ Unsupported in MVP:
 
 - X11 input injection.
 - Root `/dev/uinput` bypass as the default backend.
-- Internet exposure or cloud relay.
+- Cloud relay, TURN fallback, and automatic ICE/STUN NAT traversal.
 - End-to-end encrypted media stream separate from the encrypted control channel.
 - Controller forwarding when the host does not expose writable `/dev/uinput` to the daemon user.
-- WebRTC/H.264 transport, TURN, and adaptive bitrate.
+- WebRTC/H.264 transport and congestion-controlled adaptive bitrate.
 - iOS client.
 
 ## Troubleshooting
@@ -248,6 +281,11 @@ Controller forwarding is different from pointer/keyboard forwarding: Wayland por
 
 For remote screen mode, check the `capture` section in `waypad-daemon doctor`. Standard Wayland capture uses XDG Desktop Portal ScreenCast plus PipeWire and GStreamer. Hyprland systems can also expose monitor sources through the `hyprland-grim` fallback. If capture works but input fails, use screen viewing read-only or switch to Pad mode until RemoteDesktop or Hyprland IPC input is available.
 
+For mobile-data/direct-public tests, check the `connectivity` section in
+`waypad-daemon doctor`. Current builds report `lan_direct = true` and expose
+direct-public invites when `require_private_lan = false`; `relay`, `stun`, and
+`turn` intentionally remain false until a full WebRTC/relay stack is added.
+
 More details are in `docs/TROUBLESHOOTING.md`.
 
 ## Protocol
@@ -270,9 +308,8 @@ RUST_LOG=debug cargo run -- serve
 
 ## Roadmap
 
-- QR pairing payload for IP, port, code, and fingerprint.
 - libei sender backend through RemoteDesktop `ConnectToEIS` where supported.
-- WebRTC/H.264 media transport to replace the MVP JPEG frame stream.
+- WebRTC/H.264 media transport with ICE/STUN/TURN to replace the MVP JPEG frame stream for robust outside-LAN use.
 - More detailed monitor/compositor diagnostics.
 - Signed release packages.
 - Broader integration tests with a fake protocol client.

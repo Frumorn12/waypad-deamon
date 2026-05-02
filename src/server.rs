@@ -93,7 +93,7 @@ async fn refresh_controller_manager(state: &AppState, capabilities: &Capabilitie
 
 pub async fn run(config: Config, paths: StatePaths, identity: HostIdentity) -> anyhow::Result<()> {
     let devices = load_trusted_devices(&paths)?;
-    let capabilities = Capabilities::detect(config.allow_suspend).await;
+    let capabilities = Capabilities::detect(&config).await;
     let input = InputManager::from_capabilities(&capabilities).await;
     let gamepad = controller_manager_from_capabilities(&capabilities);
     let capabilities = Arc::new(RwLock::new(capabilities.clone()));
@@ -426,7 +426,7 @@ async fn handle_command(
                 "protocol": PROTOCOL_VERSION
             }))),
             Command::GetCapabilities => {
-                let capabilities = Capabilities::detect(state.config.allow_suspend).await;
+                let capabilities = Capabilities::detect(&state.config).await;
                 *state.capabilities.write().await = capabilities.clone();
                 refresh_controller_manager(state, &capabilities).await;
                 Ok(Some(json!(capabilities)))
@@ -436,7 +436,7 @@ async fn handle_command(
                 match input.prepare().await {
                     Ok(value) => Ok(Some(value)),
                     Err(first_error) => {
-                        let capabilities = Capabilities::detect(state.config.allow_suspend).await;
+                        let capabilities = Capabilities::detect(&state.config).await;
                         *state.capabilities.write().await = capabilities.clone();
                         refresh_controller_manager(state, &capabilities).await;
                         *input = InputManager::from_capabilities(&capabilities).await;
@@ -495,6 +495,8 @@ async fn handle_command(
                 source_id,
                 max_fps,
                 jpeg_quality,
+                max_width,
+                max_height,
             } => Ok(Some(json!(
                 state
                     .screen
@@ -502,6 +504,8 @@ async fn handle_command(
                         source_id,
                         max_fps,
                         jpeg_quality,
+                        max_width,
+                        max_height,
                     })
                     .await?
             ))),

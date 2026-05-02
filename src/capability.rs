@@ -1,4 +1,5 @@
 use crate::{
+    config::Config,
     gamepad::detect_virtual_gamepad_support,
     platform::{
         SessionInfo, command_exists, command_output, detect_session, hyprland_ipc_available,
@@ -12,6 +13,7 @@ pub struct Capabilities {
     pub portal: PortalCapability,
     pub input: InputCapability,
     pub external_input: ExternalInputCapability,
+    pub connectivity: ConnectivityCapability,
     pub capture: CaptureCapability,
     pub system: SystemCapabilities,
 }
@@ -45,6 +47,18 @@ pub struct ExternalInputCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectivityCapability {
+    pub lan_direct: bool,
+    pub public_direct: bool,
+    pub relay: bool,
+    pub signaling: bool,
+    pub stun: bool,
+    pub turn: bool,
+    pub backend: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureCapability {
     pub supported: bool,
     pub backend: String,
@@ -70,7 +84,7 @@ pub struct SystemCapabilities {
 }
 
 impl Capabilities {
-    pub async fn detect(allow_suspend: bool) -> Self {
+    pub async fn detect(config: &Config) -> Self {
         let session = detect_session();
         let portal = detect_portal().await;
         let screencast = detect_screencast_portal().await;
@@ -227,6 +241,19 @@ impl Capabilities {
                 },
                 reason: Some(external_input_reason(input_supported, &controller_reason)),
             },
+            connectivity: ConnectivityCapability {
+                lan_direct: true,
+                public_direct: !config.require_private_lan,
+                relay: false,
+                signaling: false,
+                stun: false,
+                turn: false,
+                backend: "direct-tcp-invite".into(),
+                reason: Some(
+                    "LAN and manually advertised public/direct endpoints are supported through QR invites. WebRTC ICE/STUN/TURN relay is not bundled in this daemon build."
+                        .into(),
+                ),
+            },
             capture: CaptureCapability {
                 supported: capture_supported,
                 backend: capture_backend.into(),
@@ -246,7 +273,7 @@ impl Capabilities {
                 brightness: command_exists("brightnessctl"),
                 clipboard: command_exists("wl-copy") && command_exists("wl-paste"),
                 lock: command_exists("loginctl"),
-                suspend: allow_suspend && command_exists("systemctl"),
+                suspend: config.allow_suspend && command_exists("systemctl"),
             },
         }
     }

@@ -11,7 +11,7 @@ Waypad-daemon is a user-session Linux daemon. It is intentionally not a root sys
 | `crypto` | P-256 handshake, host signatures, HKDF, AES-GCM frame encryption. |
 | `discovery` | UDP LAN discovery. |
 | `server` | TCP listener, authentication, command routing, rate limiting. |
-| `capability` | Session, portal, libei, and system helper detection. |
+| `capability` | Session, portal, libei, connectivity, and system helper detection. |
 | `input` | Wayland RemoteDesktop portal backend and unsupported fallback. |
 | `screen` | Screen source enumeration, ScreenCast/PipeWire stream sessions, and Hyprland capture fallback. |
 | `system_control` | Volume, media, brightness, clipboard, lock, suspend commands. |
@@ -50,6 +50,13 @@ Remote screen support is intentionally Wayland-first:
 
 The control channel negotiates a short-lived stream session and token. The Android app then opens a second LAN TCP connection to the daemon's stable control port, sends a `stream_connect` JSON line with that token, and receives `WAYPAD_STREAM_V1` frames. Each frame is a JSON header plus JPEG payload. Reusing the control listener avoids dynamic high-port failures on real phones and keeps the MVP small and shippable without adding a partial WebRTC stack. The transport is designed so a future WebRTC/H.264 backend can replace the frame stream without changing source selection or input mapping commands.
 
+Stream settings are not cosmetic. Android sends `max_fps`, `jpeg_quality`,
+`max_width`, and `max_height` in `start_screen_stream`. The daemon clamps FPS to
+1..60, JPEG quality to 35..92, and maximum dimensions to 480..3840. Hyprland
+`grim` capture uses the requested scale before JPEG encoding, and the
+PipeWire/GStreamer path inserts `videorate`, `videoscale`, and leaky downstream
+queues so stale frames are dropped instead of accumulating latency.
+
 Portal capture requires local user approval. Hyprland `grim` capture is compositor-specific and deliberately isolated behind the `ScreenManager`; it is not treated as a general Wayland backend.
 
 Absolute pointer control uses the existing input abstraction. Hyprland maps source-local coordinates to global compositor coordinates and dispatches `movecursor`. The RemoteDesktop portal path exposes absolute motion through `NotifyPointerMotionAbsolute`, but some portal backends require a shared screencast stream id; those failures are surfaced to the Android app instead of silently falling back to incorrect coordinates.
@@ -64,6 +71,26 @@ The daemon binds to LAN by default but still treats the LAN as hostile:
 - Device tokens can be revoked.
 - Host key rotation invalidates existing trust.
 - Public internet source addresses are rejected when `require_private_lan` is enabled.
+
+QR invites are expiring pairing helpers, not permanent credentials. The
+`invite` command creates a normal one-time pairing code, embeds it in a
+`waypad://invite` payload with the host fingerprint, address, port, route, and
+expiry, and optionally prints it as an ANSI terminal QR. The Android app still
+verifies the signed daemon handshake and pins the host key before trusting the
+connection.
+
+## Connectivity Model
+
+Current builds support direct TCP connectivity:
+
+- LAN direct through discovery, manual IP entry, or `waypad-daemon invite --qr`.
+- Public direct through `waypad-daemon invite --qr --remote-address <host>` when
+  the user intentionally exposes TCP `47771`.
+
+The daemon reports this in `capabilities.connectivity`. It also explicitly
+reports that relay, signaling, STUN, and TURN are not available. That keeps
+outside-LAN behavior honest: port forwarding or a VPN can work today, but
+automatic NAT traversal requires a future WebRTC/ICE/TURN backend.
 
 ## Service Model
 

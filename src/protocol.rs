@@ -144,6 +144,8 @@ pub enum Command {
         source_id: Option<String>,
         max_fps: Option<u32>,
         jpeg_quality: Option<u8>,
+        max_width: Option<u32>,
+        max_height: Option<u32>,
     },
     StopScreenStream {
         session_id: String,
@@ -312,11 +314,14 @@ mod tests {
     fn screen_commands_round_trip() {
         let command = Command::StartScreenStream {
             source_id: Some("hyprland:monitor:DP-1".into()),
-            max_fps: Some(12),
-            jpeg_quality: Some(70),
+            max_fps: Some(60),
+            jpeg_quality: Some(58),
+            max_width: Some(1280),
+            max_height: Some(1280),
         };
         let raw = serde_json::to_string(&command).unwrap();
         assert!(raw.contains("start_screen_stream"));
+        assert!(raw.contains("max_width"));
         let decoded: Command = serde_json::from_str(&raw).unwrap();
         assert!(matches!(decoded, Command::StartScreenStream { .. }));
 

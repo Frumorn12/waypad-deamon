@@ -15,7 +15,7 @@ use tokio::{
     process::{ChildStderr, Command},
     sync::{Mutex, RwLock, oneshot},
     task::JoinHandle,
-    time::{interval, timeout},
+    time::{MissedTickBehavior, interval, timeout},
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -42,6 +42,8 @@ pub struct StreamStartOptions {
     pub source_id: Option<String>,
     pub max_fps: Option<u32>,
     pub jpeg_quality: Option<u8>,
+    pub max_width: Option<u32>,
+    pub max_height: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -73,6 +75,8 @@ struct PendingStream {
     source: ScreenSource,
     fps: u32,
     quality: u8,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -144,8 +148,10 @@ impl ScreenManager {
         options: StreamStartOptions,
     ) -> anyhow::Result<StreamStartResponse> {
         let source = self.select_source(options.source_id.as_deref()).await?;
-        let fps = options.max_fps.unwrap_or(10).clamp(1, 30);
-        let quality = options.jpeg_quality.unwrap_or(70).clamp(35, 90);
+        let fps = options.max_fps.unwrap_or(30).clamp(1, 60);
+        let quality = options.jpeg_quality.unwrap_or(70).clamp(35, 92);
+        let max_width = options.max_width.map(|value| value.clamp(480, 3840));
+        let max_height = options.max_height.map(|value| value.clamp(480, 3840));
         let session_id = Uuid::new_v4().to_string();
         let token = Uuid::new_v4().to_string();
         self.sessions.lock().await.insert(
@@ -155,6 +161,8 @@ impl ScreenManager {
                 source: source.clone(),
                 fps,
                 quality,
+                max_width,
+                max_height,
             }),
         );
         info!(
@@ -162,6 +170,10 @@ impl ScreenManager {
             stream_port = self.stream_port,
             source_id = %source.id,
             backend = %source.backend,
+            fps,
+            quality,
+            ?max_width,
+            ?max_height,
             "screen stream session pending client attach"
         );
         Ok(StreamStartResponse {
@@ -245,6 +257,8 @@ impl ScreenManager {
                     source,
                     pending.fps,
                     pending.quality,
+                    pending.max_width,
+                    pending.max_height,
                     stop_rx,
                 )
                 .await
@@ -255,6 +269,8 @@ impl ScreenManager {
                     source,
                     pending.fps,
                     pending.quality,
+                    pending.max_width,
+                    pending.max_height,
                     stop_rx,
                 )
                 .await
@@ -328,16 +344,20 @@ async fn run_grim_stream(
     source: ScreenSource,
     fps: u32,
     quality: u8,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let mut ticker = interval(Duration::from_millis((1000 / fps.max(1)) as u64));
+    let mut ticker = interval(Duration::from_secs_f64(1.0 / f64::from(fps.max(1))));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut seq = 0u64;
-    info!(%session_id, source_id = %source.id, fps, quality, "grim stream started");
+    let scale = capture_scale(source.width, source.height, max_width, max_height);
+    info!(%session_id, source_id = %source.id, fps, quality, scale, "grim stream started");
     loop {
         tokio::select! {
             _ = &mut stop_rx => break,
             _ = ticker.tick() => {
-                let jpeg = capture_grim_frame(&source, quality).await?;
+                let jpeg = capture_grim_frame(&source, quality, scale).await?;
                 send_frame(&mut socket, seq, source.width, source.height, &jpeg).await?;
                 seq += 1;
             }
@@ -353,6 +373,8 @@ async fn run_portal_stream(
     _selected_source: ScreenSource,
     fps: u32,
     quality: u8,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
     mut stop_rx: oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     info!(%session_id, fps, quality, "portal stream client connected; starting ScreenCast approval");
@@ -369,7 +391,9 @@ async fn run_portal_stream(
         scale: 1.0,
         focused: true,
     };
-    let mut child = spawn_gstreamer_pipewire(portal, fps, quality)?;
+    let (target_width, target_height) =
+        target_dimensions(source.width, source.height, max_width, max_height);
+    let mut child = spawn_gstreamer_pipewire(portal, fps, quality, target_width, target_height)?;
     if let Some(stderr) = child.stderr.take() {
         tokio::spawn(log_child_stderr(session_id.clone(), "gstreamer", stderr));
     }
@@ -380,7 +404,7 @@ async fn run_portal_stream(
     let mut reader = JpegStreamReader::new();
     let mut buffer = [0u8; 32 * 1024];
     let mut seq = 0u64;
-    info!(%session_id, source_id = %source.id, "portal stream started");
+    info!(%session_id, source_id = %source.id, ?target_width, ?target_height, "portal stream started");
     loop {
         tokio::select! {
             _ = &mut stop_rx => break,
@@ -467,9 +491,48 @@ fn is_client_disconnect(err: &anyhow::Error) -> bool {
     })
 }
 
-async fn capture_grim_frame(source: &ScreenSource, quality: u8) -> anyhow::Result<Vec<u8>> {
+fn capture_scale(width: u32, height: u32, max_width: Option<u32>, max_height: Option<u32>) -> f64 {
+    let width_scale = max_width
+        .filter(|_| width > 0)
+        .map(|value| f64::from(value) / f64::from(width))
+        .unwrap_or(1.0);
+    let height_scale = max_height
+        .filter(|_| height > 0)
+        .map(|value| f64::from(value) / f64::from(height))
+        .unwrap_or(1.0);
+    width_scale.min(height_scale).min(1.0).max(0.1)
+}
+
+fn target_dimensions(
+    width: u32,
+    height: u32,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+) -> (Option<u32>, Option<u32>) {
+    if width == 0 || height == 0 {
+        return (None, None);
+    }
+    let scale = capture_scale(width, height, max_width, max_height);
+    if scale >= 0.999 {
+        (None, None)
+    } else {
+        (
+            Some((f64::from(width) * scale).round().max(2.0) as u32),
+            Some((f64::from(height) * scale).round().max(2.0) as u32),
+        )
+    }
+}
+
+async fn capture_grim_frame(
+    source: &ScreenSource,
+    quality: u8,
+    scale: f64,
+) -> anyhow::Result<Vec<u8>> {
     let mut command = Command::new("grim");
     command.args(["-t", "jpeg", "-q", &quality.to_string(), "-c"]);
+    if scale < 0.999 {
+        command.args(["-s", &format!("{scale:.4}")]);
+    }
     if let Some(output) = source.id.strip_prefix("hyprland:monitor:") {
         command.args(["-o", output]);
     }
@@ -619,6 +682,8 @@ fn spawn_gstreamer_pipewire(
     session: PortalScreenCastSession,
     fps: u32,
     quality: u8,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
 ) -> anyhow::Result<tokio::process::Child> {
     let fd = session.pipewire_fd.as_raw_fd();
     let mut command = Command::new("gst-launch-1.0");
@@ -629,11 +694,25 @@ fn spawn_gstreamer_pipewire(
         .arg(format!("path={}", session.stream_id))
         .arg("do-timestamp=true")
         .arg("!")
-        .arg("videorate")
-        .arg("!")
-        .arg(format!("video/x-raw,framerate={}/1", fps))
+        .arg("queue")
+        .arg("max-size-buffers=1")
+        .arg("max-size-bytes=0")
+        .arg("max-size-time=0")
+        .arg("leaky=downstream")
         .arg("!")
         .arg("videoconvert")
+        .arg("!")
+        .arg("videoscale")
+        .arg("!")
+        .arg("videorate")
+        .arg("drop-only=true")
+        .arg("!")
+        .arg(match (target_width, target_height) {
+            (Some(width), Some(height)) => {
+                format!("video/x-raw,width={width},height={height},framerate={fps}/1")
+            }
+            _ => format!("video/x-raw,framerate={fps}/1"),
+        })
         .arg("!")
         .arg("jpegenc")
         .arg(format!("quality={}", quality))
@@ -752,7 +831,9 @@ fn stream_size(properties: &HashMap<String, OwnedValue>) -> (Option<u32>, Option
 
 #[cfg(test)]
 mod tests {
-    use super::{JpegStreamReader, find_marker, is_client_disconnect};
+    use super::{
+        JpegStreamReader, capture_scale, find_marker, is_client_disconnect, target_dimensions,
+    };
 
     #[test]
     fn parses_concatenated_jpeg_frames() {
@@ -779,5 +860,18 @@ mod tests {
         let permission =
             anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert!(!is_client_disconnect(&permission));
+    }
+
+    #[test]
+    fn computes_stream_downscale_dimensions() {
+        assert_eq!(capture_scale(3840, 2160, Some(1920), Some(1080)), 0.5);
+        assert_eq!(
+            target_dimensions(3840, 2160, Some(1280), Some(1280)),
+            (Some(1280), Some(720)),
+        );
+        assert_eq!(
+            target_dimensions(1280, 720, Some(2400), Some(2400)),
+            (None, None)
+        );
     }
 }

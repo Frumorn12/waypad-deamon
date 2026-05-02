@@ -133,6 +133,48 @@ ss -ltnp | grep 47771
 ip -4 addr
 ```
 
+## QR Invite Shows 127.0.0.1 Or The Phone Cannot Connect
+
+Current builds choose the LAN address from the active IPv4 route:
+
+```bash
+ip -4 route get 1.1.1.1
+waypad-daemon invite --qr
+```
+
+The QR payload should contain the `src` address from that route, not
+`127.0.0.1`. If the phone must use a different interface, pass it explicitly:
+
+```bash
+waypad-daemon invite --qr --address 192.168.0.184
+```
+
+For mobile-data testing, expose the daemon's TCP port intentionally and provide
+the reachable public endpoint:
+
+```bash
+waypad-daemon invite --qr --remote-address your-public-hostname.example
+```
+
+This is direct TCP. The daemon does not provide a relay, STUN, TURN, or automatic
+ICE traversal yet. If `require_private_lan` is true, public clients are rejected
+even if they have a valid invite.
+
+## 60 FPS Setting Does Not Seem To Apply
+
+The Android app sends `max_fps`, `jpeg_quality`, `max_width`, and `max_height`
+when starting a screen stream. The daemon logs the accepted values:
+
+```bash
+journalctl --user -u waypad-daemon -f | grep 'starting screen stream'
+```
+
+For Game Mode or Ultra Low Latency, expect `fps=60` and a smaller max dimension.
+Actual delivered FPS still depends on compositor capture speed, PipeWire/GStreamer
+availability, JPEG encode speed, Wi-Fi quality, and Android decode time. The
+daemon drops stale frames rather than buffering them, so FPS may fall under load
+to keep input latency lower.
+
 ## Input Works But Stream Fails
 
 Check `capture` in `waypad-daemon doctor`. Input may use RemoteDesktop or Hyprland IPC even when ScreenCast/PipeWire is unavailable. Use the app's Pad mode as a fallback while fixing portal or PipeWire capture.

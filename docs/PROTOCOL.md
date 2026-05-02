@@ -78,6 +78,23 @@ waypad-daemon pair-code
 
 The app sends an encrypted `pair_request` with the code and Android device name. If valid, the daemon creates a trusted device, stores only a SHA-256 hash of the random 256-bit session token, and returns the token once.
 
+The daemon can also print an expiring QR invite:
+
+```bash
+waypad-daemon invite --qr
+```
+
+The payload is a normal deep link, for example:
+
+```text
+waypad://invite?v=1&host=desktop&address=192.168.0.184&port=47771&fingerprint=aa%3Abb&code=123456&expires=1770000000&route=direct-lan
+```
+
+`--remote-address <host-or-ip>` adds `remote_address` and marks the route as
+`direct-public`. Android prefers `remote_address` when present. The embedded
+pairing code remains short-lived and single use; the signed handshake and host
+fingerprint pinning are still mandatory.
+
 ## Authentication
 
 The app sends an encrypted `auth_request` with:
@@ -201,8 +218,10 @@ The Android app starts a stream with:
 {
   "name": "start_screen_stream",
   "source_id": "hyprland:monitor:DP-1",
-  "max_fps": 12,
-  "jpeg_quality": 70
+  "max_fps": 60,
+  "jpeg_quality": 58,
+  "max_width": 1280,
+  "max_height": 1280
 }
 ```
 
@@ -242,4 +261,10 @@ payload_length bytes of JPEG
 
 The frame header contains at least `seq`, `timestamp_ms`, `codec`, `width`, and `height`.
 
-The current MVP stream is token-protected but not encrypted independently; it is intended for the same trusted LAN model as discovery/control pairing. The authenticated control channel remains encrypted. Older builds used a dynamic per-session stream port, but current builds reuse the stable control port so phone clients are not broken by LAN firewalls or NAT rules that block random high ports. A future WebRTC/H.264 transport can replace this frame stream while keeping the source and input commands.
+`max_fps` is clamped to `1..60`, `jpeg_quality` to `35..92`, and maximum
+dimensions to `480..3840`. When a maximum dimension is lower than the source
+size, the daemon downscales before JPEG encoding to reduce bandwidth and decode
+latency. Frame pacing skips missed ticks so slow captures drop stale frames
+instead of building a long queue.
+
+The current MVP stream is token-protected but not encrypted independently; it is intended for trusted LAN, VPN, or deliberately exposed direct-public testing. The authenticated control channel remains encrypted. Older builds used a dynamic per-session stream port, but current builds reuse the stable control port so phone clients are not broken by LAN firewalls or NAT rules that block random high ports. A future WebRTC/H.264 transport can replace this frame stream while keeping the source and input commands.
