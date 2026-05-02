@@ -107,6 +107,10 @@ systemctl --user daemon-reload
 systemctl --user enable --now waypad-daemon
 ```
 
+The unit is installed under `graphical-session.target` so it starts after the
+user Wayland session has exported `WAYLAND_DISPLAY`, `XDG_SESSION_TYPE`, and
+compositor-specific variables to the systemd user manager.
+
 Logs:
 
 ```bash
