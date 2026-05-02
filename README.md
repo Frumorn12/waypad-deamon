@@ -29,6 +29,7 @@ Waypad is built around the real Wayland path:
 - Capability endpoint for Wayland, portal, libei hints, volume, media, brightness, clipboard, lock, and suspend.
 - Wayland RemoteDesktop portal backend for pointer, click, scroll, and keyboard keysyms when approved.
 - Hyprland IPC fallback for pointer movement, mouse buttons, scroll, shortcuts, direct ASCII text, and clipboard-backed text for unsupported characters when RemoteDesktop is unavailable.
+- External Android mouse and keyboard forwarding through the active pointer/keyboard backend, with explicit unsupported capability reporting for generic controller/gamepad injection.
 - Remote screen source discovery through XDG Desktop Portal ScreenCast and Hyprland monitor fallback.
 - Token-negotiated LAN JPEG frame stream for Android screen viewing.
 - Absolute pointer command path for interaction with a displayed remote monitor.
@@ -208,6 +209,7 @@ Supported:
 - Hyprland/wlroots environments with working xdg-desktop-portal RemoteDesktop support.
 - LAN-only Android control.
 - Pointer, clicks, scroll, keysyms, text, shortcuts, media, volume, brightness, clipboard set, lock.
+- External mouse and keyboard devices connected to the Android phone when the Android app is in Pad or Screen mode.
 - Remote screen viewing through ScreenCast/PipeWire where portal streaming works.
 - Hyprland monitor viewing through an isolated `grim` fallback when portal streaming dependencies are incomplete.
 
@@ -217,6 +219,7 @@ Unsupported in MVP:
 - Root `/dev/uinput` bypass as the default backend.
 - Internet exposure or cloud relay.
 - End-to-end encrypted media stream separate from the encrypted control channel.
+- Generic virtual controller/gamepad injection on Wayland. The protocol and Android capture path exist, but current Wayland RemoteDesktop and Hyprland IPC backends do not expose a safe compositor-agnostic gamepad injection mechanism.
 - WebRTC/H.264 transport, TURN, and adaptive bitrate.
 - iOS client.
 

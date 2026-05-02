@@ -8,6 +8,7 @@ pub struct Capabilities {
     pub session: SessionInfo,
     pub portal: PortalCapability,
     pub input: InputCapability,
+    pub external_input: ExternalInputCapability,
     pub capture: CaptureCapability,
     pub system: SystemCapabilities,
 }
@@ -28,6 +29,15 @@ pub struct InputCapability {
     pub supported: bool,
     pub backend: String,
     pub requires_user_approval: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalInputCapability {
+    pub pointer: bool,
+    pub keyboard: bool,
+    pub controller: bool,
+    pub backend: String,
     pub reason: Option<String>,
 }
 
@@ -197,6 +207,23 @@ impl Capabilities {
                 backend: input_backend.into(),
                 requires_user_approval,
                 reason: input_reason,
+            },
+            external_input: ExternalInputCapability {
+                pointer: input_supported,
+                keyboard: input_supported,
+                controller: false,
+                backend: if input_supported {
+                    input_backend.into()
+                } else {
+                    "noop".into()
+                },
+                reason: Some(if input_supported {
+                    "Android external mouse and keyboard events are forwarded through the active pointer/keyboard input backend. Generic controller injection is not exposed by the current Wayland portal/Hyprland IPC backends."
+                        .into()
+                } else {
+                    "External input forwarding requires a supported pointer/keyboard input backend on the host."
+                        .into()
+                }),
             },
             capture: CaptureCapability {
                 supported: capture_supported,

@@ -34,6 +34,8 @@ The daemon also detects whether RemoteDesktop version 2 may expose `ConnectToEIS
 
 When Hyprland is detected and the RemoteDesktop portal is missing, the daemon can use a `hyprland-ipc` backend. This talks to Hyprland's user-session IPC socket, not root/uinput, and is isolated behind the same `InputManager` abstraction as the portal backend. It supports cursor movement, mouse button state, scroll wheel events, shortcuts, and direct ASCII text events. Unsupported text falls back to `wl-copy` paste, so only that fallback path temporarily replaces the Wayland clipboard.
 
+External Android mouse and keyboard devices use the same input abstraction as touchpad and remote-screen input. The protocol keeps Android device metadata and normalized event types, but host-side pointer and keyboard events still terminate in RemoteDesktop portal methods or the Hyprland IPC fallback. Controller/gamepad events are parsed and routed to an explicit unsupported response today because neither backend provides a safe generic virtual gamepad device. A future libei or compositor-specific backend can attach at that `external_input` routing point without changing Android device detection.
+
 ## Remote Screen Strategy
 
 Remote screen support is intentionally Wayland-first:

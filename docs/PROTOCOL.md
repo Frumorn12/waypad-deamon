@@ -122,6 +122,7 @@ Current command names:
 | `pointer_move_absolute` | Source-local absolute pointer motion for remote screen control. |
 | `pointer_button` | Left, middle, or right button press/release. |
 | `scroll` | Smooth pointer-axis scroll. |
+| `external_input` | Normalized input events from Android-attached mouse, keyboard, touchpad, or controller devices. |
 | `key` | XKB keysym press/release. |
 | `text` | Sends characters as keysyms. |
 | `shortcut` | Sends a validated shortcut sequence. |
@@ -135,6 +136,37 @@ Current command names:
 | `system` | Lock or suspend. Suspend is disabled by default. |
 
 Unsupported commands return an authenticated error with a user-facing reason.
+
+## External Android Input
+
+The Android client forwards hardware devices connected to the phone with:
+
+```json
+{
+  "name": "external_input",
+  "device_id": "android:7:abcd1234",
+  "device_type": "keyboard",
+  "event": {
+    "type": "keyboard_key",
+    "keysym": 97,
+    "state": "pressed",
+    "repeat": false
+  }
+}
+```
+
+`device_type` is one of `keyboard`, `mouse`, `touchpad`, `gamepad`, `joystick`, or `unknown`. Event types are:
+
+| Event | Host behavior |
+| --- | --- |
+| `device_connected` / `device_disconnected` | Logged for diagnostics. |
+| `pointer_move` | Relative pointer motion through the active backend. |
+| `pointer_button` | Left/middle/right button through the active backend. |
+| `pointer_scroll` | Smooth scroll through the active backend. |
+| `keyboard_key` | XKB keysym press/release through the active backend. |
+| `controller_button` / `controller_axis` | Parsed and rejected with an explicit unsupported error unless a future backend adds virtual gamepad injection. |
+
+`get_capabilities` includes `external_input.pointer`, `external_input.keyboard`, and `external_input.controller`. Pointer and keyboard follow the current input backend. Controller is currently `false` on Wayland portal and Hyprland IPC because neither exposes a compositor-agnostic gamepad injection API.
 
 ## Screen Sources
 

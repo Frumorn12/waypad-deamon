@@ -112,6 +112,11 @@ pub enum Command {
         dy: f64,
         finish: bool,
     },
+    ExternalInput {
+        device_id: String,
+        device_type: ExternalDeviceType,
+        event: ExternalInputEvent,
+    },
     Key {
         keysym: u32,
         state: ButtonState,
@@ -180,6 +185,53 @@ impl ButtonState {
             Self::Pressed => 1,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalDeviceType {
+    Keyboard,
+    Mouse,
+    Touchpad,
+    Gamepad,
+    Joystick,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExternalInputEvent {
+    DeviceConnected {
+        name: String,
+        classes: Vec<ExternalDeviceType>,
+    },
+    DeviceDisconnected,
+    PointerMove {
+        dx: f64,
+        dy: f64,
+    },
+    PointerButton {
+        button: PointerButton,
+        state: ButtonState,
+    },
+    PointerScroll {
+        dx: f64,
+        dy: f64,
+        finish: bool,
+    },
+    KeyboardKey {
+        keysym: u32,
+        state: ButtonState,
+        repeat: bool,
+    },
+    ControllerButton {
+        button: String,
+        state: ButtonState,
+    },
+    ControllerAxis {
+        axis: String,
+        value: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,5 +329,19 @@ mod tests {
         assert!(raw.contains("pointer_move_absolute"));
         let decoded: Command = serde_json::from_str(&raw).unwrap();
         assert!(matches!(decoded, Command::PointerMoveAbsolute { .. }));
+    }
+
+    #[test]
+    fn external_input_command_round_trips() {
+        let command = Command::ExternalInput {
+            device_id: "android:1:abcd".into(),
+            device_type: ExternalDeviceType::Mouse,
+            event: ExternalInputEvent::PointerMove { dx: 4.0, dy: -2.0 },
+        };
+        let raw = serde_json::to_string(&command).unwrap();
+        assert!(raw.contains("external_input"));
+        assert!(raw.contains("pointer_move"));
+        let decoded: Command = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(decoded, Command::ExternalInput { .. }));
     }
 }

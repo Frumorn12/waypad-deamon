@@ -5,8 +5,8 @@ use crate::{
     discovery,
     input::InputManager,
     protocol::{
-        ApiError, ClientSecureMessage, Command, PROTOCOL_VERSION, response_empty, response_error,
-        response_ok,
+        ApiError, ClientSecureMessage, Command, ExternalDeviceType, ExternalInputEvent,
+        PROTOCOL_VERSION, response_empty, response_error, response_ok,
     },
     screen::{self, ScreenManager, StreamStartOptions},
     state::{
@@ -439,6 +439,13 @@ async fn handle_command(
                 state.input.lock().await.scroll(dx, dy, finish).await?;
                 Ok(None)
             }
+            Command::ExternalInput {
+                device_id,
+                device_type,
+                event,
+            } => handle_external_input(state, device_id, device_type, event)
+                .await
+                .map(|_| None),
             Command::Key { keysym, state: st } => {
                 state.input.lock().await.key(keysym, st).await?;
                 Ok(None)
@@ -496,6 +503,62 @@ async fn send_text(state: &AppState, text: String) -> anyhow::Result<()> {
         anyhow::bail!("Text input rejected: maximum length is 4096 bytes");
     }
     state.input.lock().await.text(&text).await
+}
+
+async fn handle_external_input(
+    state: &AppState,
+    device_id: String,
+    device_type: ExternalDeviceType,
+    event: ExternalInputEvent,
+) -> anyhow::Result<()> {
+    match event {
+        ExternalInputEvent::DeviceConnected { name, classes } => {
+            info!(
+                %device_id,
+                ?device_type,
+                %name,
+                ?classes,
+                "android external input device connected"
+            );
+            Ok(())
+        }
+        ExternalInputEvent::DeviceDisconnected => {
+            info!(%device_id, ?device_type, "android external input device disconnected");
+            Ok(())
+        }
+        ExternalInputEvent::PointerMove { dx, dy } => {
+            validate_delta(dx, dy)?;
+            state.input.lock().await.pointer_move(dx, dy).await
+        }
+        ExternalInputEvent::PointerButton { button, state: st } => {
+            state.input.lock().await.pointer_button(button, st).await
+        }
+        ExternalInputEvent::PointerScroll { dx, dy, finish } => {
+            validate_delta(dx, dy)?;
+            state.input.lock().await.scroll(dx, dy, finish).await
+        }
+        ExternalInputEvent::KeyboardKey {
+            keysym,
+            state: st,
+            repeat,
+        } => {
+            debug!(%device_id, ?device_type, keysym, repeat, "android external keyboard key");
+            state.input.lock().await.key(keysym, st).await
+        }
+        ExternalInputEvent::ControllerButton { button, state: st } => {
+            anyhow::bail!(
+                "Controller forwarding unsupported on this host backend: button={button} state={st:?}. Wayland RemoteDesktop and the Hyprland IPC fallback do not expose a generic virtual gamepad injection path yet."
+            )
+        }
+        ExternalInputEvent::ControllerAxis { axis, value } => {
+            if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+                anyhow::bail!("Controller axis value out of range for {axis}: {value}");
+            }
+            anyhow::bail!(
+                "Controller forwarding unsupported on this host backend: axis={axis}. Wayland RemoteDesktop and the Hyprland IPC fallback do not expose a generic virtual gamepad injection path yet."
+            )
+        }
+    }
 }
 
 async fn send_shortcut(state: &AppState, keys: Vec<String>) -> anyhow::Result<()> {

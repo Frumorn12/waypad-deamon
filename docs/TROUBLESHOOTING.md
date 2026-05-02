@@ -77,6 +77,21 @@ This is a normal partial-support case. Capture and control are separate capabili
 
 For portal input, tap "Approve portal" in the app and approve pointer/keyboard control on the Linux host. For Hyprland fallback, confirm `waypad-daemon doctor` reports `input.backend = hyprland-ipc`.
 
+## External Mouse Or Keyboard On Android Does Nothing
+
+The Android app forwards external devices only while connected in Pad or Screen mode. On the host, check capabilities:
+
+```bash
+waypad-daemon doctor | grep -A8 external_input
+journalctl --user -u waypad-daemon -f
+```
+
+`external_input.pointer` and `external_input.keyboard` follow the normal input backend. If they are false, fix RemoteDesktop portal approval or the Hyprland IPC fallback first. If Android logs show `external_input_unsupported`, the host is explicitly rejecting that class rather than dropping it silently.
+
+## Controller Or Gamepad Forwarding Is Unsupported
+
+Android controller detection and protocol transport are implemented, but this daemon currently reports `external_input.controller = false`. Wayland RemoteDesktop portal methods and the Hyprland IPC fallback do not provide a generic virtual gamepad injection path. This is a host backend limitation, not an Android detection issue. Future libei or compositor-specific support can be added behind the existing `external_input` command.
+
 ## Android Reports "Connection Closed" Or "Broken Pipe"
 
 Watch daemon logs while pressing Start in the Android Screen tab:
