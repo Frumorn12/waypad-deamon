@@ -18,6 +18,8 @@ struct DiscoveryReply<'a> {
     host_fingerprint: &'a str,
     input_backend: String,
     input_supported: bool,
+    capture_backend: String,
+    capture_supported: bool,
 }
 
 pub async fn run_discovery(
@@ -49,6 +51,8 @@ pub async fn run_discovery(
             host_fingerprint: &identity.fingerprint,
             input_backend: capabilities.input.backend.clone(),
             input_supported: capabilities.input.supported,
+            capture_backend: capabilities.capture.backend.clone(),
+            capture_supported: capabilities.capture.supported,
         };
         let raw = serde_json::to_vec(&reply)?;
         socket

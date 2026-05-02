@@ -8,6 +8,7 @@ Default ports:
 | --- | ---: | --- |
 | Discovery | 47770 | UDP broadcast |
 | Control | 47771 | TCP with encrypted Waypad frames |
+| Screen stream | 47771 | Token-attached TCP frame stream on the control listener |
 
 ## Discovery
 
@@ -27,7 +28,9 @@ The daemon replies with JSON:
   "control_port": 47771,
   "host_fingerprint": "abcd:...",
   "input_backend": "wayland-portal",
-  "input_supported": true
+  "input_supported": true,
+  "capture_backend": "wayland-screencast-portal",
+  "capture_supported": true
 }
 ```
 
@@ -116,6 +119,7 @@ Current command names:
 | `get_capabilities` | Wayland, portal, and system capability model. |
 | `prepare_input` | Starts the RemoteDesktop portal approval flow. |
 | `pointer_move` | Relative pointer motion. |
+| `pointer_move_absolute` | Source-local absolute pointer motion for remote screen control. |
 | `pointer_button` | Left, middle, or right button press/release. |
 | `scroll` | Smooth pointer-axis scroll. |
 | `key` | XKB keysym press/release. |
@@ -125,6 +129,85 @@ Current command names:
 | `volume` | `wpctl` or `pactl` volume actions. |
 | `brightness` | `brightnessctl` brightness actions. |
 | `clipboard_set` | Sets Wayland clipboard via `wl-copy`. |
+| `list_screen_sources` | Lists portal picker and/or concrete monitor sources. |
+| `start_screen_stream` | Starts a token-protected screen frame stream. |
+| `stop_screen_stream` | Stops a running screen stream session. |
 | `system` | Lock or suspend. Suspend is disabled by default. |
 
 Unsupported commands return an authenticated error with a user-facing reason.
+
+## Screen Sources
+
+`list_screen_sources` returns:
+
+```json
+{
+  "sources": [
+    {
+      "id": "hyprland:monitor:DP-1",
+      "label": "DP-1 (monitor description)",
+      "kind": "monitor",
+      "backend": "hyprland-grim",
+      "width": 1920,
+      "height": 1080,
+      "x": 0,
+      "y": 0,
+      "scale": 1.0,
+      "focused": true
+    }
+  ]
+}
+```
+
+When the standard portal path is available, the daemon also exposes `portal:chooser`. The actual monitor/window is selected locally through the compositor portal dialog.
+
+## Screen Stream
+
+The Android app starts a stream with:
+
+```json
+{
+  "name": "start_screen_stream",
+  "source_id": "hyprland:monitor:DP-1",
+  "max_fps": 12,
+  "jpeg_quality": 70
+}
+```
+
+The daemon replies:
+
+```json
+{
+  "session_id": "...",
+  "stream_port": 47771,
+  "token": "...",
+  "codec": "jpeg",
+  "transport": "waypad-control-port-stream-v2",
+  "source": { "id": "hyprland:monitor:DP-1" }
+}
+```
+
+For `waypad-control-port-stream-v2`, the app opens a fresh TCP connection to `stream_port` and writes this JSON line before any encrypted control-channel handshake:
+
+```json
+{"type":"stream_connect","token":"..."}
+```
+
+The daemon peeks at new TCP connections on the control listener. If the first line is a valid `stream_connect` token for a pending screen session, that socket is attached to the stream producer and receives:
+
+```text
+WAYPAD_STREAM_V1\n
+```
+
+Frames then repeat:
+
+```text
+u32_be header_length
+u32_be payload_length
+header_length bytes of UTF-8 JSON
+payload_length bytes of JPEG
+```
+
+The frame header contains at least `seq`, `timestamp_ms`, `codec`, `width`, and `height`.
+
+The current MVP stream is token-protected but not encrypted independently; it is intended for the same trusted LAN model as discovery/control pairing. The authenticated control channel remains encrypted. Older builds used a dynamic per-session stream port, but current builds reuse the stable control port so phone clients are not broken by LAN firewalls or NAT rules that block random high ports. A future WebRTC/H.264 transport can replace this frame stream while keeping the source and input commands.

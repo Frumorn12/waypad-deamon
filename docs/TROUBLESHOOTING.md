@@ -26,6 +26,16 @@ If `RemoteDesktop` is unavailable, the daemon cannot use the portal input path. 
 
 On Hyprland, Waypad may still expose the `hyprland-ipc` fallback. That backend talks to the user-session Hyprland IPC socket directly, supports pointer motion, mouse button hold/release, wheel-style scrolling, shortcuts, and direct ASCII text events. Unsupported text falls back to `wl-copy` paste, which requires `wl-clipboard` and temporarily replaces the current Wayland clipboard.
 
+For screen viewing on Hyprland, install PipeWire/GStreamer helpers if you want the standard portal stream path:
+
+```bash
+sudo pacman -S pipewire wireplumber gst-plugin-pipewire gst-plugins-good grim
+systemctl --user restart pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-hyprland
+waypad-daemon doctor
+```
+
+If the portal stream path is incomplete but Hyprland and `grim` are available, Waypad exposes concrete monitor sources through the isolated `hyprland-grim` fallback.
+
 ## "Remote input unavailable: RemoteDesktop portal not available"
 
 Check:
@@ -37,6 +47,70 @@ systemctl --user status xdg-desktop-portal xdg-desktop-portal-hyprland
 ```
 
 Hyprland users should ensure `xdg-desktop-portal-hyprland` is installed and not masked.
+
+## "Screen capture unavailable: ScreenCast portal not available"
+
+Check the ScreenCast portal:
+
+```bash
+busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop org.freedesktop.portal.ScreenCast --no-pager
+systemctl --user status xdg-desktop-portal
+```
+
+On Hyprland, ensure `xdg-desktop-portal-hyprland` is installed and running. On GNOME/KDE, use the desktop's portal backend and update the portal packages if the interface is missing.
+
+## "PipeWire capture could not be initialized"
+
+Check PipeWire and GStreamer:
+
+```bash
+systemctl --user status pipewire wireplumber
+gst-inspect-1.0 pipewiresrc
+gst-inspect-1.0 jpegenc
+```
+
+If `pipewiresrc` is missing, install the PipeWire GStreamer plugin package for your distribution.
+
+## Stream Starts But Input Fails
+
+This is a normal partial-support case. Capture and control are separate capabilities. The app can show the screen while the daemon reports that RemoteDesktop input is blocked or unsupported.
+
+For portal input, tap "Approve portal" in the app and approve pointer/keyboard control on the Linux host. For Hyprland fallback, confirm `waypad-daemon doctor` reports `input.backend = hyprland-ipc`.
+
+## Android Reports "Connection Closed" Or "Broken Pipe"
+
+Watch daemon logs while pressing Start in the Android Screen tab:
+
+```bash
+journalctl --user -u waypad-daemon -f
+```
+
+Healthy current logs show:
+
+```text
+screen stream session pending client attach ... stream_port=47771
+screen stream attach request received on control port
+screen stream client attached ...
+```
+
+If logs show a random high `stream_port`, the Android app and daemon are from mismatched builds. Rebuild the daemon, install it, and restart the user service:
+
+```bash
+cargo build --release
+install -Dm755 target/release/waypad-daemon ~/.local/bin/waypad-daemon
+systemctl --user restart waypad-daemon
+```
+
+If Android still cannot connect to `47771`, confirm the daemon is listening and the phone can reach the host IP:
+
+```bash
+ss -ltnp | grep 47771
+ip -4 addr
+```
+
+## Input Works But Stream Fails
+
+Check `capture` in `waypad-daemon doctor`. Input may use RemoteDesktop or Hyprland IPC even when ScreenCast/PipeWire is unavailable. Use the app's Pad mode as a fallback while fixing portal or PipeWire capture.
 
 ## "Input injection requires portal approval"
 

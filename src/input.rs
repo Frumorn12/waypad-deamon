@@ -69,6 +69,14 @@ impl InputManager {
         }
     }
 
+    pub async fn pointer_move_absolute(&self, x: f64, y: f64) -> anyhow::Result<()> {
+        match self {
+            Self::Noop { reason } => bail!("{reason}"),
+            Self::Portal(backend) => backend.pointer_move_absolute(x, y).await,
+            Self::Hyprland(backend) => backend.pointer_move_absolute(x, y).await,
+        }
+    }
+
     pub async fn pointer_button(
         &self,
         button: PointerButton,
@@ -184,6 +192,30 @@ impl HyprlandHyprctlInputBackend {
         let x = state.cursor_x.round() as i64;
         let y = state.cursor_y.round() as i64;
         let target = CursorPosition { x, y };
+        let latest = state
+            .pending_cursor
+            .or(state.in_flight_cursor)
+            .unwrap_or(state.cursor);
+        if latest == target {
+            return Ok(());
+        }
+        state.pending_cursor = Some(target);
+        drop(state);
+        self.pointer_notify.notify_one();
+        Ok(())
+    }
+
+    pub async fn pointer_move_absolute(&self, x: f64, y: f64) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        if let Some(error) = state.pointer_last_error.take() {
+            bail!("Hyprland pointer dispatch failed: {error}");
+        }
+        state.cursor_x = clamp_cursor_f64(x);
+        state.cursor_y = clamp_cursor_f64(y);
+        let target = CursorPosition {
+            x: state.cursor_x.round() as i64,
+            y: state.cursor_y.round() as i64,
+        };
         let latest = state
             .pending_cursor
             .or(state.in_flight_cursor)
@@ -852,6 +884,21 @@ impl WaylandPortalInputBackend {
             .await?
             .call::<_, _, ()>("NotifyPointerMotion", &(session, empty_options(), dx, dy))
             .await?;
+        Ok(())
+    }
+
+    pub async fn pointer_move_absolute(&self, x: f64, y: f64) -> anyhow::Result<()> {
+        let session = self.session()?;
+        self.proxy()
+            .await?
+            .call::<_, _, ()>(
+                "NotifyPointerMotionAbsolute",
+                &(session, empty_options(), 0u32, x, y),
+            )
+            .await
+            .context(
+                "RemoteDesktop portal absolute pointer motion failed; this backend may require a shared portal stream id",
+            )?;
         Ok(())
     }
 

@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod input;
 pub mod platform;
 pub mod protocol;
+pub mod screen;
 pub mod server;
 pub mod state;
 pub mod system_control;

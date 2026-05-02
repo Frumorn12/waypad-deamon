@@ -6,7 +6,7 @@ The daemon listens on the local network, pairs Android devices with explicit loc
 
 ## Status
 
-This is a shippable MVP foundation, not a finished remote-desktop suite. It implements secure pairing, encrypted sessions, trusted-device storage, discovery, diagnostics, systemd user integration, and a Wayland portal input backend. Full-screen streaming, cloud relay, iOS, and NAT traversal are intentionally out of scope.
+This is a shippable MVP foundation, not a finished remote-desktop suite. It implements secure pairing, encrypted sessions, trusted-device storage, discovery, diagnostics, systemd user integration, Wayland portal input, and a remote screen MVP. Cloud relay, iOS, NAT traversal, and production WebRTC/H.264 streaming are intentionally out of scope.
 
 ## Why Waypad Exists
 
@@ -29,6 +29,9 @@ Waypad is built around the real Wayland path:
 - Capability endpoint for Wayland, portal, libei hints, volume, media, brightness, clipboard, lock, and suspend.
 - Wayland RemoteDesktop portal backend for pointer, click, scroll, and keyboard keysyms when approved.
 - Hyprland IPC fallback for pointer movement, mouse buttons, scroll, shortcuts, direct ASCII text, and clipboard-backed text for unsupported characters when RemoteDesktop is unavailable.
+- Remote screen source discovery through XDG Desktop Portal ScreenCast and Hyprland monitor fallback.
+- Token-negotiated LAN JPEG frame stream for Android screen viewing.
+- Absolute pointer command path for interaction with a displayed remote monitor.
 - No X11-only injection hacks and no root-only default input path.
 - `systemd --user` unit for correct user session and portal access.
 
@@ -41,6 +44,7 @@ src/
   crypto.rs           Handshake and encrypted frame protocol
   discovery.rs        UDP discovery
   input.rs            Wayland portal input backend
+  screen.rs           Screen sources, ScreenCast/PipeWire streaming, Hyprland grim fallback
   server.rs           Authenticated command server
   state.rs            Host identity and trusted devices
   system_control.rs   Volume/media/brightness/clipboard/system actions
@@ -66,7 +70,7 @@ Minimum build/runtime:
 Recommended on Arch/CachyOS/Hyprland:
 
 ```bash
-sudo pacman -S rust dbus xdg-desktop-portal xdg-desktop-portal-hyprland wireplumber playerctl brightnessctl wl-clipboard
+sudo pacman -S rust dbus xdg-desktop-portal xdg-desktop-portal-hyprland pipewire wireplumber gst-plugin-pipewire gst-plugins-good grim playerctl brightnessctl wl-clipboard
 ```
 
 ## Build
@@ -204,13 +208,16 @@ Supported:
 - Hyprland/wlroots environments with working xdg-desktop-portal RemoteDesktop support.
 - LAN-only Android control.
 - Pointer, clicks, scroll, keysyms, text, shortcuts, media, volume, brightness, clipboard set, lock.
+- Remote screen viewing through ScreenCast/PipeWire where portal streaming works.
+- Hyprland monitor viewing through an isolated `grim` fallback when portal streaming dependencies are incomplete.
 
 Unsupported in MVP:
 
 - X11 input injection.
 - Root `/dev/uinput` bypass as the default backend.
 - Internet exposure or cloud relay.
-- Video streaming.
+- End-to-end encrypted media stream separate from the encrypted control channel.
+- WebRTC/H.264 transport, TURN, and adaptive bitrate.
 - iOS client.
 
 ## Troubleshooting
@@ -232,6 +239,8 @@ waypad-daemon doctor
 If the daemon reports `RemoteDesktop portal not available`, the portal-safe input path cannot work until the portal/compositor stack supports it. On Hyprland, Waypad falls back to the compositor IPC socket for practical local-session input.
 
 On Hyprland, Waypad can expose the `hyprland-ipc` backend. It moves the cursor through Hyprland IPC, sends mouse button hold/release with `sendkeystate`, maps scroll to compositor mouse wheel shortcuts, and injects normal ASCII text as key events. Unsupported characters fall back to writing the requested text to `wl-copy` and sending `CTRL+V` to the active window. This keeps the daemon session-scoped and avoids root/uinput hacks, but the fallback paste path temporarily replaces the Wayland clipboard.
+
+For remote screen mode, check the `capture` section in `waypad-daemon doctor`. Standard Wayland capture uses XDG Desktop Portal ScreenCast plus PipeWire and GStreamer. Hyprland systems can also expose monitor sources through the `hyprland-grim` fallback. If capture works but input fails, use screen viewing read-only or switch to Pad mode until RemoteDesktop or Hyprland IPC input is available.
 
 More details are in `docs/TROUBLESHOOTING.md`.
 
@@ -257,6 +266,7 @@ RUST_LOG=debug cargo run -- serve
 
 - QR pairing payload for IP, port, code, and fingerprint.
 - libei sender backend through RemoteDesktop `ConnectToEIS` where supported.
+- WebRTC/H.264 media transport to replace the MVP JPEG frame stream.
 - More detailed monitor/compositor diagnostics.
 - Signed release packages.
 - Broader integration tests with a fake protocol client.

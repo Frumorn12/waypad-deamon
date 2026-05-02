@@ -1,4 +1,6 @@
-use crate::platform::{SessionInfo, command_exists, detect_session, hyprland_ipc_available};
+use crate::platform::{
+    SessionInfo, command_exists, command_output, detect_session, hyprland_ipc_available,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6,6 +8,7 @@ pub struct Capabilities {
     pub session: SessionInfo,
     pub portal: PortalCapability,
     pub input: InputCapability,
+    pub capture: CaptureCapability,
     pub system: SystemCapabilities,
 }
 
@@ -29,6 +32,21 @@ pub struct InputCapability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureCapability {
+    pub supported: bool,
+    pub backend: String,
+    pub requires_user_approval: bool,
+    pub reason: Option<String>,
+    pub portal_screencast_available: bool,
+    pub screencast_version: Option<u32>,
+    pub available_source_types: Vec<String>,
+    pub available_cursor_modes: Vec<String>,
+    pub pipewire_runtime_available: bool,
+    pub gstreamer_pipewire_available: bool,
+    pub hyprland_grim_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemCapabilities {
     pub volume: bool,
     pub media: bool,
@@ -42,6 +60,7 @@ impl Capabilities {
     pub async fn detect(allow_suspend: bool) -> Self {
         let session = detect_session();
         let portal = detect_portal().await;
+        let screencast = detect_screencast_portal().await;
         let pointer = portal.available_device_types.iter().any(|d| d == "pointer");
         let keyboard = portal
             .available_device_types
@@ -104,6 +123,72 @@ impl Capabilities {
             )
         };
 
+        let pipewire_runtime_available = command_exists("pipewire") || command_exists("pw-cli");
+        let gstreamer_pipewire_available = command_exists("gst-launch-1.0")
+            && command_output("gst-inspect-1.0", &["pipewiresrc"]).is_some()
+            && command_output("gst-inspect-1.0", &["jpegenc"]).is_some();
+        let hyprland_grim_available = wayland
+            && session.compositor_hint == "hyprland"
+            && command_exists("grim")
+            && command_output("hyprctl", &["monitors", "-j"]).is_some();
+        let portal_capture_supported = wayland
+            && screencast.available
+            && pipewire_runtime_available
+            && gstreamer_pipewire_available;
+        let capture_supported = portal_capture_supported || hyprland_grim_available;
+        let (capture_backend, capture_requires_approval, capture_reason) = if !wayland {
+            (
+                "noop",
+                false,
+                Some("Screen capture is only enabled for Wayland sessions in this daemon".into()),
+            )
+        } else if portal_capture_supported {
+            (
+                "wayland-screencast-portal",
+                true,
+                Some(
+                    "Screen capture uses XDG Desktop Portal ScreenCast and PipeWire approval"
+                        .into(),
+                ),
+            )
+        } else if hyprland_grim_available {
+            (
+                "hyprland-grim",
+                false,
+                Some(
+                    "ScreenCast portal streaming dependencies are incomplete; using isolated Hyprland grim monitor capture fallback"
+                        .into(),
+                ),
+            )
+        } else if !screencast.xdg_desktop_portal_available {
+            (
+                "noop",
+                false,
+                Some("Screen capture unavailable: xdg-desktop-portal is not running".into()),
+            )
+        } else if !screencast.available {
+            (
+                "noop",
+                false,
+                Some("Screen capture unavailable: ScreenCast portal not available".into()),
+            )
+        } else if !pipewire_runtime_available {
+            (
+                "noop",
+                false,
+                Some("Screen capture unavailable: PipeWire runtime tools are missing".into()),
+            )
+        } else {
+            (
+                "noop",
+                false,
+                Some(
+                    "Screen capture unavailable: GStreamer PipeWire/JPEG pipeline is missing"
+                        .into(),
+                ),
+            )
+        };
+
         Self {
             session,
             portal,
@@ -112,6 +197,19 @@ impl Capabilities {
                 backend: input_backend.into(),
                 requires_user_approval,
                 reason: input_reason,
+            },
+            capture: CaptureCapability {
+                supported: capture_supported,
+                backend: capture_backend.into(),
+                requires_user_approval: capture_requires_approval,
+                reason: capture_reason,
+                portal_screencast_available: screencast.available,
+                screencast_version: screencast.version,
+                available_source_types: screencast.available_source_types,
+                available_cursor_modes: screencast.available_cursor_modes,
+                pipewire_runtime_available,
+                gstreamer_pipewire_available,
+                hyprland_grim_available,
             },
             system: SystemCapabilities {
                 volume: command_exists("wpctl") || command_exists("pactl"),
@@ -122,6 +220,138 @@ impl Capabilities {
                 suspend: allow_suspend && command_exists("systemctl"),
             },
         }
+    }
+}
+
+#[derive(Debug)]
+struct ScreenCastPortalInfo {
+    xdg_desktop_portal_available: bool,
+    available: bool,
+    version: Option<u32>,
+    available_source_types: Vec<String>,
+    available_cursor_modes: Vec<String>,
+}
+
+async fn detect_screencast_portal() -> ScreenCastPortalInfo {
+    let Ok(conn) = zbus::Connection::session().await else {
+        return ScreenCastPortalInfo {
+            xdg_desktop_portal_available: false,
+            available: false,
+            version: None,
+            available_source_types: vec![],
+            available_cursor_modes: vec![],
+        };
+    };
+
+    let has_portal = match zbus::fdo::DBusProxy::new(&conn).await {
+        Ok(proxy) => {
+            let Ok(name) = zbus::names::BusName::try_from("org.freedesktop.portal.Desktop") else {
+                return ScreenCastPortalInfo {
+                    xdg_desktop_portal_available: false,
+                    available: false,
+                    version: None,
+                    available_source_types: vec![],
+                    available_cursor_modes: vec![],
+                };
+            };
+            proxy.name_has_owner(name).await.unwrap_or(false)
+        }
+        Err(_) => false,
+    };
+    if !has_portal {
+        return ScreenCastPortalInfo {
+            xdg_desktop_portal_available: false,
+            available: false,
+            version: None,
+            available_source_types: vec![],
+            available_cursor_modes: vec![],
+        };
+    }
+
+    let proxy = match zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.ScreenCast",
+    )
+    .await
+    {
+        Ok(proxy) => proxy,
+        Err(_) => {
+            return ScreenCastPortalInfo {
+                xdg_desktop_portal_available: true,
+                available: false,
+                version: None,
+                available_source_types: vec![],
+                available_cursor_modes: vec![],
+            };
+        }
+    };
+
+    let version: Option<u32> = proxy.get_property("version").await.ok();
+    let source_mask: u32 = proxy
+        .get_property("AvailableSourceTypes")
+        .await
+        .unwrap_or(0);
+    let cursor_mask: u32 = proxy
+        .get_property("AvailableCursorModes")
+        .await
+        .unwrap_or(0);
+
+    ScreenCastPortalInfo {
+        xdg_desktop_portal_available: true,
+        available: version.is_some(),
+        version,
+        available_source_types: source_type_names(source_mask),
+        available_cursor_modes: cursor_mode_names(cursor_mask),
+    }
+}
+
+fn source_type_names(mask: u32) -> Vec<String> {
+    let mut names = Vec::new();
+    if mask & 1 != 0 {
+        names.push("monitor".into());
+    }
+    if mask & 2 != 0 {
+        names.push("window".into());
+    }
+    if mask & 4 != 0 {
+        names.push("virtual".into());
+    }
+    names
+}
+
+fn cursor_mode_names(mask: u32) -> Vec<String> {
+    let mut names = Vec::new();
+    if mask & 1 != 0 {
+        names.push("hidden".into());
+    }
+    if mask & 2 != 0 {
+        names.push("embedded".into());
+    }
+    if mask & 4 != 0 {
+        names.push("metadata".into());
+    }
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cursor_mode_names, source_type_names};
+
+    #[test]
+    fn parses_screencast_source_type_mask() {
+        assert_eq!(
+            source_type_names(1 | 2 | 4),
+            vec!["monitor", "window", "virtual"]
+        );
+        assert!(source_type_names(0).is_empty());
+    }
+
+    #[test]
+    fn parses_screencast_cursor_mode_mask() {
+        assert_eq!(cursor_mode_names(1 | 2), vec!["hidden", "embedded"]);
+        assert_eq!(cursor_mode_names(4), vec!["metadata"]);
     }
 }
 

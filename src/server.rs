@@ -8,12 +8,14 @@ use crate::{
         ApiError, ClientSecureMessage, Command, PROTOCOL_VERSION, response_empty, response_error,
         response_ok,
     },
+    screen::{self, ScreenManager, StreamStartOptions},
     state::{
         StatePaths, TrustedDevice, TrustedDevices, load_trusted_devices, save_trusted_devices,
         validate_pairing_code,
     },
     system_control,
 };
+use anyhow::Context;
 use serde_json::json;
 use std::{
     collections::{HashMap, VecDeque},
@@ -22,8 +24,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
+    io::{AsyncBufReadExt, BufReader},
     net::{TcpListener, TcpStream},
     sync::{Mutex, RwLock},
+    time::timeout,
 };
 use tracing::{debug, info, warn};
 
@@ -35,6 +39,7 @@ pub struct AppState {
     pub devices: Arc<Mutex<TrustedDevices>>,
     pub input: Arc<Mutex<InputManager>>,
     pub capabilities: Arc<RwLock<Capabilities>>,
+    pub screen: Arc<ScreenManager>,
     pub rate_limiter: Arc<Mutex<PairRateLimiter>>,
 }
 
@@ -66,6 +71,11 @@ pub async fn run(config: Config, paths: StatePaths, identity: HostIdentity) -> a
     let devices = load_trusted_devices(&paths)?;
     let capabilities = Capabilities::detect(config.allow_suspend).await;
     let input = InputManager::from_capabilities(&capabilities).await;
+    let capabilities = Arc::new(RwLock::new(capabilities.clone()));
+    let screen = Arc::new(ScreenManager::new(
+        capabilities.clone(),
+        config.control_port,
+    ));
     let identity = Arc::new(identity);
     let state = AppState {
         config: config.clone(),
@@ -73,15 +83,20 @@ pub async fn run(config: Config, paths: StatePaths, identity: HostIdentity) -> a
         identity: identity.clone(),
         devices: Arc::new(Mutex::new(devices)),
         input: Arc::new(Mutex::new(input)),
-        capabilities: Arc::new(RwLock::new(capabilities.clone())),
+        capabilities: capabilities.clone(),
+        screen,
         rate_limiter: Arc::new(Mutex::new(PairRateLimiter::default())),
     };
 
     let discovery_config = config.clone();
     let discovery_identity = identity;
     tokio::spawn(async move {
-        if let Err(err) =
-            discovery::run_discovery(discovery_config, discovery_identity, capabilities).await
+        if let Err(err) = discovery::run_discovery(
+            discovery_config,
+            discovery_identity,
+            capabilities.read().await.clone(),
+        )
+        .await
         {
             warn!(%err, "discovery listener stopped");
         }
@@ -106,10 +121,15 @@ pub async fn run(config: Config, paths: StatePaths, identity: HostIdentity) -> a
 }
 
 async fn handle_connection(
-    stream: TcpStream,
+    mut stream: TcpStream,
     peer: SocketAddr,
     state: AppState,
 ) -> anyhow::Result<()> {
+    if let Some(token) = maybe_accept_stream_attach(&mut stream).await? {
+        info!(%peer, "screen stream attach request received on control port");
+        state.screen.attach_stream_client(&token, stream).await?;
+        return Ok(());
+    }
     let (reader, writer) = stream.into_split();
     let mut channel = SecureChannel::server(reader, writer, &state.identity).await?;
     let mut authenticated: Option<TrustedDevice> = None;
@@ -184,6 +204,30 @@ async fn handle_connection(
             }
         }
     }
+}
+
+async fn maybe_accept_stream_attach(stream: &mut TcpStream) -> anyhow::Result<Option<String>> {
+    let mut peek = [0u8; 256];
+    let n = timeout(Duration::from_secs(5), stream.peek(&mut peek)).await??;
+    let preview = String::from_utf8_lossy(&peek[..n]);
+    if !preview.contains("\"stream_connect\"") {
+        return Ok(None);
+    }
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    timeout(Duration::from_secs(5), reader.read_line(&mut line)).await??;
+    let value: serde_json::Value = serde_json::from_str(&line)?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("stream_connect") {
+        anyhow::bail!("Invalid stream attach preface");
+    }
+    let token = value
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.is_empty())
+        .context("Missing stream attach token")?
+        .to_string();
+    drop(reader);
+    Ok(Some(token))
 }
 
 async fn handle_pair(
@@ -379,6 +423,13 @@ async fn handle_command(
                 state.input.lock().await.pointer_move(dx, dy).await?;
                 Ok(None)
             }
+            Command::PointerMoveAbsolute { source_id, x, y } => {
+                validate_absolute(x, y)?;
+                let source = state.screen.source_by_id(source_id.as_deref()).await?;
+                let input = state.input.lock().await;
+                screen::pointer_move_absolute(&input, source, x, y).await?;
+                Ok(None)
+            }
             Command::PointerButton { button, state: st } => {
                 state.input.lock().await.pointer_button(button, st).await?;
                 Ok(None)
@@ -401,6 +452,27 @@ async fn handle_command(
             }
             Command::ClipboardSet { text } => {
                 system_control::clipboard_set(&text).await.map(|_| None)
+            }
+            Command::ListScreenSources => Ok(Some(json!({
+                "sources": state.screen.list_sources().await?
+            }))),
+            Command::StartScreenStream {
+                source_id,
+                max_fps,
+                jpeg_quality,
+            } => Ok(Some(json!(
+                state
+                    .screen
+                    .start_stream(StreamStartOptions {
+                        source_id,
+                        max_fps,
+                        jpeg_quality,
+                    })
+                    .await?
+            ))),
+            Command::StopScreenStream { session_id } => {
+                state.screen.stop_stream(&session_id).await?;
+                Ok(None)
             }
             Command::System { action } => system_control::system(&state.config, action)
                 .await
@@ -474,6 +546,19 @@ fn shortcut_key_to_keysym(key: &str) -> anyhow::Result<u32> {
 fn validate_delta(dx: f64, dy: f64) -> anyhow::Result<()> {
     if !dx.is_finite() || !dy.is_finite() || dx.abs() > 10_000.0 || dy.abs() > 10_000.0 {
         anyhow::bail!("Pointer delta rejected as invalid");
+    }
+    Ok(())
+}
+
+fn validate_absolute(x: f64, y: f64) -> anyhow::Result<()> {
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < -100_000.0
+        || y < -100_000.0
+        || x > 100_000.0
+        || y > 100_000.0
+    {
+        anyhow::bail!("Absolute pointer coordinate rejected as invalid");
     }
     Ok(())
 }

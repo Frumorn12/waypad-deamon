@@ -98,6 +98,11 @@ pub enum Command {
         dx: f64,
         dy: f64,
     },
+    PointerMoveAbsolute {
+        source_id: Option<String>,
+        x: f64,
+        y: f64,
+    },
     PointerButton {
         button: PointerButton,
         state: ButtonState,
@@ -128,6 +133,15 @@ pub enum Command {
     },
     ClipboardSet {
         text: String,
+    },
+    ListScreenSources,
+    StartScreenStream {
+        source_id: Option<String>,
+        max_fps: Option<u32>,
+        jpeg_quality: Option<u8>,
+    },
+    StopScreenStream {
+        session_id: String,
     },
     System {
         action: SystemAction,
@@ -240,5 +254,28 @@ mod tests {
         assert!(raw.contains("pointer_button"));
         let decoded: Command = serde_json::from_str(&raw).unwrap();
         assert!(matches!(decoded, Command::PointerButton { .. }));
+    }
+
+    #[test]
+    fn screen_commands_round_trip() {
+        let command = Command::StartScreenStream {
+            source_id: Some("hyprland:monitor:DP-1".into()),
+            max_fps: Some(12),
+            jpeg_quality: Some(70),
+        };
+        let raw = serde_json::to_string(&command).unwrap();
+        assert!(raw.contains("start_screen_stream"));
+        let decoded: Command = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(decoded, Command::StartScreenStream { .. }));
+
+        let absolute = Command::PointerMoveAbsolute {
+            source_id: Some("hyprland:monitor:DP-1".into()),
+            x: 100.0,
+            y: 200.0,
+        };
+        let raw = serde_json::to_string(&absolute).unwrap();
+        assert!(raw.contains("pointer_move_absolute"));
+        let decoded: Command = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(decoded, Command::PointerMoveAbsolute { .. }));
     }
 }
