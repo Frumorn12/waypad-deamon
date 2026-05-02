@@ -291,10 +291,7 @@ async fn handle_pair(
             None,
         );
     }
-    if state.config.require_private_lan
-        && !state.config.allow_public_pairing
-        && !is_private_or_local(peer)
-    {
+    if !can_pair_publicly(&state.config, peer) {
         warn!(%peer, "rejecting public pairing attempt because require_private_lan=true and allow_public_pairing=false");
         return (
             response_error(
@@ -704,6 +701,16 @@ fn is_private_ipv6(ip: Ipv6Addr) -> bool {
     ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
 }
 
+fn can_pair_publicly(config: &Config, peer: SocketAddr) -> bool {
+    if !config.require_private_lan {
+        return true;
+    }
+    if config.allow_public_pairing {
+        return true;
+    }
+    is_private_or_local(peer)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +720,30 @@ mod tests {
         assert!(is_private_or_local("192.168.1.2:10".parse().unwrap()));
         assert!(is_private_or_local("127.0.0.1:10".parse().unwrap()));
         assert!(!is_private_or_local("8.8.8.8:10".parse().unwrap()));
+    }
+
+    #[test]
+    fn can_pair_publicly_with_default_config_blocks_public() {
+        let config = Config::default();
+        assert!(!can_pair_publicly(&config, "8.8.8.8:10".parse().unwrap()));
+        assert!(can_pair_publicly(&config, "192.168.1.2:10".parse().unwrap()));
+        assert!(can_pair_publicly(&config, "127.0.0.1:10".parse().unwrap()));
+    }
+
+    #[test]
+    fn can_pair_publicly_with_allow_public_pairing_allows_public() {
+        let mut config = Config::default();
+        config.allow_public_pairing = true;
+        assert!(can_pair_publicly(&config, "8.8.8.8:10".parse().unwrap()));
+        assert!(can_pair_publicly(&config, "192.168.1.2:10".parse().unwrap()));
+    }
+
+    #[test]
+    fn can_pair_publicly_with_require_private_lan_false_allows_all() {
+        let mut config = Config::default();
+        config.require_private_lan = false;
+        assert!(can_pair_publicly(&config, "8.8.8.8:10".parse().unwrap()));
+        assert!(can_pair_publicly(&config, "192.168.1.2:10".parse().unwrap()));
     }
 
     #[test]
