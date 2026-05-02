@@ -22,9 +22,9 @@ systemctl --user restart xdg-desktop-portal xdg-desktop-portal-hyprland
 waypad-daemon doctor
 ```
 
-If `RemoteDesktop` is unavailable, the daemon cannot provide full input injection. This is a compositor/portal capability issue, not an Android networking issue.
+If `RemoteDesktop` is unavailable, the daemon cannot use the portal input path. This is a compositor/portal capability issue, not an Android networking issue.
 
-On Hyprland, Waypad may still expose the `hyprland-hyprctl` fallback. That fallback can move the cursor via `hyprctl dispatch movecursor`, but it cannot click, scroll, or type.
+On Hyprland, Waypad may still expose the `hyprland-ipc` fallback. That backend talks to the user-session Hyprland IPC socket directly, supports pointer motion, mouse button hold/release, wheel-style scrolling, shortcuts, and direct ASCII text events. Unsupported text falls back to `wl-copy` paste, which requires `wl-clipboard` and temporarily replaces the current Wayland clipboard.
 
 ## "Remote input unavailable: RemoteDesktop portal not available"
 

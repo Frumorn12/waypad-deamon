@@ -124,7 +124,7 @@ async fn handle_connection(
                 pairing_code,
                 app_version,
             } => {
-                let response = handle_pair(
+                let (response, device) = handle_pair(
                     &state,
                     peer,
                     request_id,
@@ -133,6 +133,9 @@ async fn handle_connection(
                     app_version,
                 )
                 .await;
+                if let Some(device) = device {
+                    authenticated = Some(device);
+                }
                 channel.send(&response).await?;
             }
             ClientSecureMessage::AuthRequest {
@@ -190,15 +193,18 @@ async fn handle_pair(
     device_name: String,
     pairing_code: String,
     app_version: Option<String>,
-) -> crate::protocol::ServerSecureMessage {
+) -> (crate::protocol::ServerSecureMessage, Option<TrustedDevice>) {
     if device_name.trim().is_empty() || device_name.len() > 80 {
-        return response_error(
-            request_id,
-            ApiError::new(
-                "invalid_device_name",
-                "Device name must be 1-80 characters",
-                false,
+        return (
+            response_error(
+                request_id,
+                ApiError::new(
+                    "invalid_device_name",
+                    "Device name must be 1-80 characters",
+                    false,
+                ),
             ),
+            None,
         );
     }
     if !state
@@ -207,31 +213,40 @@ async fn handle_pair(
         .await
         .allow(peer.ip(), state.config.max_pair_attempts_per_minute)
     {
-        return response_error(
-            request_id,
-            ApiError::new(
-                "rate_limited",
-                "Too many pairing attempts; wait one minute",
-                true,
+        return (
+            response_error(
+                request_id,
+                ApiError::new(
+                    "rate_limited",
+                    "Too many pairing attempts; wait one minute",
+                    true,
+                ),
             ),
+            None,
         );
     }
     match validate_pairing_code(&state.paths, &pairing_code) {
         Ok(true) => {}
         Ok(false) => {
-            return response_error(
-                request_id,
-                ApiError::new(
-                    "pairing_denied",
-                    "Pairing code is missing, expired, or incorrect",
-                    true,
+            return (
+                response_error(
+                    request_id,
+                    ApiError::new(
+                        "pairing_denied",
+                        "Pairing code is missing, expired, or incorrect",
+                        true,
+                    ),
                 ),
+                None,
             );
         }
         Err(err) => {
-            return response_error(
-                request_id,
-                ApiError::new("pairing_state_error", err.to_string(), false),
+            return (
+                response_error(
+                    request_id,
+                    ApiError::new("pairing_state_error", err.to_string(), false),
+                ),
+                None,
             );
         }
     }
@@ -240,29 +255,40 @@ async fn handle_pair(
     let (device, token) = match devices.pair_device(device_name, app_version) {
         Ok(value) => value,
         Err(err) => {
-            return response_error(
-                request_id,
-                ApiError::new("pairing_failed", err.to_string(), false),
+            return (
+                response_error(
+                    request_id,
+                    ApiError::new("pairing_failed", err.to_string(), false),
+                ),
+                None,
             );
         }
     };
     if let Err(err) = save_trusted_devices(&state.paths, &devices) {
-        return response_error(
-            request_id,
-            ApiError::new("pairing_store_failed", err.to_string(), false),
+        return (
+            response_error(
+                request_id,
+                ApiError::new("pairing_store_failed", err.to_string(), false),
+            ),
+            None,
         );
     }
-    info!(device_id = %device.id, device_name = %device.name, "paired trusted device");
+    let device_id = device.id.clone();
+    let device_name = device.name.clone();
+    info!(device_id = %device_id, device_name = %device_name, "paired trusted device");
     let capabilities = state.capabilities.read().await.clone();
-    response_ok(
-        request_id,
-        json!({
-            "device_id": device.id,
-            "session_token": token,
-            "host_name": discovery::hostname(),
-            "host_fingerprint": state.identity.fingerprint,
-            "capabilities": capabilities
-        }),
+    (
+        response_ok(
+            request_id,
+            json!({
+                "device_id": device_id,
+                "session_token": token,
+                "host_name": discovery::hostname(),
+                "host_fingerprint": state.identity.fingerprint,
+                "capabilities": capabilities
+            }),
+        ),
+        Some(device),
     )
 }
 
@@ -397,17 +423,7 @@ async fn send_text(state: &AppState, text: String) -> anyhow::Result<()> {
     if text.len() > 4096 {
         anyhow::bail!("Text input rejected: maximum length is 4096 bytes");
     }
-    for ch in text.chars() {
-        let keysym = ch as u32;
-        let input = state.input.lock().await;
-        input
-            .key(keysym, crate::protocol::ButtonState::Pressed)
-            .await?;
-        input
-            .key(keysym, crate::protocol::ButtonState::Released)
-            .await?;
-    }
-    Ok(())
+    state.input.lock().await.text(&text).await
 }
 
 async fn send_shortcut(state: &AppState, keys: Vec<String>) -> anyhow::Result<()> {

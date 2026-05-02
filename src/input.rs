@@ -1,14 +1,17 @@
 use crate::{
     capability::Capabilities,
-    platform::command_exists,
+    platform::{command_exists, hyprland_ipc_socket_path},
     protocol::{ButtonState, PointerButton},
 };
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 use tokio::process::Command;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{Duration, timeout};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
@@ -23,11 +26,11 @@ impl InputManager {
     pub async fn from_capabilities(capabilities: &Capabilities) -> Self {
         match capabilities.input.backend.as_str() {
             "wayland-portal" => {}
-            "hyprland-hyprctl" => {
-                return match HyprlandHyprctlInputBackend::new() {
+            "hyprland-ipc" | "hyprland-hyprctl" => {
+                return match HyprlandHyprctlInputBackend::new().await {
                     Ok(backend) => Self::Hyprland(backend),
                     Err(err) => Self::Noop {
-                        reason: format!("Hyprland pointer fallback unavailable: {err}"),
+                        reason: format!("Hyprland IPC input fallback unavailable: {err}"),
                     },
                 };
             }
@@ -92,10 +95,28 @@ impl InputManager {
             Self::Hyprland(backend) => backend.key(keysym, state).await,
         }
     }
+
+    pub async fn text(&self, text: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Noop { reason } => bail!("{reason}"),
+            Self::Portal(backend) => backend.text(text).await,
+            Self::Hyprland(backend) => backend.text(text).await,
+        }
+    }
 }
 
-#[derive(Debug, Default)]
-pub struct HyprlandHyprctlInputBackend;
+#[derive(Debug)]
+pub struct HyprlandHyprctlInputBackend {
+    socket_path: PathBuf,
+    state: TokioMutex<HyprlandState>,
+}
+
+#[derive(Debug)]
+struct HyprlandState {
+    cursor: CursorPosition,
+    scroll_x_remainder: f64,
+    scroll_y_remainder: f64,
+}
 
 #[derive(Debug, Deserialize)]
 struct CursorPosition {
@@ -104,73 +125,516 @@ struct CursorPosition {
 }
 
 impl HyprlandHyprctlInputBackend {
-    pub fn new() -> anyhow::Result<Self> {
-        if !command_exists("hyprctl") {
-            bail!("hyprctl is not installed");
-        }
-        Ok(Self)
+    pub async fn new() -> anyhow::Result<Self> {
+        let socket_path =
+            hyprland_ipc_socket_path().context("HYPRLAND_INSTANCE_SIGNATURE is not set")?;
+        let cursor: CursorPosition =
+            serde_json::from_str(&hyprland_ipc_command(&socket_path, "j/cursorpos").await?)?;
+        Ok(Self {
+            socket_path,
+            state: TokioMutex::new(HyprlandState {
+                cursor,
+                scroll_x_remainder: 0.0,
+                scroll_y_remainder: 0.0,
+            }),
+        })
     }
 
     pub async fn prepare(&self) -> anyhow::Result<serde_json::Value> {
         Ok(json!({
-            "backend": "hyprland-hyprctl",
+            "backend": "hyprland-ipc",
             "status": "ready",
-            "limitations": "pointer movement only; clicks, scroll, and keyboard require RemoteDesktop portal"
+            "limitations": "uses Hyprland IPC because RemoteDesktop portal is unavailable; ASCII text is injected as key events and unsupported text falls back to clipboard paste"
         }))
     }
 
     pub async fn pointer_move(&self, dx: f64, dy: f64) -> anyhow::Result<()> {
-        let current = self.cursor_position().await?;
-        let x = clamp_cursor(current.x.saturating_add(dx.round() as i64));
-        let y = clamp_cursor(current.y.saturating_add(dy.round() as i64));
-        let output = Command::new("hyprctl")
-            .args(["dispatch", "movecursor", &x.to_string(), &y.to_string()])
-            .output()
-            .await
-            .context("failed to execute hyprctl dispatch movecursor")?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!(
-                "hyprctl dispatch movecursor exited with {}: {stderr}",
-                output.status
-            )
-        }
+        let mut state = self.state.lock().await;
+        let x = clamp_cursor(state.cursor.x.saturating_add(dx.round() as i64));
+        let y = clamp_cursor(state.cursor.y.saturating_add(dy.round() as i64));
+        self.dispatch(&format!("movecursor {x} {y}")).await?;
+        state.cursor = CursorPosition { x, y };
+        Ok(())
     }
 
     pub async fn pointer_button(
         &self,
-        _button: PointerButton,
-        _state: ButtonState,
+        button: PointerButton,
+        state: ButtonState,
     ) -> anyhow::Result<()> {
-        bail!(
-            "Hyprland hyprctl fallback only supports pointer movement; pointer buttons require RemoteDesktop portal"
-        )
-    }
-
-    pub async fn scroll(&self, _dx: f64, _dy: f64, _finish: bool) -> anyhow::Result<()> {
-        bail!(
-            "Hyprland hyprctl fallback only supports pointer movement; scroll requires RemoteDesktop portal"
-        )
-    }
-
-    pub async fn key(&self, _keysym: u32, _state: ButtonState) -> anyhow::Result<()> {
-        bail!(
-            "Hyprland hyprctl fallback only supports pointer movement; keyboard input requires RemoteDesktop portal"
-        )
-    }
-
-    async fn cursor_position(&self) -> anyhow::Result<CursorPosition> {
-        let output = Command::new("hyprctl")
-            .args(["-j", "cursorpos"])
-            .output()
+        let key = button.hyprland_key();
+        let state = state.hyprland_state();
+        self.dispatch(&format!("sendkeystate , {key},{state},activewindow"))
             .await
-            .context("failed to execute hyprctl -j cursorpos")?;
-        if !output.status.success() {
-            bail!("hyprctl -j cursorpos exited with {}", output.status);
+    }
+
+    pub async fn scroll(&self, dx: f64, dy: f64, finish: bool) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        state.scroll_x_remainder += dx;
+        state.scroll_y_remainder += dy;
+        let horizontal = scroll_steps(&mut state.scroll_x_remainder, finish);
+        let vertical = scroll_steps(&mut state.scroll_y_remainder, finish);
+        drop(state);
+
+        for _ in 0..vertical.unsigned_abs().min(12) {
+            self.send_shortcut(
+                "",
+                if vertical > 0 {
+                    "mouse_down"
+                } else {
+                    "mouse_up"
+                },
+            )
+            .await?;
         }
-        Ok(serde_json::from_slice(&output.stdout)?)
+        for _ in 0..horizontal.unsigned_abs().min(12) {
+            self.send_shortcut(
+                "SHIFT",
+                if horizontal > 0 {
+                    "mouse_down"
+                } else {
+                    "mouse_up"
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn key(&self, keysym: u32, state: ButtonState) -> anyhow::Result<()> {
+        let key = keysym_to_hyprland_key(keysym)?;
+        self.dispatch(&format!(
+            "sendkeystate , {key},{},activewindow",
+            state.hyprland_state()
+        ))
+        .await
+    }
+
+    pub async fn text(&self, text: &str) -> anyhow::Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if text.len() > 4096 {
+            bail!("Text input rejected: maximum length is 4096 bytes");
+        }
+        if self.send_text_as_key_events(text).await? {
+            return Ok(());
+        }
+        self.paste_text_via_clipboard(text).await
+    }
+
+    async fn send_text_as_key_events(&self, text: &str) -> anyhow::Result<bool> {
+        let shortcuts: Option<Vec<_>> = text.chars().map(text_char_to_hyprland_shortcut).collect();
+        let Some(shortcuts) = shortcuts else {
+            return Ok(false);
+        };
+        for shortcut in shortcuts {
+            self.send_shortcut(shortcut.mods, shortcut.key).await?;
+        }
+        Ok(true)
+    }
+
+    async fn paste_text_via_clipboard(&self, text: &str) -> anyhow::Result<()> {
+        if !command_exists("wl-copy") {
+            bail!("Hyprland text input fallback requires wl-copy from wl-clipboard");
+        }
+        let mut child = Command::new("wl-copy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to spawn wl-copy for Hyprland text input")?;
+        let mut stdin = child.stdin.take().context("wl-copy stdin unavailable")?;
+        stdin.write_all(text.as_bytes()).await?;
+        drop(stdin);
+        let status = child.wait().await?;
+        if !status.success() {
+            bail!("wl-copy exited with {status}");
+        }
+        self.send_shortcut("CTRL", "V").await
+    }
+
+    async fn dispatch(&self, args: &str) -> anyhow::Result<()> {
+        let response = hyprland_ipc_command(&self.socket_path, &format!("dispatch {args}")).await?;
+        if response.trim() == "ok" {
+            Ok(())
+        } else {
+            bail!("Hyprland dispatch failed: {}", response.trim())
+        }
+    }
+
+    async fn send_shortcut(&self, mods: &str, key: &str) -> anyhow::Result<()> {
+        self.dispatch(&format!("sendshortcut {mods}, {key},activewindow"))
+            .await
+    }
+}
+
+async fn hyprland_ipc_command(socket_path: &PathBuf, command: &str) -> anyhow::Result<String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .with_context(|| format!("failed to connect to Hyprland IPC socket at {socket_path:?}"))?;
+    stream.write_all(command.as_bytes()).await?;
+    stream.shutdown().await?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .await
+        .context("failed to read Hyprland IPC response")?;
+    Ok(response)
+}
+
+fn scroll_steps(remainder: &mut f64, finish: bool) -> i32 {
+    const THRESHOLD: f64 = 24.0;
+    if finish && remainder.abs() > 3.0 {
+        let direction = if *remainder > 0.0 { 1 } else { -1 };
+        *remainder = 0.0;
+        return direction;
+    }
+    let steps = (*remainder / THRESHOLD).trunc() as i32;
+    *remainder -= steps as f64 * THRESHOLD;
+    steps
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HyprlandShortcut {
+    mods: &'static str,
+    key: &'static str,
+}
+
+fn text_char_to_hyprland_shortcut(ch: char) -> Option<HyprlandShortcut> {
+    let shortcut = match ch {
+        'a'..='z' => HyprlandShortcut {
+            mods: "",
+            key: ascii_letter_key(ch),
+        },
+        'A'..='Z' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: ascii_letter_key(ch),
+        },
+        '0'..='9' => HyprlandShortcut {
+            mods: "",
+            key: ascii_digit_key(ch),
+        },
+        ' ' => HyprlandShortcut {
+            mods: "",
+            key: "Space",
+        },
+        '\n' | '\r' => HyprlandShortcut {
+            mods: "",
+            key: "RETURN",
+        },
+        '\t' => HyprlandShortcut {
+            mods: "",
+            key: "Tab",
+        },
+        '!' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "1",
+        },
+        '@' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "2",
+        },
+        '#' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "3",
+        },
+        '$' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "4",
+        },
+        '%' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "5",
+        },
+        '^' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "6",
+        },
+        '&' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "7",
+        },
+        '*' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "8",
+        },
+        '(' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "9",
+        },
+        ')' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "0",
+        },
+        '-' => HyprlandShortcut {
+            mods: "",
+            key: "minus",
+        },
+        '_' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "minus",
+        },
+        '=' => HyprlandShortcut {
+            mods: "",
+            key: "equal",
+        },
+        '+' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "equal",
+        },
+        '[' => HyprlandShortcut {
+            mods: "",
+            key: "bracketleft",
+        },
+        '{' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "bracketleft",
+        },
+        ']' => HyprlandShortcut {
+            mods: "",
+            key: "bracketright",
+        },
+        '}' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "bracketright",
+        },
+        ';' => HyprlandShortcut {
+            mods: "",
+            key: "semicolon",
+        },
+        ':' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "semicolon",
+        },
+        '\'' => HyprlandShortcut {
+            mods: "",
+            key: "apostrophe",
+        },
+        '"' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "apostrophe",
+        },
+        ',' => HyprlandShortcut {
+            mods: "",
+            key: "comma",
+        },
+        '<' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "comma",
+        },
+        '.' => HyprlandShortcut {
+            mods: "",
+            key: "period",
+        },
+        '>' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "period",
+        },
+        '/' => HyprlandShortcut {
+            mods: "",
+            key: "slash",
+        },
+        '?' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "slash",
+        },
+        '\\' => HyprlandShortcut {
+            mods: "",
+            key: "backslash",
+        },
+        '|' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "backslash",
+        },
+        '`' => HyprlandShortcut {
+            mods: "",
+            key: "grave",
+        },
+        '~' => HyprlandShortcut {
+            mods: "SHIFT",
+            key: "grave",
+        },
+        _ => return None,
+    };
+    Some(shortcut)
+}
+
+fn ascii_letter_key(ch: char) -> &'static str {
+    match ch.to_ascii_uppercase() {
+        'A' => "A",
+        'B' => "B",
+        'C' => "C",
+        'D' => "D",
+        'E' => "E",
+        'F' => "F",
+        'G' => "G",
+        'H' => "H",
+        'I' => "I",
+        'J' => "J",
+        'K' => "K",
+        'L' => "L",
+        'M' => "M",
+        'N' => "N",
+        'O' => "O",
+        'P' => "P",
+        'Q' => "Q",
+        'R' => "R",
+        'S' => "S",
+        'T' => "T",
+        'U' => "U",
+        'V' => "V",
+        'W' => "W",
+        'X' => "X",
+        'Y' => "Y",
+        'Z' => "Z",
+        _ => unreachable!("caller checked ASCII letter"),
+    }
+}
+
+fn ascii_digit_key(ch: char) -> &'static str {
+    match ch {
+        '0' => "0",
+        '1' => "1",
+        '2' => "2",
+        '3' => "3",
+        '4' => "4",
+        '5' => "5",
+        '6' => "6",
+        '7' => "7",
+        '8' => "8",
+        '9' => "9",
+        _ => unreachable!("caller checked ASCII digit"),
+    }
+}
+
+fn keysym_to_hyprland_key(keysym: u32) -> anyhow::Result<&'static str> {
+    let key = match keysym {
+        0xffe3 | 0xffe4 => "Ctrl_L",
+        0xffe9 | 0xffea => "Alt_L",
+        0xffe1 | 0xffe2 => "Shift_L",
+        0xffeb | 0xffec => "Super_L",
+        0xff0d => "RETURN",
+        0xff1b => "Escape",
+        0xff09 => "Tab",
+        0x0020 => "Space",
+        0xff08 => "BackSpace",
+        0xffff => "Delete",
+        0xff51 => "left",
+        0xff52 => "up",
+        0xff53 => "right",
+        0xff54 => "down",
+        0x30 => "0",
+        0x31 => "1",
+        0x32 => "2",
+        0x33 => "3",
+        0x34 => "4",
+        0x35 => "5",
+        0x36 => "6",
+        0x37 => "7",
+        0x38 => "8",
+        0x39 => "9",
+        0x61 | 0x41 => "A",
+        0x62 | 0x42 => "B",
+        0x63 | 0x43 => "C",
+        0x64 | 0x44 => "D",
+        0x65 | 0x45 => "E",
+        0x66 | 0x46 => "F",
+        0x67 | 0x47 => "G",
+        0x68 | 0x48 => "H",
+        0x69 | 0x49 => "I",
+        0x6a | 0x4a => "J",
+        0x6b | 0x4b => "K",
+        0x6c | 0x4c => "L",
+        0x6d | 0x4d => "M",
+        0x6e | 0x4e => "N",
+        0x6f | 0x4f => "O",
+        0x70 | 0x50 => "P",
+        0x71 | 0x51 => "Q",
+        0x72 | 0x52 => "R",
+        0x73 | 0x53 => "S",
+        0x74 | 0x54 => "T",
+        0x75 | 0x55 => "U",
+        0x76 | 0x56 => "V",
+        0x77 | 0x57 => "W",
+        0x78 | 0x58 => "X",
+        0x79 | 0x59 => "Y",
+        0x7a | 0x5a => "Z",
+        _ => bail!("Unsupported Hyprland key keysym: 0x{keysym:x}"),
+    };
+    Ok(key)
+}
+
+impl PointerButton {
+    fn hyprland_key(&self) -> &'static str {
+        match self {
+            Self::Left => "mouse:272",
+            Self::Right => "mouse:273",
+            Self::Middle => "mouse:274",
+        }
+    }
+}
+
+impl ButtonState {
+    fn hyprland_state(&self) -> &'static str {
+        match self {
+            Self::Pressed => "down",
+            Self::Released => "up",
+        }
+    }
+}
+
+impl WaylandPortalInputBackend {
+    pub async fn text(&self, text: &str) -> anyhow::Result<()> {
+        if text.len() > 4096 {
+            bail!("Text input rejected: maximum length is 4096 bytes");
+        }
+        for ch in text.chars() {
+            let keysym = ch as u32;
+            self.key(keysym, crate::protocol::ButtonState::Pressed)
+                .await?;
+            self.key(keysym, crate::protocol::ButtonState::Released)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HyprlandShortcut, scroll_steps, text_char_to_hyprland_shortcut};
+
+    #[test]
+    fn maps_ascii_text_to_hyprland_shortcuts() {
+        assert_eq!(
+            text_char_to_hyprland_shortcut('a'),
+            Some(HyprlandShortcut { mods: "", key: "A" })
+        );
+        assert_eq!(
+            text_char_to_hyprland_shortcut('A'),
+            Some(HyprlandShortcut {
+                mods: "SHIFT",
+                key: "A"
+            })
+        );
+        assert_eq!(
+            text_char_to_hyprland_shortcut('?'),
+            Some(HyprlandShortcut {
+                mods: "SHIFT",
+                key: "slash"
+            })
+        );
+        assert_eq!(text_char_to_hyprland_shortcut('è'), None);
+    }
+
+    #[test]
+    fn coalesces_scroll_delta_into_bounded_steps() {
+        let mut remainder = 50.0;
+        assert_eq!(scroll_steps(&mut remainder, false), 2);
+        assert!((remainder - 2.0).abs() < f64::EPSILON);
+        assert_eq!(scroll_steps(&mut remainder, true), 0);
+
+        let mut remainder = -5.0;
+        assert_eq!(scroll_steps(&mut remainder, true), -1);
+        assert_eq!(remainder, 0.0);
     }
 }
 

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::FileTypeExt;
 use std::{env, ffi::OsString, path::PathBuf, process::Command};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +76,23 @@ pub fn command_output(program: &str, args: &[&str]) -> Option<String> {
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if text.is_empty() { None } else { Some(text) }
+}
+
+pub fn hyprland_ipc_socket_path() -> Option<PathBuf> {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")?;
+    let signature = env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+    Some(
+        PathBuf::from(runtime_dir)
+            .join("hypr")
+            .join(signature)
+            .join(".socket.sock"),
+    )
+}
+
+pub fn hyprland_ipc_available() -> bool {
+    hyprland_ipc_socket_path()
+        .and_then(|path| path.metadata().ok())
+        .is_some_and(|metadata| metadata.file_type().is_socket())
 }
 
 pub fn env_os(name: &str) -> Option<OsString> {

@@ -28,7 +28,7 @@ Waypad is built around the real Wayland path:
 - UDP LAN discovery plus manual IP fallback.
 - Capability endpoint for Wayland, portal, libei hints, volume, media, brightness, clipboard, lock, and suspend.
 - Wayland RemoteDesktop portal backend for pointer, click, scroll, and keyboard keysyms when approved.
-- Hyprland `hyprctl` pointer-move fallback when RemoteDesktop is unavailable.
+- Hyprland IPC fallback for pointer movement, mouse buttons, scroll, shortcuts, direct ASCII text, and clipboard-backed text for unsupported characters when RemoteDesktop is unavailable.
 - No X11-only injection hacks and no root-only default input path.
 - `systemd --user` unit for correct user session and portal access.
 
@@ -225,9 +225,9 @@ systemctl --user restart xdg-desktop-portal xdg-desktop-portal-hyprland
 waypad-daemon doctor
 ```
 
-If the daemon reports `RemoteDesktop portal not available`, full input injection cannot work until the portal/compositor stack supports it. The Android app will still connect and show diagnostics, but pointer buttons, scroll, and keyboard commands will fail with explicit errors.
+If the daemon reports `RemoteDesktop portal not available`, the portal-safe input path cannot work until the portal/compositor stack supports it. On Hyprland, Waypad falls back to the compositor IPC socket for practical local-session input.
 
-On Hyprland, Waypad can use a limited `hyprctl dispatch movecursor` fallback when RemoteDesktop is unavailable. This moves the cursor only. Clicks, scrolling, and keyboard input still require `org.freedesktop.portal.RemoteDesktop`.
+On Hyprland, Waypad can expose the `hyprland-ipc` backend. It moves the cursor through Hyprland IPC, sends mouse button hold/release with `sendkeystate`, maps scroll to compositor mouse wheel shortcuts, and injects normal ASCII text as key events. Unsupported characters fall back to writing the requested text to `wl-copy` and sending `CTRL+V` to the active window. This keeps the daemon session-scoped and avoids root/uinput hacks, but the fallback paste path temporarily replaces the Wayland clipboard.
 
 More details are in `docs/TROUBLESHOOTING.md`.
 

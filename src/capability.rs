@@ -1,4 +1,4 @@
-use crate::platform::{SessionInfo, command_exists, detect_session};
+use crate::platform::{SessionInfo, command_exists, detect_session, hyprland_ipc_available};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,11 +50,11 @@ impl Capabilities {
         let wayland = session.session_type == "wayland";
         let portal_input_supported =
             wayland && portal.remote_desktop_available && (pointer || keyboard);
-        let hyprland_pointer_fallback = wayland
+        let hyprland_ipc_fallback = wayland
             && !portal.remote_desktop_available
             && session.compositor_hint == "hyprland"
-            && command_exists("hyprctl");
-        let input_supported = portal_input_supported || hyprland_pointer_fallback;
+            && hyprland_ipc_available();
+        let input_supported = portal_input_supported || hyprland_ipc_fallback;
         let (input_backend, requires_user_approval, input_reason) = if !wayland {
             (
                 "noop",
@@ -69,12 +69,12 @@ impl Capabilities {
                     "Input injection requires RemoteDesktop portal approval on this session".into(),
                 ),
             )
-        } else if hyprland_pointer_fallback {
+        } else if hyprland_ipc_fallback {
             (
-                "hyprland-hyprctl",
+                "hyprland-ipc",
                 false,
                 Some(
-                    "RemoteDesktop portal unavailable; using Hyprland pointer-move fallback. Clicks, scroll, and keyboard still require RemoteDesktop portal."
+                    "RemoteDesktop portal unavailable; using Hyprland IPC fallback for pointer, buttons, scroll, shortcuts, direct ASCII text, and clipboard-backed text for unsupported characters."
                         .into(),
                 ),
             )
