@@ -7,11 +7,12 @@ use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
@@ -108,17 +109,25 @@ impl InputManager {
 #[derive(Debug)]
 pub struct HyprlandHyprctlInputBackend {
     socket_path: PathBuf,
-    state: TokioMutex<HyprlandState>,
+    state: Arc<TokioMutex<HyprlandState>>,
+    pointer_notify: Arc<Notify>,
+    pointer_idle_notify: Arc<Notify>,
 }
 
 #[derive(Debug)]
 struct HyprlandState {
     cursor: CursorPosition,
+    cursor_x: f64,
+    cursor_y: f64,
+    pending_cursor: Option<CursorPosition>,
+    in_flight_cursor: Option<CursorPosition>,
+    pointer_in_flight: bool,
+    pointer_last_error: Option<String>,
     scroll_x_remainder: f64,
     scroll_y_remainder: f64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 struct CursorPosition {
     x: i64,
     y: i64,
@@ -130,13 +139,30 @@ impl HyprlandHyprctlInputBackend {
             hyprland_ipc_socket_path().context("HYPRLAND_INSTANCE_SIGNATURE is not set")?;
         let cursor: CursorPosition =
             serde_json::from_str(&hyprland_ipc_command(&socket_path, "j/cursorpos").await?)?;
+        let state = Arc::new(TokioMutex::new(HyprlandState {
+            cursor_x: cursor.x as f64,
+            cursor_y: cursor.y as f64,
+            cursor,
+            pending_cursor: None,
+            in_flight_cursor: None,
+            pointer_in_flight: false,
+            pointer_last_error: None,
+            scroll_x_remainder: 0.0,
+            scroll_y_remainder: 0.0,
+        }));
+        let pointer_notify = Arc::new(Notify::new());
+        let pointer_idle_notify = Arc::new(Notify::new());
+        tokio::spawn(run_hyprland_pointer_worker(
+            socket_path.clone(),
+            state.clone(),
+            pointer_notify.clone(),
+            pointer_idle_notify.clone(),
+        ));
         Ok(Self {
             socket_path,
-            state: TokioMutex::new(HyprlandState {
-                cursor,
-                scroll_x_remainder: 0.0,
-                scroll_y_remainder: 0.0,
-            }),
+            state,
+            pointer_notify,
+            pointer_idle_notify,
         })
     }
 
@@ -150,10 +176,24 @@ impl HyprlandHyprctlInputBackend {
 
     pub async fn pointer_move(&self, dx: f64, dy: f64) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
-        let x = clamp_cursor(state.cursor.x.saturating_add(dx.round() as i64));
-        let y = clamp_cursor(state.cursor.y.saturating_add(dy.round() as i64));
-        self.dispatch(&format!("movecursor {x} {y}")).await?;
-        state.cursor = CursorPosition { x, y };
+        if let Some(error) = state.pointer_last_error.take() {
+            bail!("Hyprland pointer dispatch failed: {error}");
+        }
+        state.cursor_x = clamp_cursor_f64(state.cursor_x + dx);
+        state.cursor_y = clamp_cursor_f64(state.cursor_y + dy);
+        let x = state.cursor_x.round() as i64;
+        let y = state.cursor_y.round() as i64;
+        let target = CursorPosition { x, y };
+        let latest = state
+            .pending_cursor
+            .or(state.in_flight_cursor)
+            .unwrap_or(state.cursor);
+        if latest == target {
+            return Ok(());
+        }
+        state.pending_cursor = Some(target);
+        drop(state);
+        self.pointer_notify.notify_one();
         Ok(())
     }
 
@@ -162,6 +202,7 @@ impl HyprlandHyprctlInputBackend {
         button: PointerButton,
         state: ButtonState,
     ) -> anyhow::Result<()> {
+        self.flush_pointer().await?;
         let key = button.hyprland_key();
         let state = state.hyprland_state();
         self.dispatch(&format!("sendkeystate , {key},{state},activewindow"))
@@ -169,6 +210,7 @@ impl HyprlandHyprctlInputBackend {
     }
 
     pub async fn scroll(&self, dx: f64, dy: f64, finish: bool) -> anyhow::Result<()> {
+        self.flush_pointer().await?;
         let mut state = self.state.lock().await;
         state.scroll_x_remainder += dx;
         state.scroll_y_remainder += dy;
@@ -202,6 +244,7 @@ impl HyprlandHyprctlInputBackend {
     }
 
     pub async fn key(&self, keysym: u32, state: ButtonState) -> anyhow::Result<()> {
+        self.flush_pointer().await?;
         let key = keysym_to_hyprland_key(keysym)?;
         self.dispatch(&format!(
             "sendkeystate , {key},{},activewindow",
@@ -211,6 +254,7 @@ impl HyprlandHyprctlInputBackend {
     }
 
     pub async fn text(&self, text: &str) -> anyhow::Result<()> {
+        self.flush_pointer().await?;
         if text.is_empty() {
             return Ok(());
         }
@@ -253,17 +297,75 @@ impl HyprlandHyprctlInputBackend {
     }
 
     async fn dispatch(&self, args: &str) -> anyhow::Result<()> {
-        let response = hyprland_ipc_command(&self.socket_path, &format!("dispatch {args}")).await?;
-        if response.trim() == "ok" {
-            Ok(())
-        } else {
-            bail!("Hyprland dispatch failed: {}", response.trim())
+        hyprland_dispatch(&self.socket_path, args).await
+    }
+
+    async fn flush_pointer(&self) -> anyhow::Result<()> {
+        loop {
+            let notified = self.pointer_idle_notify.notified();
+            {
+                let mut state = self.state.lock().await;
+                if let Some(error) = state.pointer_last_error.take() {
+                    bail!("Hyprland pointer dispatch failed: {error}");
+                }
+                if state.pending_cursor.is_none() && !state.pointer_in_flight {
+                    return Ok(());
+                }
+            }
+            notified.await;
         }
     }
 
     async fn send_shortcut(&self, mods: &str, key: &str) -> anyhow::Result<()> {
         self.dispatch(&format!("sendshortcut {mods}, {key},activewindow"))
             .await
+    }
+}
+
+async fn run_hyprland_pointer_worker(
+    socket_path: PathBuf,
+    state: Arc<TokioMutex<HyprlandState>>,
+    pointer_notify: Arc<Notify>,
+    pointer_idle_notify: Arc<Notify>,
+) {
+    loop {
+        pointer_notify.notified().await;
+        loop {
+            let target = {
+                let mut state = state.lock().await;
+                let Some(target) = state.pending_cursor.take() else {
+                    state.pointer_in_flight = false;
+                    state.in_flight_cursor = None;
+                    pointer_idle_notify.notify_one();
+                    break;
+                };
+                state.pointer_in_flight = true;
+                state.in_flight_cursor = Some(target);
+                target
+            };
+
+            let result = hyprland_dispatch(
+                &socket_path,
+                &format!("movecursor {} {}", target.x, target.y),
+            )
+            .await;
+            let mut state = state.lock().await;
+            match result {
+                Ok(()) => {
+                    state.cursor = target;
+                    state.pointer_last_error = None;
+                }
+                Err(err) => {
+                    state.pointer_last_error = Some(err.to_string());
+                }
+            }
+            state.pointer_in_flight = false;
+            state.in_flight_cursor = None;
+            pointer_idle_notify.notify_one();
+            if state.pending_cursor.is_none() {
+                break;
+            }
+        }
     }
 }
 
@@ -279,6 +381,15 @@ async fn hyprland_ipc_command(socket_path: &PathBuf, command: &str) -> anyhow::R
         .await
         .context("failed to read Hyprland IPC response")?;
     Ok(response)
+}
+
+async fn hyprland_dispatch(socket_path: &PathBuf, args: &str) -> anyhow::Result<()> {
+    let response = hyprland_ipc_command(socket_path, &format!("dispatch {args}")).await?;
+    if response.trim() == "ok" {
+        Ok(())
+    } else {
+        bail!("Hyprland dispatch failed: {}", response.trim())
+    }
 }
 
 fn scroll_steps(remainder: &mut f64, finish: bool) -> i32 {
@@ -638,8 +749,8 @@ mod tests {
     }
 }
 
-fn clamp_cursor(value: i64) -> i64 {
-    value.clamp(-100_000, 100_000)
+fn clamp_cursor_f64(value: f64) -> f64 {
+    value.clamp(-100_000.0, 100_000.0)
 }
 
 #[derive(Debug)]
