@@ -137,10 +137,12 @@ fn invite_payload(
     expires: u64,
     route: &str,
 ) -> String {
+    let primary_address = remote_address.unwrap_or(address);
     let mut query = vec![
         ("v", "1".to_string()),
         ("host", host.to_string()),
-        ("address", address.to_string()),
+        ("address", primary_address.to_string()),
+        ("lan_address", address.to_string()),
         ("port", port.to_string()),
         ("fingerprint", fingerprint.to_string()),
         ("code", code.to_string()),
@@ -334,7 +336,8 @@ mod tests {
         );
 
         assert!(payload.starts_with("waypad://invite?"));
-        assert!(payload.contains("address=192.168.1.20"));
+        assert!(payload.contains("address=203.0.113.10"));
+        assert!(payload.contains("lan_address=192.168.1.20"));
         assert!(payload.contains("remote_address=203.0.113.10"));
         assert!(payload.contains("code=123456"));
         assert!(payload.contains("fingerprint=aa%3Abb"));

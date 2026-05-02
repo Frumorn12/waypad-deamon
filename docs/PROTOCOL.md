@@ -87,13 +87,14 @@ waypad-daemon invite --qr
 The payload is a normal deep link, for example:
 
 ```text
-waypad://invite?v=1&host=desktop&address=192.168.0.184&port=47771&fingerprint=aa%3Abb&code=123456&expires=1770000000&route=direct-lan
+waypad://invite?v=1&host=desktop&address=192.168.0.184&lan_address=192.168.0.184&port=47771&fingerprint=aa%3Abb&code=123456&expires=1770000000&route=direct-lan
 ```
 
 `--remote-address <host-or-ip>` adds `remote_address` and marks the route as
-`direct-public`. Android prefers `remote_address` when present. The embedded
-pairing code remains short-lived and single use; the signed handshake and host
-fingerprint pinning are still mandatory.
+`direct-public`. For remote invites, `address` is the public endpoint and
+`lan_address` remains present as a fallback. Android treats the endpoints as
+ordered candidates. The embedded pairing code remains short-lived and single
+use; the signed handshake and host fingerprint pinning are still mandatory.
 
 ## Authentication
 

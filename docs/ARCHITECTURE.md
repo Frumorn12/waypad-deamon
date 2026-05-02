@@ -74,10 +74,12 @@ The daemon binds to LAN by default but still treats the LAN as hostile:
 
 QR invites are expiring pairing helpers, not permanent credentials. The
 `invite` command creates a normal one-time pairing code, embeds it in a
-`waypad://invite` payload with the host fingerprint, address, port, route, and
-expiry, and optionally prints it as an ANSI terminal QR. The Android app still
-verifies the signed daemon handshake and pins the host key before trusting the
-connection.
+`waypad://invite` payload with the host fingerprint, endpoint hints, port,
+route, and expiry, and optionally prints it as an ANSI terminal QR. When a
+remote endpoint is supplied, the payload includes both `remote_address` and
+`lan_address`; Android can try the public/direct endpoint first and then fall
+back to LAN. The app still verifies the signed daemon handshake and pins the
+host key before trusting the connection.
 
 ## Connectivity Model
 

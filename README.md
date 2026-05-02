@@ -206,11 +206,11 @@ Alternative QR flow:
 waypad-daemon invite --qr
 ```
 
-Scan the QR with the Android app or paste the printed `waypad://invite?...`
-payload. The invite embeds the host fingerprint, LAN address, port, one-time
-pairing code, route type, and expiry. By default the daemon chooses the LAN
-source address from the active IPv4 route; override it with `--address` if the
-phone must use a different interface.
+Scan the QR with the Android app's in-app scanner or paste the printed
+`waypad://invite?...` payload. The invite embeds the host fingerprint, endpoint
+hints, port, one-time pairing code, route type, and expiry. By default the
+daemon chooses the LAN source address from the active IPv4 route; override it
+with `--address` if the phone must use a different interface.
 
 For a mobile-data/direct-public test, expose TCP `47771` through your firewall
 or router and generate:
@@ -223,6 +223,12 @@ This is still direct TCP, not a relay. If `require_private_lan` is true, public
 source addresses are rejected after pairing, so set it to false only when the
 port is intentionally exposed and protected by pairing, host-key pinning, and a
 reasonable firewall policy.
+
+When `--remote-address` is provided, the QR contains both the public endpoint
+and the LAN endpoint. Current Android clients try the public endpoint first and
+fall back to the LAN endpoint, so one QR can bootstrap both mobile-data and
+same-Wi-Fi direct connections. Full automatic NAT traversal still requires a
+future signaling/WebRTC/ICE/TURN backend.
 
 ## Device Management
 

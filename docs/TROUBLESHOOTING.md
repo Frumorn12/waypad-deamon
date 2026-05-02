@@ -160,6 +160,12 @@ This is direct TCP. The daemon does not provide a relay, STUN, TURN, or automati
 ICE traversal yet. If `require_private_lan` is true, public clients are rejected
 even if they have a valid invite.
 
+With `--remote-address`, the QR also includes `lan_address`. Android clients try
+the public/direct endpoint first and then the LAN endpoint, so the same QR is
+usable when the phone is on mobile data or on the same Wi-Fi. If both fail, the
+advertised endpoint is unreachable or the daemon is rejecting that source
+address.
+
 ## 60 FPS Setting Does Not Seem To Apply
 
 The Android app sends `max_fps`, `jpeg_quality`, `max_width`, and `max_height`
