@@ -212,6 +212,55 @@ from public networks. Either pair while on the same LAN, or set
 `allow_public_pairing=true` in the daemon config after ensuring your firewall
 restricts TCP `47771` appropriately.
 
+## Stream Is Very Slow (~10 FPS Average)
+
+If the stream delivers only 5-15 FPS despite selecting a 60 FPS profile, the
+most common cause is selection of a grim-based (screenshot) source instead of
+the portal (PipeWire/GStreamer) source.
+
+### Check which source is active
+
+```bash
+journalctl --user -u waypad-daemon -f | grep 'backend='
+```
+
+- `backend=hyprland-grim` — screenshot-per-frame, slow. Switch to Portal picker.
+- `backend=wayland-screencast-portal` — PipeWire pipeline, fast.
+
+### Why grim is slow
+
+Each grim frame spawns a new `grim` process that takes a full-screen JPEG
+screenshot. At 1080p, this takes 80-200 ms per frame (5-12 FPS max). Grim is
+intended as a fallback for hosts without PipeWire/GStreamer capture.
+
+### Fix: use Portal picker
+
+1. In the Android app, go to Remote Display → Sources
+2. Select **"Portal picker (60 FPS capable)"**
+3. A ScreenCast approval dialog appears on the Linux host — approve it
+4. The stream now uses the PipeWire + GStreamer pipeline
+
+If no Portal picker appears, install the required packages:
+```bash
+sudo pacman -S pipewire wireplumber xdg-desktop-portal \
+  xdg-desktop-portal-hyprland gst-plugin-pipewire gst-plugins-good
+systemctl --user restart pipewire wireplumber \
+  xdg-desktop-portal xdg-desktop-portal-hyprland
+```
+
+### Verify portal throughput
+
+```bash
+journalctl --user -u waypad-daemon -f | grep 'throughput'
+```
+
+Healthy output: `fps_measured=52.3 fps_target=60 frames=104`
+If measured FPS is still low despite using portal, the bottleneck is in:
+- Compositor capture rate (check compositor is running)
+- PipeWire buffer settings
+- JPEG encode complexity (reduce quality or resolution)
+- Network bandwidth (TCP cannot keep up with frame size)
+
 ## 60 FPS Setting Does Not Seem To Apply
 
 The Android app sends `max_fps`, `jpeg_quality`, `max_width`, and `max_height`
@@ -235,16 +284,34 @@ The GStreamer pipeline is configured for interactive streaming:
 pipewiresrc → queue(leaky=downstream, max-buffers=1) → videoconvert →
 videoscale → videorate(drop-only=true, skip-to-first=true) →
 video/x-raw,format=I420,framerate=FPS/1 → jpegenc(quality=Q,
-idct-method=fast, smoothing=0, snapshot=false) → fdsink(sync=false)
+snapshot=false) → fdsink(sync=false)
 ```
+
+> **Important**: jpegenc uses `idct-method=ifast` by default (fastest
+> integer DCT). Do NOT set `idct-method=fast` or `smoothing` — these are
+> invalid property names for jpegenc 1.28+ and will break the pipeline.
 
 Each element is tuned to minimize buffering:
 - `leaky=downstream` on queue drops old frames when downstream is slow
 - `drop-only=true, skip-to-first=true` on videorate skips to real-time
-- `idct-method=fast` on jpegenc uses faster DCT for lower encode latency
-- `smoothing=0` avoids smooth interpolation (sharper image, less CPU)
 - `snapshot=false` ensures proper streaming encode (not still-image freeze)
 - `sync=false` on fdsink avoids blocking on stdout
+- `max-size-buffers=1` prevents queue buildup (only 1 buffer held)
+- `format=I420` forces planar YUV format for fastest encode path
+
+### Stream source selection matters for FPS
+
+The daemon exposes two kinds of sources:
+1. **Portal picker (60 FPS capable)** — uses PipeWire + GStreamer pipeline.
+   Can reach 30-60 FPS. Requires user to approve a ScreenCast portal dialog
+   on the Linux host.
+2. **Hyprland monitor (screenshot fallback — slower)** — uses `grim` per-frame
+   screenshot capture. Capped at 15 FPS. Suitable for desktop viewing only,
+   not for gaming or smooth video.
+
+The Android app auto-selects the portal chooser when available. If you
+see a grim monitor source, make sure `xdg-desktop-portal`,
+`pipewire`, `wireplumber`, and `gst-plugin-pipewire` are installed.
 
 ### Frame send deadline
 

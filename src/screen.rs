@@ -103,7 +103,7 @@ impl ScreenManager {
         {
             sources.push(ScreenSource {
                 id: "portal:chooser".into(),
-                label: "Portal picker".into(),
+                label: "Portal picker (60 FPS capable)".into(),
                 kind: "chooser".into(),
                 backend: "wayland-screencast-portal".into(),
                 width: 0,
@@ -111,14 +111,19 @@ impl ScreenManager {
                 x: 0,
                 y: 0,
                 scale: 1.0,
-                focused: false,
+                focused: true,
             });
         }
         if capabilities.capture.hyprland_grim_available {
-            sources.extend(hyprland_monitor_sources().await.unwrap_or_else(|err| {
+            let monitors = hyprland_monitor_sources().await.unwrap_or_else(|err| {
                 warn!(%err, "failed to enumerate Hyprland monitors");
                 Vec::new()
-            }));
+            });
+            for mut monitor in monitors {
+                monitor.label = format!("{} (screenshot fallback — slower)", monitor.label);
+                monitor.focused = false;
+                sources.push(monitor);
+            }
         }
         if sources.is_empty() {
             bail!(
@@ -148,7 +153,9 @@ impl ScreenManager {
         options: StreamStartOptions,
     ) -> anyhow::Result<StreamStartResponse> {
         let source = self.select_source(options.source_id.as_deref()).await?;
+        let is_grim = source.backend == "hyprland-grim";
         let fps = options.max_fps.unwrap_or(30).clamp(1, 60);
+        let fps = if is_grim { fps.min(15) } else { fps };
         let quality = options.jpeg_quality.unwrap_or(70).clamp(35, 92);
         let max_width = options.max_width.map(|value| value.clamp(480, 3840));
         let max_height = options.max_height.map(|value| value.clamp(480, 3840));
@@ -353,6 +360,8 @@ async fn run_grim_stream(
     let mut seq = 0u64;
     let scale = capture_scale(source.width, source.height, max_width, max_height);
     info!(%session_id, source_id = %source.id, fps, quality, scale, "grim stream started");
+    let mut frame_count = 0u64;
+    let mut throughput_start = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = &mut stop_rx => break,
@@ -360,6 +369,14 @@ async fn run_grim_stream(
                 let jpeg = capture_grim_frame(&source, quality, scale).await?;
                 send_frame(&mut socket, seq, source.width, source.height, &jpeg).await?;
                 seq += 1;
+                frame_count += 1;
+                let elapsed = throughput_start.elapsed().as_secs_f64();
+                if elapsed >= 2.0 {
+                    let measured = frame_count as f64 / elapsed;
+                    debug!(%session_id, fps_measured = measured, fps_target = fps, frames = frame_count, "grim stream throughput");
+                    frame_count = 0;
+                    throughput_start = tokio::time::Instant::now();
+                }
             }
         }
     }
@@ -404,6 +421,8 @@ async fn run_portal_stream(
     let mut reader = JpegStreamReader::new();
     let mut buffer = [0u8; 32 * 1024];
     let mut seq = 0u64;
+    let mut frame_count = 0u64;
+    let mut throughput_start = tokio::time::Instant::now();
     info!(%session_id, source_id = %source.id, ?target_width, ?target_height, "portal stream started");
     loop {
         tokio::select! {
@@ -417,6 +436,14 @@ async fn run_portal_stream(
                 for frame in reader.push(&buffer[..n]) {
                     send_frame(&mut socket, seq, source.width, source.height, &frame).await?;
                     seq += 1;
+                    frame_count += 1;
+                }
+                let elapsed = throughput_start.elapsed().as_secs_f64();
+                if elapsed >= 2.0 {
+                    let measured = frame_count as f64 / elapsed;
+                    debug!(%session_id, fps_measured = measured, fps_target = fps, frames = frame_count, "portal stream throughput");
+                    frame_count = 0;
+                    throughput_start = tokio::time::Instant::now();
                 }
             }
         }
@@ -740,8 +767,6 @@ fn spawn_gstreamer_pipewire(
         .arg("!")
         .arg("jpegenc")
         .arg(format!("quality={}", quality))
-        .arg("idct-method=fast")
-        .arg("smoothing=0")
         .arg("snapshot=false")
         .arg("!")
         .arg("fdsink")
