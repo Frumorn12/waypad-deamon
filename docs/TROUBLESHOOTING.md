@@ -508,3 +508,36 @@ After approval, future streams auto-switch to portal at 30-60 fps.
 ### Manual source switching:
 In the Android app, you can still select "Portal picker" from the sources list.
 If portal is not approved, the daemon silently switches to grim.
+
+## X11 Capture Backend (60 FPS, No Portal)
+
+Waypad now supports X11 screen capture via ffmpeg. This backend:
+- **Does NOT need xdg-desktop-portal** — no approval dialog
+- **Does NOT need PipeWire** — captures via X11
+- **Delivers real 60 FPS** — ffmpeg runs continuously, no per-frame overhead
+- **Auto-detected** — X11 monitor sources appear first in the list
+
+### Requirements:
+```bash
+# ffmpeg must be installed
+sudo pacman -S ffmpeg
+
+# XWayland must be running (check with:)
+echo $DISPLAY  # should show :1 or :0
+pgrep Xwayland
+```
+
+### How it works:
+1. ffmpeg captures the X11 screen via `x11grab` at the requested FPS
+2. Frames are encoded as MJPEG and piped to stdout
+3. The daemon reads frames and sends them via TCP (same format as other backends)
+4. Android side decodes JPEG frames as usual — no changes needed
+
+### Limitations:
+- Only captures X11/XWayland windows, not native Wayland apps
+- Most games (Steam, Proton, Wine) run through XWayland by default
+- For native Wayland apps, launch with: `GDK_BACKEND=x11 ./my-app`
+
+### Selecting a specific monitor:
+The daemon auto-detects all connected monitors via `xrandr`.
+Select the desired monitor in the Android app sources list.
