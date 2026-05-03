@@ -100,6 +100,7 @@ pub async fn run(config: Config, paths: StatePaths, identity: HostIdentity) -> a
     let screen = Arc::new(ScreenManager::new(
         capabilities.clone(),
         config.control_port,
+        paths.clone(),
     ));
     let identity = Arc::new(identity);
     let state = AppState {

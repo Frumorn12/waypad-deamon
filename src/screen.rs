@@ -61,6 +61,7 @@ pub struct ScreenManager {
     capabilities: Arc<RwLock<Capabilities>>,
     stream_port: u16,
     sessions: Arc<Mutex<HashMap<String, StreamSession>>>,
+    paths: Arc<super::state::StatePaths>,
 }
 
 #[derive(Debug)]
@@ -86,11 +87,12 @@ struct RunningStream {
 }
 
 impl ScreenManager {
-    pub fn new(capabilities: Arc<RwLock<Capabilities>>, stream_port: u16) -> Self {
+    pub fn new(capabilities: Arc<RwLock<Capabilities>>, stream_port: u16, paths: super::state::StatePaths) -> Self {
         Self {
             capabilities,
             stream_port,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            paths: Arc::new(paths),
         }
     }
 
@@ -256,6 +258,7 @@ impl ScreenManager {
         let task_sessions = self.sessions.clone();
         let task_session = session_id.clone();
         let source = pending.source.clone();
+        let task_paths = self.paths.clone();
         let task = tokio::spawn(async move {
             let result = if source.backend == "wayland-screencast-portal" {
                 run_portal_stream(
@@ -267,6 +270,7 @@ impl ScreenManager {
                     pending.max_width,
                     pending.max_height,
                     stop_rx,
+                    task_paths.as_ref().clone(),
                 )
                 .await
             } else {
@@ -393,9 +397,28 @@ async fn run_portal_stream(
     max_width: Option<u32>,
     max_height: Option<u32>,
     mut stop_rx: oneshot::Receiver<()>,
+    paths: super::state::StatePaths,
 ) -> anyhow::Result<()> {
     info!(%session_id, fps, quality, "portal stream client connected; starting ScreenCast approval");
-    let portal = PortalScreenCastSession::start().await?;
+
+    let restore_token = crate::state::load_portal_restore_token(&paths);
+    let portal = match PortalScreenCastSession::start(restore_token).await {
+        Ok(portal) => portal,
+        Err(first_err) => {
+            let had_restore = crate::state::load_portal_restore_token(&paths).is_some();
+            if had_restore {
+                warn!(%session_id, %first_err, "portal restore failed; retrying without restore token");
+                PortalScreenCastSession::start(None).await?
+            } else {
+                return Err(first_err);
+            }
+        }
+    };
+    if let Some(ref token) = portal.restore_token {
+        if let Err(err) = crate::state::save_portal_restore_token(&paths, token) {
+            warn!(%session_id, %err, "failed to save portal restore token");
+        }
+    }
     let source = ScreenSource {
         id: format!("portal:stream:{}", portal.stream_id),
         label: "Portal-selected source".into(),
@@ -637,10 +660,13 @@ struct PortalScreenCastSession {
     width: Option<u32>,
     height: Option<u32>,
     pipewire_fd: OwnedFd,
+    restore_token: Option<String>,
+    connection: Option<zbus::Connection>,
+    session_handle: Option<OwnedObjectPath>,
 }
 
 impl PortalScreenCastSession {
-    async fn start() -> anyhow::Result<Self> {
+    async fn start(restore_token: Option<String>) -> anyhow::Result<Self> {
         let connection = zbus::Connection::session().await?;
         let proxy = zbus::Proxy::new(
             &connection,
@@ -651,16 +677,20 @@ impl PortalScreenCastSession {
         .await
         .context("ScreenCast portal not available")?;
 
-        let session_token = format!("waypad_screen_{}", portal_token());
         let mut create_options = HashMap::<&str, OwnedValue>::new();
         create_options.insert(
             "handle_token",
             Value::from(format!("waypad_create_{}", portal_token())).try_into()?,
         );
+        let session_token = format!("waypad_screen_{}", portal_token());
         create_options.insert(
             "session_handle_token",
             Value::from(session_token).try_into()?,
         );
+        if let Some(ref token) = restore_token {
+            create_options.insert("restore_token", Value::from(token.as_str()).try_into()?);
+            info!("portal restore_token provided, attempting session restoration");
+        }
         let create_handle: OwnedObjectPath = proxy.call("CreateSession", &(create_options)).await?;
         let create_response = wait_request(&connection, &create_handle).await?;
         if create_response.response != 0 {
@@ -673,22 +703,28 @@ impl PortalScreenCastSession {
             .context("ScreenCast portal did not return a session handle")?;
         let session_handle = OwnedObjectPath::try_from(session_handle_string.as_str())?;
 
-        let mut select_options = HashMap::<&str, OwnedValue>::new();
-        select_options.insert("types", Value::from(1u32 | 2u32).try_into()?);
-        select_options.insert("multiple", Value::from(false).try_into()?);
-        select_options.insert("cursor_mode", Value::from(2u32).try_into()?);
-        select_options.insert("persist_mode", Value::from(1u32).try_into()?);
-        select_options.insert(
-            "handle_token",
-            Value::from(format!("waypad_select_{}", portal_token())).try_into()?,
-        );
-        let select_handle: OwnedObjectPath = proxy
-            .call("SelectSources", &(&session_handle, select_options))
-            .await?;
-        let select_response = wait_request(&connection, &select_handle).await?;
-        if select_response.response != 0 {
-            bail!("ScreenCast source selection was denied by the portal");
-        }
+        let new_restore_token = if restore_token.is_some() {
+            info!("portal session restored from token; reusing previous source selection");
+            None
+        } else {
+            let mut select_options = HashMap::<&str, OwnedValue>::new();
+            select_options.insert("types", Value::from(1u32 | 2u32).try_into()?);
+            select_options.insert("multiple", Value::from(false).try_into()?);
+            select_options.insert("cursor_mode", Value::from(2u32).try_into()?);
+            select_options.insert("persist_mode", Value::from(1u32).try_into()?);
+            select_options.insert(
+                "handle_token",
+                Value::from(format!("waypad_select_{}", portal_token())).try_into()?,
+            );
+            let select_handle: OwnedObjectPath = proxy
+                .call("SelectSources", &(&session_handle, select_options))
+                .await?;
+            let select_response = wait_request(&connection, &select_handle).await?;
+            if select_response.response != 0 {
+                bail!("ScreenCast source selection was denied by the portal");
+            }
+            None
+        };
 
         let mut start_options = HashMap::<&str, OwnedValue>::new();
         start_options.insert(
@@ -713,20 +749,64 @@ impl PortalScreenCastSession {
             .context("ScreenCast portal returned an empty stream list")?;
         let (width, height) = stream_size(&properties);
 
+        let saved_token = new_restore_token.or_else(|| {
+            start_response
+                .results
+                .get("restore_token")
+                .and_then(owned_value_to_string)
+        });
+
         let open_options = HashMap::<&str, OwnedValue>::new();
         let pipewire_fd: OwnedFd = proxy
             .call("OpenPipeWireRemote", &(&session_handle, open_options))
             .await
             .context("PipeWire capture could not be initialized")?;
+
+        if let Some(_token) = &saved_token {
+            info!("portal restore_token saved for future sessions");
+        }
+
         Ok(Self {
             stream_id,
             width,
             height,
             pipewire_fd,
+            restore_token: saved_token,
+            connection: Some(connection),
+            session_handle: Some(session_handle),
         })
     }
 }
 
+impl Drop for PortalScreenCastSession {
+    fn drop(&mut self) {
+        if let (Some(connection), Some(handle)) = (self.connection.take(), self.session_handle.take()) {
+            tokio::spawn(async move {
+                let proxy = zbus::Proxy::new(
+                    &connection,
+                    "org.freedesktop.portal.Desktop",
+                    "/org/freedesktop/portal/desktop",
+                    "org.freedesktop.portal.ScreenCast",
+                )
+                .await;
+                match proxy {
+                    Ok(proxy) => {
+                        let _: Result<(), _> = proxy
+                            .call::<_, _, ()>("CloseSession", &(handle.as_str()))
+                            .await;
+                    }
+                    Err(_) => {}
+                }
+            });
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PortalResponse {
+    response: u32,
+    results: HashMap<String, OwnedValue>,
+}
 fn spawn_gstreamer_pipewire(
     session: PortalScreenCastSession,
     fps: u32,
@@ -832,12 +912,6 @@ fn find_marker(buffer: &[u8], marker: [u8; 2], from: usize) -> Option<usize> {
         .enumerate()
         .skip(from)
         .find_map(|(index, window)| (window == marker).then_some(index))
-}
-
-#[derive(Debug)]
-struct PortalResponse {
-    response: u32,
-    results: HashMap<String, OwnedValue>,
 }
 
 async fn wait_request(

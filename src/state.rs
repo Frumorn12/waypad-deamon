@@ -45,6 +45,7 @@ pub struct StatePaths {
     pub host_identity: PathBuf,
     pub trusted_devices: PathBuf,
     pub pairing_code: PathBuf,
+    pub portal_restore_token: PathBuf,
 }
 
 impl StatePaths {
@@ -54,6 +55,7 @@ impl StatePaths {
             host_identity: state_dir.join("host_identity.json"),
             trusted_devices: state_dir.join("trusted_devices.json"),
             pairing_code: state_dir.join("pairing_code.json"),
+            portal_restore_token: state_dir.join("portal_restore_token.json"),
             state_dir,
         }
     }
@@ -207,6 +209,25 @@ fn set_private_file_permissions(path: &Path) -> io::Result<()> {
 #[cfg(not(unix))]
 fn set_private_file_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+pub fn save_portal_restore_token(paths: &StatePaths, token: &str) -> anyhow::Result<()> {
+    ensure_state_dir(paths)?;
+    let path = &paths.portal_restore_token;
+    let data = serde_json::json!({ "restore_token": token, "saved_at": now_unix() });
+    fs::write(path, serde_json::to_string(&data)?)?;
+    set_private_file_permissions(path)?;
+    Ok(())
+}
+
+pub fn load_portal_restore_token(paths: &StatePaths) -> Option<String> {
+    let path = &paths.portal_restore_token;
+    if !path.exists() {
+        return None;
+    }
+    let raw = fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value.get("restore_token")?.as_str().map(str::to_string)
 }
 
 #[cfg(test)]
