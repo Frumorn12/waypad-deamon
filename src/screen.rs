@@ -930,6 +930,7 @@ fn spawn_gstreamer_pipewire(
     let fd = session.pipewire_fd.as_raw_fd();
     let mut command = Command::new("gst-launch-1.0");
     command
+        .env("GST_GL_API", "opengl")
         .arg("-q")
         .arg("pipewiresrc")
         .arg("fd=3")
@@ -937,7 +938,13 @@ fn spawn_gstreamer_pipewire(
         .arg("do-timestamp=true")
         .arg("keepalive-time=1000")
         .arg("!")
-        // DMA-BUF → CPU: use videoconvert which supports DMA_DRM format
+        // DMA-BUF → CPU via OpenGL
+        .arg("glupload")
+        .arg("!")
+        .arg("glcolorconvert")
+        .arg("!")
+        .arg("gldownload")
+        .arg("!")
         .arg("videoconvert")
         .arg("!")
         .arg("videoscale")
