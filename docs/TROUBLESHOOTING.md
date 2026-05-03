@@ -296,23 +296,50 @@ in time are dropped to prevent head-of-line blocking and keep latency low.
 The GStreamer pipeline is configured for interactive streaming:
 
 ```
-pipewiresrc → queue(leaky=downstream, max-buffers=1) → videoconvert →
-videoscale → videorate(drop-only=true, skip-to-first=true) →
-video/x-raw,format=I420,framerate=FPS/1 → jpegenc(quality=Q,
-snapshot=false) → fdsink(sync=false)
+pipewiresrc → videoconvert → videoscale →
+videorate(drop-only=true, skip-to-first=true) →
+caps(video/x-raw,format=I420,framerate=FPS/1) →
+queue(leaky=upstream, max-size-buffers=1) →
+jpegenc(quality=Q, snapshot=false) → fdsink(sync=false)
 ```
 
-> **Important**: jpegenc uses `idct-method=ifast` by default (fastest
-> integer DCT). Do NOT set `idct-method=fast` or `smoothing` — these are
-> invalid property names for jpegenc 1.28+ and will break the pipeline.
-
 Each element is tuned to minimize buffering:
-- `leaky=downstream` on queue drops old frames when downstream is slow
 - `drop-only=true, skip-to-first=true` on videorate skips to real-time
 - `snapshot=false` ensures proper streaming encode (not still-image freeze)
 - `sync=false` on fdsink avoids blocking on stdout
-- `max-size-buffers=1` prevents queue buildup (only 1 buffer held)
+- `leaky=upstream` on queue: drops oldest frame when encoder is busy
 - `format=I420` forces planar YUV format for fastest encode path
+- Queue placed AFTER videorate to prevent preroll deadlock with live sources
+
+### Portal restore tokens
+
+The daemon uses xdg-desktop-portal persist_mode + restore_token for
+automatic session restoration.
+
+**First time**: Select "Portal picker" → portal dialog appears on desktop →
+approve → restore_token saved. Only the FIRST time needs approval.
+
+**Subsequent times**: restore_token is passed to CreateSession, skipping
+SelectSources entirely. No dialog appears. The portal returns a new
+restore_token which replaces the old one (restore tokens are single-use).
+
+**If restore fails**: token was revoked, permissions changed, or source
+disappeared. Daemon falls back to grim automatically. To re-authorize:
+```bash
+rm ~/.config/waypad-daemon/portal_restore_token.json
+systemctl --user restart waypad-daemon
+```
+
+### Display persistence
+
+The daemon remembers which screen source was last used:
+```bash
+cat ~/.config/waypad-daemon/preferred_source.json
+```
+
+On subsequent stream starts, the same source is restored automatically.
+If that source is no longer available (e.g. monitor disconnected), the
+default source is used instead.
 
 ### Stream source selection matters for FPS
 
