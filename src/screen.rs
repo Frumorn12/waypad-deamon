@@ -104,6 +104,14 @@ impl ScreenManager {
         let has_restore_token = crate::state::load_portal_restore_token(&self.paths).is_some();
 
         let mut sources = Vec::new();
+
+        // X11 capture via ffmpeg — no portal needed, works on XWayland
+        if let Ok(x11_monitors) = list_x11_monitors().await {
+            for monitor in x11_monitors {
+                sources.push(monitor);
+            }
+        }
+
         if portal_available {
             sources.push(ScreenSource {
                 id: "portal:chooser".into(),
@@ -119,7 +127,7 @@ impl ScreenManager {
                 x: 0,
                 y: 0,
                 scale: 1.0,
-                focused: has_restore_token, // Only focus if portal was previously approved
+                focused: false, // Never default — X11 is always preferred
             });
         }
         if capabilities.capture.hyprland_grim_available {
@@ -127,12 +135,7 @@ impl ScreenManager {
                 warn!(%err, "failed to enumerate Hyprland monitors");
                 Vec::new()
             });
-            for (index, mut monitor) in monitors.into_iter().enumerate() {
-                monitor.label = format!("{} (auto – no approval needed)", monitor.label);
-                // Focus first grim monitor if portal is not approved
-                if !has_restore_token && index == 0 && sources.iter().all(|s| !s.focused) {
-                    monitor.focused = true;
-                }
+            for monitor in monitors {
                 sources.push(monitor);
             }
         }
@@ -168,6 +171,7 @@ impl ScreenManager {
         // If portal is selected but never approved, silently switch to grim
         let source = if source.backend == "wayland-screencast-portal"
             && crate::state::load_portal_restore_token(&self.paths).is_none()
+            && source.backend != "x11-ffmpeg" // Never switch X11 sources
         {
             let grim = self
                 .list_sources()
@@ -293,7 +297,19 @@ impl ScreenManager {
         let source = pending.source.clone();
         let task_paths = self.paths.clone();
         let task = tokio::spawn(async move {
-            let result = if source.backend == "wayland-screencast-portal" {
+            let result = if source.backend == "x11-ffmpeg" {
+                run_x11_stream(
+                    &mut socket,
+                    task_session.clone(),
+                    source,
+                    pending.fps,
+                    pending.quality,
+                    pending.max_width,
+                    pending.max_height,
+                    &mut stop_rx,
+                )
+                .await
+            } else if source.backend == "wayland-screencast-portal" {
                 let portal_result = run_portal_stream(
                     &mut socket,
                     task_session.clone(),
@@ -1089,6 +1105,156 @@ fn stream_size(properties: &HashMap<String, OwnedValue>) -> (Option<u32>, Option
         return (Some(width), Some(height));
     }
     (None, None)
+}
+
+// ============================================================
+// X11 capture backend (ffmpeg x11grab — no portal needed)
+// ============================================================
+
+async fn list_x11_monitors() -> anyhow::Result<Vec<ScreenSource>> {
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
+    let output = tokio::process::Command::new("xrandr")
+        .arg("--display")
+        .arg(&display)
+        .output()
+        .await
+        .context("xrandr not available")?;
+    if !output.status.success() {
+        anyhow::bail!("xrandr failed");
+    }
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let mut monitors = Vec::new();
+    for line in raw.lines() {
+        if !line.contains(" connected") {
+            continue;
+        }
+        // Format: "HDMI-A-1 connected 1920x1080+1920+0 ..."
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let name = parts[0].to_string();
+        let geom_str = parts[2];
+        if !geom_str.contains('x') || !geom_str.contains('+') {
+            continue;
+        }
+        // Parse "WIDTHxHEIGHT+X+Y"
+        let main_parts: Vec<&str> = geom_str.split('+').collect();
+        if main_parts.len() < 3 {
+            continue;
+        }
+        let res_str = main_parts[0];
+        let res_parts: Vec<&str> = res_str.split('x').collect();
+        if res_parts.len() != 2 {
+            continue;
+        }
+        let Ok(w) = res_parts[0].parse::<u32>() else { continue };
+        let Ok(h) = res_parts[1].parse::<u32>() else { continue };
+        let Ok(x) = main_parts[1].parse::<i32>() else { continue };
+        let Ok(y) = main_parts[2].parse::<i32>() else { continue };
+
+        monitors.push(ScreenSource {
+            id: format!("x11:{}", name),
+            label: format!("{} (X11 – 60 FPS, no approval)", name),
+            kind: "monitor".into(),
+            backend: "x11-ffmpeg".into(),
+            width: w,
+            height: h,
+            x,
+            y,
+            scale: 1.0,
+            focused: monitors.is_empty(),
+        });
+    }
+    if monitors.is_empty() {
+        anyhow::bail!("no connected monitors found via xrandr");
+    }
+    Ok(monitors)
+}
+
+async fn run_x11_stream(
+    socket: &mut TcpStream,
+    session_id: String,
+    source: ScreenSource,
+    fps: u32,
+    quality: u8,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+    stop_rx: &mut oneshot::Receiver<()>,
+) -> anyhow::Result<()> {
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
+    let (target_w, target_h) =
+        target_dimensions(source.width, source.height, max_width, max_height);
+    let cap_w = target_w.unwrap_or(source.width);
+    let cap_h = target_h.unwrap_or(source.height);
+
+    info!(%session_id, source_id = %source.id, fps, quality, cap_w, cap_h, "x11 stream starting with ffmpeg");
+
+    // ffmpeg -f x11grab -framerate 60 -video_size 1920x1080 -i :1.0+1920,0
+    //   -vf "scale=W:H" -c:v mjpeg -q:v Q -f mjpeg pipe:1
+    let input_spec = format!("{}.0+{},{}", display, source.x, source.y);
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.args([
+        "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "x11grab",
+        "-framerate", &fps.to_string(),
+        "-video_size", &format!("{cap_w}x{cap_h}"),
+        "-i", &input_spec,
+    ]);
+    // Scale if needed
+    if target_w.is_some() || target_h.is_some() {
+        cmd.args(["-vf", &format!("scale={}:{}", cap_w, cap_h)]);
+    }
+    cmd.args([
+        "-c:v", "mjpeg",
+        "-q:v", &quality.to_string(),
+        "-f", "mjpeg",
+        "pipe:1",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().context("failed to spawn ffmpeg for X11 capture")?;
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(log_child_stderr(session_id.clone(), "ffmpeg", stderr));
+    }
+    let mut stdout = child.stdout.take().context("ffmpeg stdout unavailable")?;
+    let mut reader = JpegStreamReader::new();
+    let mut buffer = [0u8; 32 * 1024];
+    let mut seq = 0u64;
+    let mut frame_count = 0u64;
+    let mut throughput_start = tokio::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = &mut *stop_rx => break,
+            read = stdout.read(&mut buffer) => {
+                let n = read?;
+                if n == 0 {
+                    warn!(%session_id, "ffmpeg x11 producer closed stdout");
+                    break;
+                }
+                for frame in reader.push(&buffer[..n]) {
+                    send_frame(&mut *socket, seq, source.width, source.height, &frame).await?;
+                    seq += 1;
+                    frame_count += 1;
+                }
+                let elapsed = throughput_start.elapsed().as_secs_f64();
+                if elapsed >= 2.0 {
+                    let measured = frame_count as f64 / elapsed;
+                    info!(%session_id, fps_measured = measured, fps_target = fps, frames = frame_count, "x11 stream throughput");
+                    frame_count = 0;
+                    throughput_start = tokio::time::Instant::now();
+                }
+            }
+        }
+    }
+    let _ = child.kill().await;
+    if seq == 0 {
+        anyhow::bail!("ffmpeg x11 produced no frames");
+    }
+    info!(%session_id, total_frames = seq, "x11 stream stopped");
+    Ok(())
 }
 
 pub async fn authorize_portal() -> anyhow::Result<String> {
