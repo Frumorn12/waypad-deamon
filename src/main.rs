@@ -59,11 +59,11 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         "authorize-portal" => {
-            println!("Opening ScreenCast portal authorization (15s timeout)...");
+            println!("Opening ScreenCast portal authorization (60s timeout)...");
             println!("A dialog should appear on your desktop. Approve screen sharing.");
             println!("This needs to be done only ONCE.");
             println!();
-            match tokio::time::timeout(Duration::from_secs(15), authorize_portal()).await {
+            match tokio::time::timeout(Duration::from_secs(60), authorize_portal()).await {
                 Ok(Ok(token)) => {
                     save_portal_restore_token(&paths, &token)?;
                     println!("Portal authorized successfully!");
@@ -84,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Err(_elapsed) => {
                     eprintln!();
-                    eprintln!("Authorization timed out after 15 seconds.");
+                    eprintln!("Authorization timed out after 60 seconds.");
                     eprintln!("The portal dialog did not appear on your desktop.");
                     eprintln!();
                     eprintln!("This is OK — the daemon will use the grim fallback automatically.");

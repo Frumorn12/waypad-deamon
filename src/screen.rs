@@ -157,7 +157,7 @@ impl ScreenManager {
         let source = self.select_source(options.source_id.as_deref()).await?;
         let is_grim = source.backend == "hyprland-grim";
         let fps = options.max_fps.unwrap_or(30).clamp(1, 60);
-        let fps = if is_grim { fps.min(25) } else { fps };
+        let fps = if is_grim { fps.min(30) } else { fps };
         let quality = options.jpeg_quality.unwrap_or(70).clamp(35, 92);
         let max_width = options.max_width.map(|value| value.clamp(480, 3840));
         let max_height = options.max_height.map(|value| value.clamp(480, 3840));
@@ -411,7 +411,7 @@ async fn run_grim_stream_impl(
     let mut seq = 0u64;
     // Force aggressive scale for grim (screenshot tool is slow at full res)
     let requested_scale = capture_scale(source.width, source.height, max_width, max_height);
-    let scale = requested_scale.min(0.6); // Never capture above 60% resolution
+    let scale = requested_scale.min(0.4); // Never capture above 40% resolution for grim
     info!(%session_id, source_id = %source.id, fps, quality, scale, requested_scale, "grim stream started");
     let mut frame_count = 0u64;
     let mut throughput_start = tokio::time::Instant::now();
@@ -521,6 +521,11 @@ async fn run_portal_stream(
         }
     }
     let _ = child.kill().await;
+    if seq == 0 {
+        // GStreamer pipeline failed before producing any frames
+        // Kill child and return error so the grim fallback can take over
+        anyhow::bail!("Portal GStreamer pipeline produced no frames (PipeWire format may be incompatible)");
+    }
     debug!(%session_id, "portal stream stopped");
     Ok(())
 }
@@ -545,7 +550,7 @@ async fn log_child_stderr(session_id: String, label: &'static str, mut stderr: C
 }
 
 const SEND_FRAME_DEADLINE_MS: u64 = 12;
-const SEND_FRAME_DEADLINE_GRIM_MS: u64 = 250;
+const SEND_FRAME_DEADLINE_GRIM_MS: u64 = 500;
 
 async fn send_frame(
     socket: &mut TcpStream,
@@ -672,8 +677,8 @@ async fn capture_grim_frame(
     scale: f64,
 ) -> anyhow::Result<Vec<u8>> {
     let mut command = Command::new("grim");
-    // Use lower quality for streaming (cap at 50, use even lower if requested)
-    let stream_quality = quality.min(50);
+    // Use much lower quality for streaming speed (cap at 35)
+    let stream_quality = quality.min(35);
     command.args(["-t", "jpeg", "-q", &stream_quality.to_string()]);
     if scale < 0.999 {
         command.args(["-s", &format!("{scale:.4}")]);
@@ -908,9 +913,9 @@ fn spawn_gstreamer_pipewire(
         .arg("!")
         .arg(match (target_width, target_height) {
             (Some(width), Some(height)) => {
-                format!("video/x-raw,format=I420,width={width},height={height},framerate={fps}/1")
+                format!("video/x-raw,width={width},height={height},framerate={fps}/1")
             }
-            _ => format!("video/x-raw,format=I420,framerate={fps}/1"),
+            _ => format!("video/x-raw,framerate={fps}/1"),
         })
         .arg("!")
         .arg("queue")
@@ -918,6 +923,8 @@ fn spawn_gstreamer_pipewire(
         .arg("max-size-bytes=0")
         .arg("max-size-time=0")
         .arg("leaky=upstream")
+        .arg("!")
+        .arg("videoconvert")
         .arg("!")
         .arg("jpegenc")
         .arg(format!("quality={}", quality))
@@ -1000,7 +1007,7 @@ async fn wait_request(
     )
     .await?;
     let mut stream = proxy.receive_signal("Response").await?;
-    let message = timeout(Duration::from_secs(15), stream.next())
+    let message = timeout(Duration::from_secs(60), stream.next())
         .await
         .context("Timed out waiting for portal response")?
         .context("Portal request closed before emitting Response")?;
