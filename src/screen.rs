@@ -445,6 +445,8 @@ async fn log_child_stderr(session_id: String, label: &'static str, mut stderr: C
     }
 }
 
+const SEND_FRAME_DEADLINE_MS: u64 = 12;
+
 async fn send_frame(
     socket: &mut TcpStream,
     seq: u64,
@@ -461,13 +463,33 @@ async fn send_frame(
     })
     .to_string();
     let header = header.as_bytes();
-    socket
-        .write_all(&(header.len() as u32).to_be_bytes())
-        .await?;
-    socket.write_all(&(jpeg.len() as u32).to_be_bytes()).await?;
-    socket.write_all(header).await?;
-    socket.write_all(jpeg).await?;
-    Ok(())
+    let header_len = (header.len() as u32).to_be_bytes();
+    let payload_len = (jpeg.len() as u32).to_be_bytes();
+
+    let total = 4 + 4 + header.len() + jpeg.len();
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(&header_len);
+    buf.extend_from_slice(&payload_len);
+    buf.extend_from_slice(header);
+    buf.extend_from_slice(jpeg);
+
+    let result = timeout(Duration::from_millis(SEND_FRAME_DEADLINE_MS), async {
+        let mut offset = 0;
+        while offset < buf.len() {
+            offset += socket.write(&buf[offset..]).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(io_err)) => Err(anyhow::Error::new(io_err)),
+        Err(_elapsed) => {
+            debug!(seq, "dropping frame: send deadline exceeded");
+            Err(anyhow::anyhow!("frame send deadline exceeded (dropped)"))
+        }
+    }
 }
 
 fn now_millis() -> u128 {
@@ -693,6 +715,7 @@ fn spawn_gstreamer_pipewire(
         .arg("fd=3")
         .arg(format!("path={}", session.stream_id))
         .arg("do-timestamp=true")
+        .arg("keepalive-time=1000")
         .arg("!")
         .arg("queue")
         .arg("max-size-buffers=1")
@@ -706,19 +729,24 @@ fn spawn_gstreamer_pipewire(
         .arg("!")
         .arg("videorate")
         .arg("drop-only=true")
+        .arg("skip-to-first=true")
         .arg("!")
         .arg(match (target_width, target_height) {
             (Some(width), Some(height)) => {
-                format!("video/x-raw,width={width},height={height},framerate={fps}/1")
+                format!("video/x-raw,format=I420,width={width},height={height},framerate={fps}/1")
             }
-            _ => format!("video/x-raw,framerate={fps}/1"),
+            _ => format!("video/x-raw,format=I420,framerate={fps}/1"),
         })
         .arg("!")
         .arg("jpegenc")
         .arg(format!("quality={}", quality))
+        .arg("idct-method=fast")
+        .arg("smoothing=0")
+        .arg("snapshot=false")
         .arg("!")
         .arg("fdsink")
         .arg("fd=1")
+        .arg("sync=false")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     unsafe {

@@ -132,6 +132,14 @@ impl ControllerInputManager {
         self.ensure_backend()?.axis(axis, value)
     }
 
+    pub fn flush_pending(&mut self) -> anyhow::Result<()> {
+        if let Some(backend) = &mut self.backend {
+            backend.flush_pending()
+        } else {
+            Ok(())
+        }
+    }
+
     fn ensure_backend(&mut self) -> anyhow::Result<&mut VirtualGamepadBackend> {
         if !self.available {
             bail!("{}", self.unavailable_reason);
@@ -170,6 +178,7 @@ pub struct VirtualGamepadBackend {
     file: File,
     button_state: HashMap<u16, i32>,
     axis_state: HashMap<u16, i32>,
+    dirty: bool,
 }
 
 impl VirtualGamepadBackend {
@@ -210,6 +219,7 @@ impl VirtualGamepadBackend {
             file,
             button_state: HashMap::new(),
             axis_state: HashMap::new(),
+            dirty: false,
         })
     }
 
@@ -225,7 +235,8 @@ impl VirtualGamepadBackend {
         self.button_state.insert(code, value);
         debug!(button, code, value, "virtual gamepad button");
         self.emit(EV_KEY, code, value)?;
-        self.sync()
+        self.sync()?;
+        self.file.flush().context("flushing uinput event")
     }
 
     fn axis(&mut self, axis: &str, value: f64) -> anyhow::Result<()> {
@@ -240,7 +251,17 @@ impl VirtualGamepadBackend {
         self.axis_state.insert(code, scaled);
         debug!(axis, code, value, scaled, "virtual gamepad axis");
         self.emit(EV_ABS, code, scaled)?;
-        self.sync()
+        self.sync()?;
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) -> anyhow::Result<()> {
+        if self.dirty {
+            self.dirty = false;
+            self.file.flush().context("flushing uinput event batch")
+        } else {
+            Ok(())
+        }
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
@@ -271,7 +292,8 @@ impl VirtualGamepadBackend {
 
     fn sync(&mut self) -> anyhow::Result<()> {
         self.emit(EV_SYN, SYN_REPORT, 0)?;
-        self.file.flush().context("flushing uinput event")
+        self.dirty = true;
+        Ok(())
     }
 }
 

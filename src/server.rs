@@ -563,18 +563,18 @@ async fn handle_external_input(
                 "android external input device connected"
             );
             if is_controller_device(&device_type) || classes.iter().any(is_controller_device) {
-                state
-                    .gamepad
-                    .lock()
-                    .await
-                    .device_connected(&device_id, &name)?;
+                let mut gamepad = state.gamepad.lock().await;
+                gamepad.device_connected(&device_id, &name)?;
+                gamepad.flush_pending()?;
             }
             Ok(())
         }
         ExternalInputEvent::DeviceDisconnected => {
             info!(%device_id, ?device_type, "android external input device disconnected");
             if is_controller_device(&device_type) {
-                state.gamepad.lock().await.device_disconnected(&device_id)?;
+                let mut gamepad = state.gamepad.lock().await;
+                gamepad.device_disconnected(&device_id)?;
+                gamepad.flush_pending()?;
             }
             Ok(())
         }
@@ -599,14 +599,18 @@ async fn handle_external_input(
         }
         ExternalInputEvent::ControllerButton { button, state: st } => {
             debug!(%device_id, ?device_type, %button, ?st, "android external controller button");
-            state.gamepad.lock().await.button(&button, st)
+            let mut gamepad = state.gamepad.lock().await;
+            gamepad.button(&button, st)?;
+            gamepad.flush_pending()
         }
         ExternalInputEvent::ControllerAxis { axis, value } => {
             if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
                 anyhow::bail!("Controller axis value out of range for {axis}: {value}");
             }
             debug!(%device_id, ?device_type, %axis, value, "android external controller axis");
-            state.gamepad.lock().await.axis(&axis, value)
+            let mut gamepad = state.gamepad.lock().await;
+            gamepad.axis(&axis, value)?;
+            gamepad.flush_pending()
         }
     }
 }

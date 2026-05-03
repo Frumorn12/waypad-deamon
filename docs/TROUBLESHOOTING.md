@@ -223,9 +223,87 @@ journalctl --user -u waypad-daemon -f | grep 'starting screen stream'
 
 For Game Mode or Ultra Low Latency, expect `fps=60` and a smaller max dimension.
 Actual delivered FPS still depends on compositor capture speed, PipeWire/GStreamer
-availability, JPEG encode speed, Wi-Fi quality, and Android decode time. The
-daemon drops stale frames rather than buffering them, so FPS may fall under load
-to keep input latency lower.
+availability, JPEG encode speed, Wi-Fi quality, and Android decode time.
+The daemon sends each frame with a 12 ms deadline; frames that cannot be sent
+in time are dropped to prevent head-of-line blocking and keep latency low.
+
+### Pipeline low-latency tuning
+
+The GStreamer pipeline is configured for interactive streaming:
+
+```
+pipewiresrc → queue(leaky=downstream, max-buffers=1) → videoconvert →
+videoscale → videorate(drop-only=true, skip-to-first=true) →
+video/x-raw,format=I420,framerate=FPS/1 → jpegenc(quality=Q,
+idct-method=fast, smoothing=0, snapshot=false) → fdsink(sync=false)
+```
+
+Each element is tuned to minimize buffering:
+- `leaky=downstream` on queue drops old frames when downstream is slow
+- `drop-only=true, skip-to-first=true` on videorate skips to real-time
+- `idct-method=fast` on jpegenc uses faster DCT for lower encode latency
+- `smoothing=0` avoids smooth interpolation (sharper image, less CPU)
+- `snapshot=false` ensures proper streaming encode (not still-image freeze)
+- `sync=false` on fdsink avoids blocking on stdout
+
+### Frame send deadline
+
+Each frame must be sent to the TCP socket within 12 ms. If the kernel send
+buffer is full (network congestion), the frame is dropped and the pipeline
+continues to the next frame. This prevents the common pattern of buffering
+old frames and then bursting them all at once.
+
+## Controller Forwarding Latency
+
+uinput events are batched to reduce kernel call overhead:
+- **Button events**: Written and flushed immediately (critical for timing)
+- **Axis events**: Written and synced, but flushed only when a button event
+  arrives or the batch is complete. This coalesces multiple axis updates
+  into a single kernel operation.
+
+To verify:
+
+```bash
+journalctl --user -u waypad-daemon -f | grep "virtual gamepad"
+```
+
+## Performance Bottleneck Diagnosis
+
+### Check capture backend
+
+```bash
+waypad-daemon doctor | grep -A5 capture
+```
+
+`wayland-screencast-portal` (PipeWire/GStreamer) = fast, can reach 60 fps.
+`hyprland-grim` = slow, single-frame screenshot per tick, 5-15 fps max.
+
+### Check GStreamer pipeline health
+
+```bash
+journalctl --user -u waypad-daemon -f | grep "gstreamer"
+```
+
+Warnings about pipewire feed stalls or jpegenc errors indicate capture issues.
+The pipeline will continue with frame drops rather than stalling.
+
+### Check frame dropping activity
+
+```bash
+journalctl --user -u waypad-daemon -f | grep "dropping frame"
+```
+
+If this appears frequently, the network cannot keep up with the frame rate.
+Reduce quality/resolution or switch to a lower FPS profile.
+
+### Check uinput availability for controllers
+
+```bash
+ls -l /dev/uinput
+waypad-daemon doctor | grep -A8 external_input
+```
+
+`external_input.controller = true` requires writable `/dev/uinput`.
 
 ## Input Works But Stream Fails
 
