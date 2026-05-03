@@ -487,3 +487,24 @@ waypad-daemon authorize-portal
 ```
 This command has a 15-second timeout. Approve the dialog if it appears.
 If it doesn't, the grim fallback continues to work.
+
+## Portal Never Appears (Default Grim Fallback)
+
+If the portal dialog never appears on your desktop (common on Hyprland),
+**the daemon now defaults to grim automatically**. No manual intervention needed.
+
+### What happens:
+1. First stream start → grim monitor auto-selected (no portal picker)
+2. Stream delivers ~9-10 fps (grim is fundamentally limited to this)
+3. **No timeouts, no retry loops, no "screen stream failed after retries"**
+4. Stream starts immediately on connection
+
+### If you ever get the portal working:
+```bash
+waypad-daemon authorize-portal   # approve dialog if it appears
+```
+After approval, future streams auto-switch to portal at 30-60 fps.
+
+### Manual source switching:
+In the Android app, you can still select "Portal picker" from the sources list.
+If portal is not approved, the daemon silently switches to grim.
