@@ -237,8 +237,16 @@ intended as a fallback for hosts without PipeWire/GStreamer capture.
 
 1. In the Android app, go to Remote Display → Sources
 2. Select **"Portal picker (60 FPS capable)"**
-3. A ScreenCast approval dialog appears on the Linux host — approve it
+3. **First time only**: A ScreenCast approval dialog appears on the Linux host — approve it.
+   After the first approval, the daemon saves a `restore_token` and all future streams
+   start automatically without any dialog.
 4. The stream now uses the PipeWire + GStreamer pipeline
+
+If you need to re-authorize (e.g., after changing monitors), delete the saved token:
+```bash
+rm ~/.config/waypad-daemon/portal_restore_token.json
+systemctl --user restart waypad-daemon
+```
 
 If no Portal picker appears, install the required packages:
 ```bash
@@ -247,6 +255,13 @@ sudo pacman -S pipewire wireplumber xdg-desktop-portal \
 systemctl --user restart pipewire wireplumber \
   xdg-desktop-portal xdg-desktop-portal-hyprland
 ```
+
+If Portal picker appears but **no approval dialog shows on Linux**, check:
+1. The portal backend is running: `systemctl --user status xdg-desktop-portal-hyprland`
+2. The dialog might be hidden behind other windows — check your taskbar
+3. Try deleting any stale restore token: `rm ~/.config/waypad-daemon/portal_restore_token.json`
+4. Restart the daemon: `systemctl --user restart waypad-daemon`
+5. On first stream start after deleting the token, the dialog should appear
 
 ### Verify portal throughput
 
