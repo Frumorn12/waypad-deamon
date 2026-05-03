@@ -98,14 +98,20 @@ impl ScreenManager {
 
     pub async fn list_sources(&self) -> anyhow::Result<Vec<ScreenSource>> {
         let capabilities = self.capabilities.read().await.clone();
-        let mut sources = Vec::new();
-        if capabilities.capture.portal_screencast_available
+        let portal_available = capabilities.capture.portal_screencast_available
             && capabilities.capture.pipewire_runtime_available
-            && capabilities.capture.gstreamer_pipewire_available
-        {
+            && capabilities.capture.gstreamer_pipewire_available;
+        let has_restore_token = crate::state::load_portal_restore_token(&self.paths).is_some();
+
+        let mut sources = Vec::new();
+        if portal_available {
             sources.push(ScreenSource {
                 id: "portal:chooser".into(),
-                label: "Portal picker (60 FPS capable)".into(),
+                label: if has_restore_token {
+                    "Portal picker (60 FPS capable)".into()
+                } else {
+                    "Portal picker (requires desktop approval)".into()
+                },
                 kind: "chooser".into(),
                 backend: "wayland-screencast-portal".into(),
                 width: 0,
@@ -113,7 +119,7 @@ impl ScreenManager {
                 x: 0,
                 y: 0,
                 scale: 1.0,
-                focused: true,
+                focused: has_restore_token, // Only focus if portal was previously approved
             });
         }
         if capabilities.capture.hyprland_grim_available {
@@ -121,9 +127,12 @@ impl ScreenManager {
                 warn!(%err, "failed to enumerate Hyprland monitors");
                 Vec::new()
             });
-            for mut monitor in monitors {
-                monitor.label = format!("{} (screenshot fallback — slower)", monitor.label);
-                monitor.focused = false;
+            for (index, mut monitor) in monitors.into_iter().enumerate() {
+                monitor.label = format!("{} (auto – no approval needed)", monitor.label);
+                // Focus first grim monitor if portal is not approved
+                if !has_restore_token && index == 0 && sources.iter().all(|s| !s.focused) {
+                    monitor.focused = true;
+                }
                 sources.push(monitor);
             }
         }
@@ -155,6 +164,26 @@ impl ScreenManager {
         options: StreamStartOptions,
     ) -> anyhow::Result<StreamStartResponse> {
         let source = self.select_source(options.source_id.as_deref()).await?;
+
+        // If portal is selected but never approved, silently switch to grim
+        let source = if source.backend == "wayland-screencast-portal"
+            && crate::state::load_portal_restore_token(&self.paths).is_none()
+        {
+            let grim = self
+                .list_sources()
+                .await?
+                .into_iter()
+                .find(|s| s.backend == "hyprland-grim")
+                .context("No grim monitor available and portal is not approved")?;
+            warn!(
+                "portal selected but no restore_token; auto-switching to grim source {}",
+                grim.id
+            );
+            grim
+        } else {
+            source
+        };
+
         let is_grim = source.backend == "hyprland-grim";
         let fps = options.max_fps.unwrap_or(30).clamp(1, 60);
         let fps = if is_grim { fps.min(30) } else { fps };
@@ -451,6 +480,11 @@ async fn run_portal_stream(
     info!(%session_id, fps, quality, "portal stream client connected; starting ScreenCast approval");
 
     let restore_token = crate::state::load_portal_restore_token(&paths);
+    if restore_token.is_none() {
+        // Portal was never approved — fast fail so grim fallback activates immediately
+        info!(%session_id, "no portal restore_token; fast-failing to grim fallback");
+        anyhow::bail!("Portal not approved: no restore_token available");
+    }
     let portal = match PortalScreenCastSession::start(restore_token).await {
         Ok(portal) => portal,
         Err(first_err) => {
@@ -550,7 +584,6 @@ async fn log_child_stderr(session_id: String, label: &'static str, mut stderr: C
 }
 
 const SEND_FRAME_DEADLINE_MS: u64 = 12;
-const SEND_FRAME_DEADLINE_GRIM_MS: u64 = 500;
 
 async fn send_frame(
     socket: &mut TcpStream,
@@ -569,7 +602,28 @@ async fn send_frame_grim(
     height: u32,
     jpeg: &[u8],
 ) -> anyhow::Result<()> {
-    send_frame_deadline(socket, seq, width, height, jpeg, SEND_FRAME_DEADLINE_GRIM_MS).await
+    // Grim frames are large JPEG screenshots — no deadline, send at TCP speed
+    let header = json!({
+        "seq": seq,
+        "timestamp_ms": now_millis(),
+        "codec": "jpeg",
+        "width": width,
+        "height": height
+    })
+    .to_string();
+    let header = header.as_bytes();
+    let header_len = (header.len() as u32).to_be_bytes();
+    let payload_len = (jpeg.len() as u32).to_be_bytes();
+
+    let total = 4 + 4 + header.len() + jpeg.len();
+    let mut buf = Vec::with_capacity(total);
+    buf.extend_from_slice(&header_len);
+    buf.extend_from_slice(&payload_len);
+    buf.extend_from_slice(header);
+    buf.extend_from_slice(jpeg);
+
+    socket.write_all(&buf).await?;
+    Ok(())
 }
 
 async fn send_frame_deadline(
