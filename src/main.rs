@@ -1,5 +1,5 @@
 use anyhow::{Context, bail};
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 use tracing_subscriber::EnvFilter;
 use waypad_daemon::{
     capability::Capabilities,
@@ -59,28 +59,39 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         "authorize-portal" => {
-            println!("Opening ScreenCast portal authorization...");
+            println!("Opening ScreenCast portal authorization (15s timeout)...");
             println!("A dialog should appear on your desktop. Approve screen sharing.");
-            println!("This needs to be done only ONCE. After approval, all future");
-            println!("streams will start automatically without any dialog.");
+            println!("This needs to be done only ONCE.");
             println!();
-            match authorize_portal().await {
-                Ok(token) => {
+            match tokio::time::timeout(Duration::from_secs(15), authorize_portal()).await {
+                Ok(Ok(token)) => {
                     save_portal_restore_token(&paths, &token)?;
                     println!("Portal authorized successfully!");
-                    println!("Restore token saved to {:?}", paths.portal_restore_token);
                     println!("You can now stream at 60 FPS without any host approval.");
                     Ok(())
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     eprintln!();
                     eprintln!("Authorization failed: {err}");
                     eprintln!();
-                    eprintln!("Make sure:");
-                    eprintln!("  1) xdg-desktop-portal-hyprland is running");
-                    eprintln!("  2) You approved the dialog that appeared on your desktop");
-                    eprintln!("  3) PipeWire is running");
-                    Err(err)
+                    eprintln!("The portal dialog did not appear or was denied.");
+                    eprintln!("This is OK — the daemon will automatically use the grim");
+                    eprintln!("screenshot backend instead. It's slower but works without approval.");
+                    eprintln!();
+                    eprintln!("To try again later, re-run this command.");
+                    // Don't return error — grim still works
+                    Ok(())
+                }
+                Err(_elapsed) => {
+                    eprintln!();
+                    eprintln!("Authorization timed out after 15 seconds.");
+                    eprintln!("The portal dialog did not appear on your desktop.");
+                    eprintln!();
+                    eprintln!("This is OK — the daemon will use the grim fallback automatically.");
+                    eprintln!("Streams will work at 20-25 fps without any approval.");
+                    eprintln!();
+                    eprintln!("To try portal again: waypad-daemon authorize-portal");
+                    Ok(())
                 }
             }
         }

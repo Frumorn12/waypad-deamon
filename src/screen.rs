@@ -157,7 +157,7 @@ impl ScreenManager {
         let source = self.select_source(options.source_id.as_deref()).await?;
         let is_grim = source.backend == "hyprland-grim";
         let fps = options.max_fps.unwrap_or(30).clamp(1, 60);
-        let fps = if is_grim { fps.min(15) } else { fps };
+        let fps = if is_grim { fps.min(25) } else { fps };
         let quality = options.jpeg_quality.unwrap_or(70).clamp(35, 92);
         let max_width = options.max_width.map(|value| value.clamp(480, 3840));
         let max_height = options.max_height.map(|value| value.clamp(480, 3840));
@@ -254,35 +254,57 @@ impl ScreenManager {
             backend = %pending.source.backend,
             "screen stream client attached"
         );
-        let (stop_tx, stop_rx) = oneshot::channel();
+        let (stop_tx, mut stop_rx) = oneshot::channel();
         let task_sessions = self.sessions.clone();
         let task_session = session_id.clone();
         let source = pending.source.clone();
         let task_paths = self.paths.clone();
         let task = tokio::spawn(async move {
             let result = if source.backend == "wayland-screencast-portal" {
-                run_portal_stream(
-                    socket,
+                let portal_result = run_portal_stream(
+                    &mut socket,
                     task_session.clone(),
-                    source,
+                    source.clone(),
                     pending.fps,
                     pending.quality,
                     pending.max_width,
                     pending.max_height,
-                    stop_rx,
+                    &mut stop_rx,
                     task_paths.as_ref().clone(),
                 )
-                .await
+                .await;
+                match portal_result {
+                    Ok(()) => Ok(()),
+                    Err(portal_err) => {
+                        if is_client_disconnect(&portal_err) {
+                            Err(portal_err)
+                        } else {
+                            warn!(session_id = %task_session, %portal_err, "portal stream failed; falling back to grim");
+                            // Use grim with the same connection
+                            run_grim_stream_on_open(
+                                &mut socket,
+                                task_session.clone(),
+                                source,
+                                pending.fps,
+                                pending.quality,
+                                pending.max_width,
+                                pending.max_height,
+                                &mut stop_rx,
+                            )
+                            .await
+                        }
+                    }
+                }
             } else {
-                run_grim_stream(
-                    socket,
+                run_grim_stream_on_open(
+                    &mut socket,
                     task_session.clone(),
                     source,
                     pending.fps,
                     pending.quality,
                     pending.max_width,
                     pending.max_height,
-                    stop_rx,
+                    &mut stop_rx,
                 )
                 .await
             };
@@ -349,29 +371,44 @@ pub async fn pointer_move_absolute(
     }
 }
 
-async fn run_grim_stream(
-    mut socket: TcpStream,
+async fn run_grim_stream_on_open(
+    socket: &mut TcpStream,
     session_id: String,
     source: ScreenSource,
     fps: u32,
     quality: u8,
     max_width: Option<u32>,
     max_height: Option<u32>,
-    mut stop_rx: oneshot::Receiver<()>,
+    stop_rx: &mut oneshot::Receiver<()>,
+) -> anyhow::Result<()> {
+    run_grim_stream_impl(socket, session_id, source, fps, quality, max_width, max_height, stop_rx).await
+}
+
+async fn run_grim_stream_impl(
+    socket: &mut TcpStream,
+    session_id: String,
+    source: ScreenSource,
+    fps: u32,
+    quality: u8,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
+    stop_rx: &mut oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
     let mut ticker = interval(Duration::from_secs_f64(1.0 / f64::from(fps.max(1))));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut seq = 0u64;
-    let scale = capture_scale(source.width, source.height, max_width, max_height);
-    info!(%session_id, source_id = %source.id, fps, quality, scale, "grim stream started");
+    // Force aggressive scale for grim (screenshot tool is slow at full res)
+    let requested_scale = capture_scale(source.width, source.height, max_width, max_height);
+    let scale = requested_scale.min(0.6); // Never capture above 60% resolution
+    info!(%session_id, source_id = %source.id, fps, quality, scale, requested_scale, "grim stream started");
     let mut frame_count = 0u64;
     let mut throughput_start = tokio::time::Instant::now();
     loop {
         tokio::select! {
-            _ = &mut stop_rx => break,
+            _ = &mut *stop_rx => break,
             _ = ticker.tick() => {
                 let jpeg = capture_grim_frame(&source, quality, scale).await?;
-                send_frame(&mut socket, seq, source.width, source.height, &jpeg).await?;
+                send_frame(&mut *socket, seq, source.width, source.height, &jpeg).await?;
                 seq += 1;
                 frame_count += 1;
                 let elapsed = throughput_start.elapsed().as_secs_f64();
@@ -389,14 +426,14 @@ async fn run_grim_stream(
 }
 
 async fn run_portal_stream(
-    mut socket: TcpStream,
+    socket: &mut TcpStream,
     session_id: String,
     _selected_source: ScreenSource,
     fps: u32,
     quality: u8,
     max_width: Option<u32>,
     max_height: Option<u32>,
-    mut stop_rx: oneshot::Receiver<()>,
+    stop_rx: &mut oneshot::Receiver<()>,
     paths: super::state::StatePaths,
 ) -> anyhow::Result<()> {
     info!(%session_id, fps, quality, "portal stream client connected; starting ScreenCast approval");
@@ -449,7 +486,7 @@ async fn run_portal_stream(
     info!(%session_id, source_id = %source.id, ?target_width, ?target_height, "portal stream started");
     loop {
         tokio::select! {
-            _ = &mut stop_rx => break,
+            _ = &mut *stop_rx => break,
             read = stdout.read(&mut buffer) => {
                 let n = read?;
                 if n == 0 {
@@ -457,7 +494,7 @@ async fn run_portal_stream(
                     break;
                 }
                 for frame in reader.push(&buffer[..n]) {
-                    send_frame(&mut socket, seq, source.width, source.height, &frame).await?;
+                    send_frame(&mut *socket, seq, source.width, source.height, &frame).await?;
                     seq += 1;
                     frame_count += 1;
                 }
@@ -601,13 +638,16 @@ async fn capture_grim_frame(
     scale: f64,
 ) -> anyhow::Result<Vec<u8>> {
     let mut command = Command::new("grim");
-    command.args(["-t", "jpeg", "-q", &quality.to_string(), "-c"]);
+    // Use lower quality for streaming (cap at 50, use even lower if requested)
+    let stream_quality = quality.min(50);
+    command.args(["-t", "jpeg", "-q", &stream_quality.to_string()]);
     if scale < 0.999 {
         command.args(["-s", &format!("{scale:.4}")]);
     }
     if let Some(output) = source.id.strip_prefix("hyprland:monitor:") {
         command.args(["-o", output]);
     }
+    // Output to stdout (no file, no cursor for speed)
     command.arg("-");
     let output = command.output().await.context("failed to run grim")?;
     if !output.status.success() {
@@ -926,7 +966,7 @@ async fn wait_request(
     )
     .await?;
     let mut stream = proxy.receive_signal("Response").await?;
-    let message = timeout(Duration::from_secs(120), stream.next())
+    let message = timeout(Duration::from_secs(15), stream.next())
         .await
         .context("Timed out waiting for portal response")?
         .context("Portal request closed before emitting Response")?;
