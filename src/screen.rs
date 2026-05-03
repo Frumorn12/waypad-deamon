@@ -108,7 +108,7 @@ impl ScreenManager {
         if portal_available {
             sources.push(ScreenSource {
                 id: "portal:chooser".into(),
-                label: "Portal picker (60 FPS, one-time approval)".into(),
+                label: "Portal picker (experimental – may not work on NVIDIA)".into(),
                 kind: "chooser".into(),
                 backend: "wayland-screencast-portal".into(),
                 width: 0,
@@ -116,7 +116,7 @@ impl ScreenManager {
                 x: 0,
                 y: 0,
                 scale: 1.0,
-                focused: true, // Default: portal is preferred
+                focused: false, // Not default — grim is always preferred
             });
         }
         if capabilities.capture.hyprland_grim_available {
@@ -124,7 +124,8 @@ impl ScreenManager {
                 warn!(%err, "failed to enumerate Hyprland monitors");
                 Vec::new()
             });
-            for monitor in monitors {
+            for (i, mut monitor) in monitors.into_iter().enumerate() {
+                monitor.focused = i == 0 && sources.iter().all(|s| !s.focused);
                 sources.push(monitor);
             }
         }
@@ -156,17 +157,6 @@ impl ScreenManager {
         options: StreamStartOptions,
     ) -> anyhow::Result<StreamStartResponse> {
         let source = self.select_source(options.source_id.as_deref()).await?;
-
-        // If portal is selected but never approved, silently switch to grim
-        let source = if source.backend == "wayland-screencast-portal"
-            && crate::state::load_portal_restore_token(&self.paths).is_none()
-        {
-            // Portal might work with app_id now; let it try but warn
-            warn!("portal selected without restore_token; will attempt portal (app_id now provided)");
-            source
-        } else {
-            source
-        };
 
         let is_grim = source.backend == "hyprland-grim";
         let fps = options.max_fps.unwrap_or(30).clamp(1, 60);
