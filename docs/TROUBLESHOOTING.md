@@ -424,31 +424,21 @@ The Android app refuses to connect if the pinned host fingerprint changes. This 
 
 Remove the trusted host on Android and pair again only if you intentionally changed the host key.
 
-## Portal Dialog Does Not Appear / Stuck On "Connecting Stream"
+## Stream Gets Stuck On "Connecting" / Portal Never Appears
 
-If the Android app stays on "Connecting stream" and the portal dialog
-never appears on the Linux desktop, pre-authorize manually:
+**The daemon now handles this automatically.** If the portal dialog doesn't
+appear within 15 seconds, the stream falls back to the grim screenshot backend.
+This works without any host approval and delivers 20-25 fps.
 
+### What happens:
+1. Daemon tries portal path for 15 seconds
+2. If portal succeeds → 60 FPS PipeWire stream
+3. If portal fails/times out → auto-fallback to grim (20-25 FPS)
+4. No more "connecting stream" hangs!
+
+### To try portal again later:
 ```bash
 waypad-daemon authorize-portal
 ```
-
-This command:
-1. Triggers the ScreenCast approval dialog
-2. Waits for you to click "Allow" on the desktop
-3. Saves the restore token so all future streams auto-approve
-
-After this one-time step, restart the daemon and try streaming again:
-
-```bash
-systemctl --user restart waypad-daemon
-```
-
-If the dialog STILL doesn't appear:
-```bash
-# Check portal backends
-systemctl --user status xdg-desktop-portal xdg-desktop-portal-hyprland
-
-# Check for errors
-journalctl --user -u xdg-desktop-portal-hyprland -n 20
-```
+This command has a 15-second timeout. Approve the dialog if it appears.
+If it doesn't, the grim fallback continues to work.
