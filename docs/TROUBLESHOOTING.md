@@ -214,9 +214,20 @@ restricts TCP `47771` appropriately.
 
 ## Stream Is Very Slow (~10 FPS Average)
 
-If the stream delivers only 5-15 FPS despite selecting a 60 FPS profile, the
-most common cause is selection of a grim-based (screenshot) source instead of
-the portal (PipeWire/GStreamer) source.
+### Grim is limited to ~10 FPS by design
+
+The grim backend takes a full JPEG screenshot each frame using the `grim`
+tool. Each screenshot cycle takes ~100-110ms on Hyprland at 432p. This
+gives a theoretical maximum of ~9-10 FPS regardless of the FPS setting.
+
+**For 30+ FPS, you MUST use the Portal (PipeWire/GStreamer) path.**
+The grim backend is a fallback for hosts where the portal is not available.
+
+Grim optimizations applied:
+- Force scale 0.4 (never above 40% resolution)
+- Quality capped at 35
+- Cursor not captured (faster)
+- Send deadline 500ms (accommodates large JPEG frames)
 
 ### Check which source is active
 
@@ -248,7 +259,14 @@ rm ~/.config/waypad-daemon/portal_restore_token.json
 systemctl --user restart waypad-daemon
 ```
 
-If no Portal picker appears, install the required packages:
+If Portal picker appears but stream fails immediately with GStreamer errors
+(`"error set output format: -22"` or `"pipeline doesn't want to preroll"`):
+
+1. Remove forced format caps (done — the pipeline now auto-negotiates format)
+2. Check PipeWire: `systemctl --user status pipewire wireplumber`
+3. Check GStreamer plugins: `gst-inspect-1.0 pipewiresrc jpegenc videoconvert`
+4. On NVIDIA GPUs, DMA-BUF negotiation may fail. The pipeline now detects this
+   and auto-falls back to grim
 ```bash
 sudo pacman -S pipewire wireplumber xdg-desktop-portal \
   xdg-desktop-portal-hyprland gst-plugin-pipewire gst-plugins-good
