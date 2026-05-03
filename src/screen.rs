@@ -277,19 +277,7 @@ impl ScreenManager {
         let source = pending.source.clone();
         let task_paths = self.paths.clone();
         let task = tokio::spawn(async move {
-            let result = if source.backend == "x11-ffmpeg" {
-                run_x11_stream(
-                    &mut socket,
-                    task_session.clone(),
-                    source,
-                    pending.fps,
-                    pending.quality,
-                    pending.max_width,
-                    pending.max_height,
-                    &mut stop_rx,
-                )
-                .await
-            } else if source.backend == "wayland-screencast-portal" {
+            let result = if source.backend == "wayland-screencast-portal" {
                 let portal_result = run_portal_stream(
                     &mut socket,
                     task_session.clone(),
@@ -949,6 +937,7 @@ fn spawn_gstreamer_pipewire(
         .arg("do-timestamp=true")
         .arg("keepalive-time=1000")
         .arg("!")
+        // DMA-BUF → CPU: use videoconvert which supports DMA_DRM format
         .arg("videoconvert")
         .arg("!")
         .arg("videoscale")
@@ -963,14 +952,6 @@ fn spawn_gstreamer_pipewire(
             }
             _ => format!("video/x-raw,framerate={fps}/1"),
         })
-        .arg("!")
-        .arg("queue")
-        .arg("max-size-buffers=1")
-        .arg("max-size-bytes=0")
-        .arg("max-size-time=0")
-        .arg("leaky=upstream")
-        .arg("!")
-        .arg("videoconvert")
         .arg("!")
         .arg("jpegenc")
         .arg(format!("quality={}", quality))
