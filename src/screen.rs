@@ -163,6 +163,10 @@ impl ScreenManager {
         let max_height = options.max_height.map(|value| value.clamp(480, 3840));
         let session_id = Uuid::new_v4().to_string();
         let token = Uuid::new_v4().to_string();
+        // Save the selected source for future sessions
+        if let Err(err) = crate::state::save_preferred_source(&self.paths, &source.id) {
+            warn!(%err, source_id = %source.id, "failed to save preferred source");
+        }
         self.sessions.lock().await.insert(
             session_id.clone(),
             StreamSession::Pending(PendingStream {
@@ -336,6 +340,14 @@ impl ScreenManager {
                 .find(|source| source.id == id)
                 .with_context(|| format!("Screen source not found: {id}"))
         } else {
+            // Try preferred source first, then focused, then first
+            let preferred = crate::state::load_preferred_source(&self.paths);
+            if let Some(ref pref_id) = preferred {
+                if let Some(source) = sources.iter().find(|s| s.id == *pref_id) {
+                    info!(source_id = %pref_id, "restored preferred screen source");
+                    return Ok(source.clone());
+                }
+            }
             sources
                 .iter()
                 .find(|source| source.focused)
@@ -408,7 +420,7 @@ async fn run_grim_stream_impl(
             _ = &mut *stop_rx => break,
             _ = ticker.tick() => {
                 let jpeg = capture_grim_frame(&source, quality, scale).await?;
-                send_frame(&mut *socket, seq, source.width, source.height, &jpeg).await?;
+                send_frame_grim(&mut *socket, seq, source.width, source.height, &jpeg).await?;
                 seq += 1;
                 frame_count += 1;
                 let elapsed = throughput_start.elapsed().as_secs_f64();
@@ -533,6 +545,7 @@ async fn log_child_stderr(session_id: String, label: &'static str, mut stderr: C
 }
 
 const SEND_FRAME_DEADLINE_MS: u64 = 12;
+const SEND_FRAME_DEADLINE_GRIM_MS: u64 = 250;
 
 async fn send_frame(
     socket: &mut TcpStream,
@@ -540,6 +553,27 @@ async fn send_frame(
     width: u32,
     height: u32,
     jpeg: &[u8],
+) -> anyhow::Result<()> {
+    send_frame_deadline(socket, seq, width, height, jpeg, SEND_FRAME_DEADLINE_MS).await
+}
+
+async fn send_frame_grim(
+    socket: &mut TcpStream,
+    seq: u64,
+    width: u32,
+    height: u32,
+    jpeg: &[u8],
+) -> anyhow::Result<()> {
+    send_frame_deadline(socket, seq, width, height, jpeg, SEND_FRAME_DEADLINE_GRIM_MS).await
+}
+
+async fn send_frame_deadline(
+    socket: &mut TcpStream,
+    seq: u64,
+    width: u32,
+    height: u32,
+    jpeg: &[u8],
+    deadline_ms: u64,
 ) -> anyhow::Result<()> {
     let header = json!({
         "seq": seq,
@@ -560,7 +594,7 @@ async fn send_frame(
     buf.extend_from_slice(header);
     buf.extend_from_slice(jpeg);
 
-    let result = timeout(Duration::from_millis(SEND_FRAME_DEADLINE_MS), async {
+    let result = timeout(Duration::from_millis(deadline_ms), async {
         let mut offset = 0;
         while offset < buf.len() {
             offset += socket.write(&buf[offset..]).await?;
@@ -864,12 +898,6 @@ fn spawn_gstreamer_pipewire(
         .arg("do-timestamp=true")
         .arg("keepalive-time=1000")
         .arg("!")
-        .arg("queue")
-        .arg("max-size-buffers=1")
-        .arg("max-size-bytes=0")
-        .arg("max-size-time=0")
-        .arg("leaky=downstream")
-        .arg("!")
         .arg("videoconvert")
         .arg("!")
         .arg("videoscale")
@@ -884,6 +912,12 @@ fn spawn_gstreamer_pipewire(
             }
             _ => format!("video/x-raw,format=I420,framerate={fps}/1"),
         })
+        .arg("!")
+        .arg("queue")
+        .arg("max-size-buffers=1")
+        .arg("max-size-bytes=0")
+        .arg("max-size-time=0")
+        .arg("leaky=upstream")
         .arg("!")
         .arg("jpegenc")
         .arg(format!("quality={}", quality))

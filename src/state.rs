@@ -46,6 +46,7 @@ pub struct StatePaths {
     pub trusted_devices: PathBuf,
     pub pairing_code: PathBuf,
     pub portal_restore_token: PathBuf,
+    pub preferred_source: PathBuf,
 }
 
 impl StatePaths {
@@ -56,6 +57,7 @@ impl StatePaths {
             trusted_devices: state_dir.join("trusted_devices.json"),
             pairing_code: state_dir.join("pairing_code.json"),
             portal_restore_token: state_dir.join("portal_restore_token.json"),
+            preferred_source: state_dir.join("preferred_source.json"),
             state_dir,
         }
     }
@@ -228,6 +230,25 @@ pub fn load_portal_restore_token(paths: &StatePaths) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
     value.get("restore_token")?.as_str().map(str::to_string)
+}
+
+pub fn save_preferred_source(paths: &StatePaths, source_id: &str) -> anyhow::Result<()> {
+    ensure_state_dir(paths)?;
+    let path = &paths.preferred_source;
+    let data = serde_json::json!({ "source_id": source_id, "saved_at": now_unix() });
+    fs::write(path, serde_json::to_string(&data)?)?;
+    set_private_file_permissions(path)?;
+    Ok(())
+}
+
+pub fn load_preferred_source(paths: &StatePaths) -> Option<String> {
+    let path = &paths.preferred_source;
+    if !path.exists() {
+        return None;
+    }
+    let raw = fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value.get("source_id")?.as_str().map(str::to_string)
 }
 
 #[cfg(test)]
