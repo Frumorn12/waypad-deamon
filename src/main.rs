@@ -5,10 +5,11 @@ use waypad_daemon::{
     capability::Capabilities,
     config::Config,
     platform::command_output,
+    screen::authorize_portal,
     server,
     state::{
         StatePaths, create_pairing_code, load_or_create_identity, load_trusted_devices,
-        rotate_identity, save_trusted_devices,
+        rotate_identity, save_portal_restore_token, save_trusted_devices,
     },
 };
 
@@ -56,6 +57,32 @@ async fn main() -> anyhow::Result<()> {
             Config::write_sample(&path)?;
             println!("Wrote sample config to {}", path.display());
             Ok(())
+        }
+        "authorize-portal" => {
+            println!("Opening ScreenCast portal authorization...");
+            println!("A dialog should appear on your desktop. Approve screen sharing.");
+            println!("This needs to be done only ONCE. After approval, all future");
+            println!("streams will start automatically without any dialog.");
+            println!();
+            match authorize_portal().await {
+                Ok(token) => {
+                    save_portal_restore_token(&paths, &token)?;
+                    println!("Portal authorized successfully!");
+                    println!("Restore token saved to {:?}", paths.portal_restore_token);
+                    println!("You can now stream at 60 FPS without any host approval.");
+                    Ok(())
+                }
+                Err(err) => {
+                    eprintln!();
+                    eprintln!("Authorization failed: {err}");
+                    eprintln!();
+                    eprintln!("Make sure:");
+                    eprintln!("  1) xdg-desktop-portal-hyprland is running");
+                    eprintln!("  2) You approved the dialog that appeared on your desktop");
+                    eprintln!("  3) PipeWire is running");
+                    Err(err)
+                }
+            }
         }
         other => bail!("unknown command: {other}"),
     }
@@ -343,6 +370,7 @@ fn print_help() {
   invite [--qr --allow-public-pairing --remote-address <host>]
                                 Allow public-network pairing for this invite
   doctor                        Print Wayland, portal, and backend diagnostics
+  authorize-portal              Pre-authorize screen capture (approve ONCE, then auto-approve forever)
   devices list                  List trusted Android devices
   devices revoke <device-id>    Revoke a trusted Android device
   rotate-host-key               Rotate host identity and require re-pairing

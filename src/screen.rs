@@ -956,6 +956,81 @@ fn stream_size(properties: &HashMap<String, OwnedValue>) -> (Option<u32>, Option
     (None, None)
 }
 
+pub async fn authorize_portal() -> anyhow::Result<String> {
+    let connection = zbus::Connection::session().await?;
+    let proxy = zbus::Proxy::new(
+        &connection,
+        "org.freedesktop.portal.Desktop",
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.ScreenCast",
+    )
+    .await
+    .context("ScreenCast portal not available")?;
+
+    let mut create_options = HashMap::<&str, OwnedValue>::new();
+    create_options.insert(
+        "handle_token",
+        Value::from(format!("waypad_auth_create_{}", portal_token())).try_into()?,
+    );
+    create_options.insert(
+        "session_handle_token",
+        Value::from(format!("waypad_auth_session_{}", portal_token())).try_into()?,
+    );
+    let create_handle: OwnedObjectPath = proxy.call("CreateSession", &(create_options)).await?;
+    let create_response = wait_request(&connection, &create_handle).await?;
+    if create_response.response != 0 {
+        bail!("Portal permission denied while creating ScreenCast authorization");
+    }
+    let session_handle_string = create_response
+        .results
+        .get("session_handle")
+        .and_then(owned_value_to_string)
+        .context("ScreenCast portal did not return a session handle")?;
+    let session_handle = OwnedObjectPath::try_from(session_handle_string.as_str())?;
+
+    let mut select_options = HashMap::<&str, OwnedValue>::new();
+    select_options.insert("types", Value::from(1u32 | 2u32).try_into()?);
+    select_options.insert("multiple", Value::from(false).try_into()?);
+    select_options.insert("cursor_mode", Value::from(2u32).try_into()?);
+    select_options.insert("persist_mode", Value::from(1u32).try_into()?);
+    select_options.insert(
+        "handle_token",
+        Value::from(format!("waypad_auth_select_{}", portal_token())).try_into()?,
+    );
+    let select_handle: OwnedObjectPath = proxy
+        .call("SelectSources", &(&session_handle, select_options))
+        .await?;
+    let select_response = wait_request(&connection, &select_handle).await?;
+    if select_response.response != 0 {
+        bail!("ScreenCast source selection was denied");
+    }
+
+    let mut start_options = HashMap::<&str, OwnedValue>::new();
+    start_options.insert(
+        "handle_token",
+        Value::from(format!("waypad_auth_start_{}", portal_token())).try_into()?,
+    );
+    let start_handle: OwnedObjectPath = proxy
+        .call("Start", &(&session_handle, "", start_options))
+        .await?;
+    let start_response = wait_request(&connection, &start_handle).await?;
+    if start_response.response != 0 {
+        bail!("ScreenCast authorization was denied or cancelled. Approve the dialog on your desktop.");
+    }
+
+    let restore_token = start_response
+        .results
+        .get("restore_token")
+        .and_then(owned_value_to_string)
+        .context("ScreenCast portal did not return a restore_token (persist_mode may not be supported)")?;
+
+    let _: Result<(), _> = proxy
+        .call::<_, _, ()>("CloseSession", &(session_handle.as_str()))
+        .await;
+
+    Ok(restore_token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
