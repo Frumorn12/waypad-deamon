@@ -423,3 +423,32 @@ The Android app refuses to connect if the pinned host fingerprint changes. This 
 - restoring from a different Linux user profile
 
 Remove the trusted host on Android and pair again only if you intentionally changed the host key.
+
+## Portal Dialog Does Not Appear / Stuck On "Connecting Stream"
+
+If the Android app stays on "Connecting stream" and the portal dialog
+never appears on the Linux desktop, pre-authorize manually:
+
+```bash
+waypad-daemon authorize-portal
+```
+
+This command:
+1. Triggers the ScreenCast approval dialog
+2. Waits for you to click "Allow" on the desktop
+3. Saves the restore token so all future streams auto-approve
+
+After this one-time step, restart the daemon and try streaming again:
+
+```bash
+systemctl --user restart waypad-daemon
+```
+
+If the dialog STILL doesn't appear:
+```bash
+# Check portal backends
+systemctl --user status xdg-desktop-portal xdg-desktop-portal-hyprland
+
+# Check for errors
+journalctl --user -u xdg-desktop-portal-hyprland -n 20
+```
