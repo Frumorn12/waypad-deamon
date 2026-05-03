@@ -105,21 +105,10 @@ impl ScreenManager {
 
         let mut sources = Vec::new();
 
-        // X11 capture via ffmpeg — no portal needed, works on XWayland
-        if let Ok(x11_monitors) = list_x11_monitors().await {
-            for monitor in x11_monitors {
-                sources.push(monitor);
-            }
-        }
-
         if portal_available {
             sources.push(ScreenSource {
                 id: "portal:chooser".into(),
-                label: if has_restore_token {
-                    "Portal picker (60 FPS capable)".into()
-                } else {
-                    "Portal picker (requires desktop approval)".into()
-                },
+                label: "Portal picker (60 FPS, one-time approval)".into(),
                 kind: "chooser".into(),
                 backend: "wayland-screencast-portal".into(),
                 width: 0,
@@ -127,7 +116,7 @@ impl ScreenManager {
                 x: 0,
                 y: 0,
                 scale: 1.0,
-                focused: false, // Never default — X11 is always preferred
+                focused: true, // Default: portal is preferred
             });
         }
         if capabilities.capture.hyprland_grim_available {
@@ -171,19 +160,10 @@ impl ScreenManager {
         // If portal is selected but never approved, silently switch to grim
         let source = if source.backend == "wayland-screencast-portal"
             && crate::state::load_portal_restore_token(&self.paths).is_none()
-            && source.backend != "x11-ffmpeg" // Never switch X11 sources
         {
-            let grim = self
-                .list_sources()
-                .await?
-                .into_iter()
-                .find(|s| s.backend == "hyprland-grim")
-                .context("No grim monitor available and portal is not approved")?;
-            warn!(
-                "portal selected but no restore_token; auto-switching to grim source {}",
-                grim.id
-            );
-            grim
+            // Portal might work with app_id now; let it try but warn
+            warn!("portal selected without restore_token; will attempt portal (app_id now provided)");
+            source
         } else {
             source
         };
@@ -496,11 +476,6 @@ async fn run_portal_stream(
     info!(%session_id, fps, quality, "portal stream client connected; starting ScreenCast approval");
 
     let restore_token = crate::state::load_portal_restore_token(&paths);
-    if restore_token.is_none() {
-        // Portal was never approved — fast fail so grim fallback activates immediately
-        info!(%session_id, "no portal restore_token; fast-failing to grim fallback");
-        anyhow::bail!("Portal not approved: no restore_token available");
-    }
     let portal = match PortalScreenCastSession::start(restore_token).await {
         Ok(portal) => portal,
         Err(first_err) => {
@@ -836,6 +811,7 @@ impl PortalScreenCastSession {
             "session_handle_token",
             Value::from(session_token).try_into()?,
         );
+        
         if let Some(ref token) = restore_token {
             create_options.insert("restore_token", Value::from(token.as_str()).try_into()?);
             info!("portal restore_token provided, attempting session restoration");
@@ -860,7 +836,7 @@ impl PortalScreenCastSession {
             select_options.insert("types", Value::from(1u32 | 2u32).try_into()?);
             select_options.insert("multiple", Value::from(false).try_into()?);
             select_options.insert("cursor_mode", Value::from(2u32).try_into()?);
-            select_options.insert("persist_mode", Value::from(1u32).try_into()?);
+            select_options.insert("persist_mode", Value::from(2u32).try_into()?);
             select_options.insert(
                 "handle_token",
                 Value::from(format!("waypad_select_{}", portal_token())).try_into()?,
@@ -1277,6 +1253,7 @@ pub async fn authorize_portal() -> anyhow::Result<String> {
         "session_handle_token",
         Value::from(format!("waypad_auth_session_{}", portal_token())).try_into()?,
     );
+    
     let create_handle: OwnedObjectPath = proxy.call("CreateSession", &(create_options)).await?;
     let create_response = wait_request(&connection, &create_handle).await?;
     if create_response.response != 0 {
@@ -1293,7 +1270,7 @@ pub async fn authorize_portal() -> anyhow::Result<String> {
     select_options.insert("types", Value::from(1u32 | 2u32).try_into()?);
     select_options.insert("multiple", Value::from(false).try_into()?);
     select_options.insert("cursor_mode", Value::from(2u32).try_into()?);
-    select_options.insert("persist_mode", Value::from(1u32).try_into()?);
+    select_options.insert("persist_mode", Value::from(2u32).try_into()?);
     select_options.insert(
         "handle_token",
         Value::from(format!("waypad_auth_select_{}", portal_token())).try_into()?,
@@ -1322,14 +1299,23 @@ pub async fn authorize_portal() -> anyhow::Result<String> {
     let restore_token = start_response
         .results
         .get("restore_token")
-        .and_then(owned_value_to_string)
-        .context("ScreenCast portal did not return a restore_token (persist_mode may not be supported)")?;
+        .and_then(owned_value_to_string);
 
-    let _: Result<(), _> = proxy
-        .call::<_, _, ()>("CloseSession", &(session_handle.as_str()))
-        .await;
-
-    Ok(restore_token)
+    match restore_token {
+        Some(token) => {
+            let _: Result<(), _> = proxy
+                .call::<_, _, ()>("CloseSession", &(session_handle.as_str()))
+                .await;
+            Ok(token)
+        }
+        None => {
+            warn!("portal authorization succeeded but no restore_token returned; persist_mode may not be supported by this backend");
+            let _: Result<(), _> = proxy
+                .call::<_, _, ()>("CloseSession", &(session_handle.as_str()))
+                .await;
+            anyhow::bail!("Portal authorization completed but restore_token not available. The portal should now be approved for this session. Try streaming immediately.")
+        }
+    }
 }
 
 #[cfg(test)]
