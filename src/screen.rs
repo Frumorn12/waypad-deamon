@@ -1,4 +1,4 @@
-use crate::{capability::Capabilities, input::InputManager, platform::command_output};
+use crate::{capability::Capabilities, input::InputManager, platform::{command_exists, command_output}};
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use tokio::{
     process::{ChildStderr, Command},
     sync::{Mutex, RwLock, oneshot},
     task::JoinHandle,
-    time::{MissedTickBehavior, interval, timeout},
+    time::{timeout},
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -54,6 +54,8 @@ pub struct StreamStartResponse {
     pub codec: String,
     pub transport: String,
     pub source: ScreenSource,
+    pub actual_fps: u32,
+    pub actual_quality: u8,
 }
 
 #[derive(Debug)]
@@ -101,7 +103,7 @@ impl ScreenManager {
         let portal_available = capabilities.capture.portal_screencast_available
             && capabilities.capture.pipewire_runtime_available
             && capabilities.capture.gstreamer_pipewire_available;
-        let has_restore_token = crate::state::load_portal_restore_token(&self.paths).is_some();
+        let _has_restore_token = crate::state::load_portal_restore_token(&self.paths).is_some();
 
         let mut sources = Vec::new();
 
@@ -127,6 +129,20 @@ impl ScreenManager {
             for (i, mut monitor) in monitors.into_iter().enumerate() {
                 monitor.focused = i == 0 && sources.iter().all(|s| !s.focused);
                 sources.push(monitor);
+            }
+        }
+        // X11 ffmpeg backend — high performance, no portal approval needed
+        if std::env::var("DISPLAY").is_ok() && command_exists("xrandr") && command_exists("ffmpeg") {
+            match list_x11_monitors().await {
+                Ok(monitors) => {
+                    for (i, mut monitor) in monitors.into_iter().enumerate() {
+                        monitor.focused = i == 0 && sources.iter().all(|s| !s.focused);
+                        sources.push(monitor);
+                    }
+                }
+                Err(err) => {
+                    warn!(%err, "failed to enumerate X11 monitors");
+                }
             }
         }
         if sources.is_empty() {
@@ -186,8 +202,9 @@ impl ScreenManager {
             stream_port = self.stream_port,
             source_id = %source.id,
             backend = %source.backend,
-            fps,
-            quality,
+            requested_fps = options.max_fps,
+            actual_fps = fps,
+            actual_quality = quality,
             ?max_width,
             ?max_height,
             "screen stream session pending client attach"
@@ -199,6 +216,8 @@ impl ScreenManager {
             codec: "jpeg".into(),
             transport: "waypad-control-port-stream-v2".into(),
             source,
+            actual_fps: fps,
+            actual_quality: quality,
         })
     }
 
@@ -302,6 +321,18 @@ impl ScreenManager {
                         }
                     }
                 }
+            } else if source.backend == "x11-ffmpeg" {
+                run_x11_stream(
+                    &mut socket,
+                    task_session.clone(),
+                    source,
+                    pending.fps,
+                    pending.quality,
+                    pending.max_width,
+                    pending.max_height,
+                    &mut stop_rx,
+                )
+                .await
             } else {
                 run_grim_stream_on_open(
                     &mut socket,
@@ -409,8 +440,7 @@ async fn run_grim_stream_impl(
     max_height: Option<u32>,
     stop_rx: &mut oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let mut ticker = interval(Duration::from_secs_f64(1.0 / f64::from(fps.max(1))));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let target_interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
     let mut seq = 0u64;
     // Force aggressive scale for grim (screenshot tool is slow at full res)
     let requested_scale = capture_scale(source.width, source.height, max_width, max_height);
@@ -419,19 +449,29 @@ async fn run_grim_stream_impl(
     let mut frame_count = 0u64;
     let mut throughput_start = tokio::time::Instant::now();
     loop {
+        let frame_start = tokio::time::Instant::now();
         tokio::select! {
             _ = &mut *stop_rx => break,
-            _ = ticker.tick() => {
-                let jpeg = capture_grim_frame(&source, quality, scale).await?;
+            jpeg = capture_grim_frame(&source, quality, scale) => {
+                let jpeg = jpeg?;
                 send_frame_grim(&mut *socket, seq, source.width, source.height, &jpeg).await?;
                 seq += 1;
                 frame_count += 1;
                 let elapsed = throughput_start.elapsed().as_secs_f64();
                 if elapsed >= 2.0 {
                     let measured = frame_count as f64 / elapsed;
-                    debug!(%session_id, fps_measured = measured, fps_target = fps, frames = frame_count, "grim stream throughput");
+                    info!(%session_id, fps_measured = measured, fps_target = fps, frames = frame_count, "grim stream throughput");
                     frame_count = 0;
                     throughput_start = tokio::time::Instant::now();
+                }
+                // Sleep remaining time to hit target fps, but never less than 16ms to avoid busy-wait
+                let capture_elapsed = frame_start.elapsed();
+                if let Some(remaining) = target_interval.checked_sub(capture_elapsed) {
+                    let sleep_for = remaining.max(Duration::from_millis(16));
+                    tokio::select! {
+                        _ = &mut *stop_rx => break,
+                        _ = tokio::time::sleep(sleep_for) => {}
+                    }
                 }
             }
         }
@@ -946,6 +986,10 @@ fn spawn_gstreamer_pipewire(
         .arg("jpegenc")
         .arg(format!("quality={}", quality))
         .arg("snapshot=false")
+        .arg("!")
+        .arg("queue")
+        .arg("max-size-buffers=1")
+        .arg("leaky=downstream")
         .arg("!")
         .arg("fdsink")
         .arg("fd=1")

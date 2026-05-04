@@ -227,7 +227,8 @@ Grim optimizations applied:
 - Force scale 0.4 (never above 40% resolution)
 - Quality capped at 35
 - Cursor not captured (faster)
-- Send deadline 500ms (accommodates large JPEG frames)
+- Loop sleeps remaining frame time instead of skipping missed ticks, maximizing throughput
+- Send deadline removed for grim (large JPEG frames send at TCP speed)
 
 ### Check which source is active
 
@@ -316,18 +317,23 @@ The GStreamer pipeline is configured for interactive streaming:
 ```
 pipewiresrc → videoconvert → videoscale →
 videorate(drop-only=true, skip-to-first=true) →
-caps(video/x-raw,format=I420,framerate=FPS/1) →
-queue(leaky=upstream, max-size-buffers=1) →
-jpegenc(quality=Q, snapshot=false) → fdsink(sync=false)
+caps(video/x-raw,framerate=FPS/1) →
+jpegenc(quality=Q, snapshot=false) →
+queue(leaky=downstream, max-size-buffers=1) →
+fdsink(sync=false)
 ```
 
 Each element is tuned to minimize buffering:
 - `drop-only=true, skip-to-first=true` on videorate skips to real-time
 - `snapshot=false` ensures proper streaming encode (not still-image freeze)
 - `sync=false` on fdsink avoids blocking on stdout
-- `leaky=upstream` on queue: drops oldest frame when encoder is busy
-- `format=I420` forces planar YUV format for fastest encode path
-- Queue placed AFTER videorate to prevent preroll deadlock with live sources
+- `leaky=downstream` on queue: drops newest frame when the network cannot keep up, preventing encoder backpressure
+- Queue placed AFTER jpegenc to protect the encoder from network stalls
+- `format=I420` auto-negotiates planar YUV for fastest encode path
+
+### Honest FPS reporting
+
+The daemon now returns `actual_fps` and `actual_quality` in the stream start response. If the selected source cannot support the requested FPS (e.g., grim is capped at 30), the app displays the clamped value so you know exactly what the host is delivering.
 
 ### Portal restore tokens
 
