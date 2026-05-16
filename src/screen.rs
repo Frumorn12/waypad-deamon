@@ -966,27 +966,34 @@ fn spawn_gstreamer_pipewire(
         .arg("do-timestamp=true")
         .arg("keepalive-time=1000")
         .arg("!")
+        .arg("queue")
+        .arg("max-size-buffers=4")
+        .arg("leaky=downstream")
+        .arg("!")
         .arg("videoconvert")
-        .arg("!")
-        .arg("videoscale")
-        .arg("!")
-        .arg("videorate")
-        .arg("drop-only=true")
-        .arg("skip-to-first=true")
-        .arg("!")
-        .arg(match (target_width, target_height) {
-            (Some(width), Some(height)) => {
-                format!("video/x-raw,width={width},height={height},framerate={fps}/1")
-            }
-            _ => format!("video/x-raw,framerate={fps}/1"),
-        })
+        .arg("n-threads=4")
+        .arg("!");
+
+    // Scale + framerate in a single capsfilter (avoids separate videoscale + videorate overhead)
+    match (target_width, target_height) {
+        (Some(width), Some(height)) => {
+            command.arg(format!(
+                "video/x-raw,width={width},height={height},framerate={fps}/1"
+            ));
+        }
+        _ => {
+            command.arg(format!("video/x-raw,framerate={fps}/1"));
+        }
+    }
+
+    command
         .arg("!")
         .arg("jpegenc")
-        .arg(format!("quality={}", quality))
-        .arg("snapshot=false")
+        .arg(format!("quality={}", quality.min(75)))
+        .arg("idct-method=1")
         .arg("!")
         .arg("queue")
-        .arg("max-size-buffers=1")
+        .arg("max-size-buffers=8")
         .arg("leaky=downstream")
         .arg("!")
         .arg("fdsink")
