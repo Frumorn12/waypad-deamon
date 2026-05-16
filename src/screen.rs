@@ -176,7 +176,6 @@ impl ScreenManager {
 
         let is_grim = source.backend == "hyprland-grim";
         let fps = options.max_fps.unwrap_or(30).clamp(1, 60);
-        let fps = if is_grim { fps.min(30) } else { fps };
         let quality = options.jpeg_quality.unwrap_or(70).clamp(35, 92);
         let max_width = options.max_width.map(|value| value.clamp(480, 3840));
         let max_height = options.max_height.map(|value| value.clamp(480, 3840));
@@ -464,13 +463,12 @@ async fn run_grim_stream_impl(
                     frame_count = 0;
                     throughput_start = tokio::time::Instant::now();
                 }
-                // Sleep remaining time to hit target fps, but never less than 16ms to avoid busy-wait
+                // Sleep remaining time to hit target fps
                 let capture_elapsed = frame_start.elapsed();
                 if let Some(remaining) = target_interval.checked_sub(capture_elapsed) {
-                    let sleep_for = remaining.max(Duration::from_millis(16));
                     tokio::select! {
                         _ = &mut *stop_rx => break,
-                        _ = tokio::time::sleep(sleep_for) => {}
+                        _ = tokio::time::sleep(remaining) => {}
                     }
                 }
             }
