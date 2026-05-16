@@ -110,7 +110,7 @@ impl ScreenManager {
         if portal_available {
             sources.push(ScreenSource {
                 id: "portal:chooser".into(),
-                label: "Portal picker (experimental – may not work on NVIDIA)".into(),
+                label: "Portal picker (PipeWire screencast — 30–60 FPS)".into(),
                 kind: "chooser".into(),
                 backend: "wayland-screencast-portal".into(),
                 width: 0,
@@ -118,7 +118,7 @@ impl ScreenManager {
                 x: 0,
                 y: 0,
                 scale: 1.0,
-                focused: false, // Not default — grim is always preferred
+                focused: true,
             });
         }
         if capabilities.capture.hyprland_grim_available {
@@ -174,7 +174,7 @@ impl ScreenManager {
     ) -> anyhow::Result<StreamStartResponse> {
         let source = self.select_source(options.source_id.as_deref()).await?;
 
-        let is_grim = source.backend == "hyprland-grim";
+        let _is_grim = source.backend == "hyprland-grim";
         let fps = options.max_fps.unwrap_or(30).clamp(1, 60);
         let quality = options.jpeg_quality.unwrap_or(70).clamp(35, 92);
         let max_width = options.max_width.map(|value| value.clamp(480, 3840));
