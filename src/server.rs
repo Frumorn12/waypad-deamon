@@ -18,6 +18,7 @@ use crate::{
 };
 use anyhow::Context;
 use serde_json::json;
+use socket2::SockRef;
 use std::{
     collections::{HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -148,6 +149,14 @@ async fn handle_connection(
     peer: SocketAddr,
     state: AppState,
 ) -> anyhow::Result<()> {
+    let sock_ref = SockRef::from(&stream);
+    sock_ref.set_keepalive(true)?;
+    sock_ref.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(15))
+            .with_retries(3),
+    )?;
     if let Some(token) = maybe_accept_stream_attach(&mut stream).await? {
         info!(%peer, "screen stream attach request received on control port");
         state.screen.attach_stream_client(&token, stream).await?;
