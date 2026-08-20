@@ -2,6 +2,7 @@ use crate::{
     capability::Capabilities,
     platform::{command_exists, hyprland_ipc_socket_path},
     protocol::{ButtonState, PointerButton},
+    uinput::VirtualInputBackend,
 };
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
@@ -21,12 +22,21 @@ pub enum InputManager {
     Noop { reason: String },
     Portal(WaylandPortalInputBackend),
     Hyprland(HyprlandHyprctlInputBackend),
+    Uinput(VirtualInputBackend),
 }
 
 impl InputManager {
     pub async fn from_capabilities(capabilities: &Capabilities) -> Self {
         match capabilities.input.backend.as_str() {
             "wayland-portal" => {}
+            "uinput" => {
+                return match VirtualInputBackend::create() {
+                    Ok(backend) => Self::Uinput(backend),
+                    Err(err) => Self::Noop {
+                        reason: format!("Virtual uinput input unavailable: {err}"),
+                    },
+                };
+            }
             "hyprland-ipc" | "hyprland-hyprctl" => {
                 return match HyprlandHyprctlInputBackend::new().await {
                     Ok(backend) => Self::Hyprland(backend),
@@ -58,6 +68,7 @@ impl InputManager {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.prepare().await,
             Self::Hyprland(backend) => backend.prepare().await,
+            Self::Uinput(backend) => backend.prepare(),
         }
     }
 
@@ -66,6 +77,7 @@ impl InputManager {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.pointer_move(dx, dy).await,
             Self::Hyprland(backend) => backend.pointer_move(dx, dy).await,
+            Self::Uinput(backend) => backend.pointer_move(dx, dy),
         }
     }
 
@@ -74,6 +86,7 @@ impl InputManager {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.pointer_move_absolute(x, y).await,
             Self::Hyprland(backend) => backend.pointer_move_absolute(x, y).await,
+            Self::Uinput(backend) => backend.pointer_move_absolute(x, y),
         }
     }
 
@@ -86,6 +99,7 @@ impl InputManager {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.pointer_button(button, state).await,
             Self::Hyprland(backend) => backend.pointer_button(button, state).await,
+            Self::Uinput(backend) => backend.pointer_button(button, state),
         }
     }
 
@@ -94,6 +108,7 @@ impl InputManager {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.scroll(dx, dy, finish).await,
             Self::Hyprland(backend) => backend.scroll(dx, dy, finish).await,
+            Self::Uinput(backend) => backend.scroll(dx, dy, finish),
         }
     }
 
@@ -102,6 +117,7 @@ impl InputManager {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.key(keysym, state).await,
             Self::Hyprland(backend) => backend.key(keysym, state).await,
+            Self::Uinput(backend) => backend.key(keysym, state),
         }
     }
 
@@ -110,8 +126,55 @@ impl InputManager {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.text(text).await,
             Self::Hyprland(backend) => backend.text(text).await,
+            Self::Uinput(backend) => uinput_text(backend, text).await,
         }
     }
+}
+
+impl InputManager {
+    /// Releases any key or button still held, so a dropped session cannot leave
+    /// the desktop with a stuck modifier or an unfinished drag.
+    pub fn release_all(&self) {
+        if let Self::Uinput(backend) = self
+            && let Err(err) = backend.release_all()
+        {
+            tracing::warn!(%err, "failed to release virtual input state");
+        }
+    }
+}
+
+/// Types text through the virtual keyboard, falling back to a clipboard paste
+/// for characters with no US-keymap equivalent.
+async fn uinput_text(backend: &VirtualInputBackend, text: &str) -> anyhow::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    if text.len() > 4096 {
+        bail!("Text input rejected: maximum length is 4096 bytes");
+    }
+    if backend.text(text)? {
+        return Ok(());
+    }
+    if !command_exists("wl-copy") {
+        bail!("Text input fallback requires wl-copy from wl-clipboard");
+    }
+    let mut child = Command::new("wl-copy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn wl-copy for virtual keyboard text input")?;
+    let mut stdin = child.stdin.take().context("wl-copy stdin unavailable")?;
+    stdin.write_all(text.as_bytes()).await?;
+    drop(stdin);
+    let status = child.wait().await?;
+    if !status.success() {
+        bail!("wl-copy exited with {status}");
+    }
+    const CONTROL_L: u32 = 0xffe3;
+    const LOWERCASE_V: u32 = 0x76;
+    backend.key(CONTROL_L, ButtonState::Pressed)?;
+    backend.key(LOWERCASE_V, ButtonState::Pressed)?;
+    backend.key(LOWERCASE_V, ButtonState::Released)?;
+    backend.key(CONTROL_L, ButtonState::Released)
 }
 
 #[derive(Debug)]

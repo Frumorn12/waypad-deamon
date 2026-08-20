@@ -515,6 +515,7 @@ async fn handle_command(
                 source_id,
                 max_fps,
                 jpeg_quality,
+                bitrate_kbps,
                 max_width,
                 max_height,
             } => Ok(Some(json!(
@@ -524,6 +525,7 @@ async fn handle_command(
                         source_id,
                         max_fps,
                         jpeg_quality,
+                        bitrate_kbps,
                         max_width,
                         max_height,
                     })
@@ -531,6 +533,10 @@ async fn handle_command(
             ))),
             Command::StopScreenStream { session_id } => {
                 state.screen.stop_stream(&session_id).await?;
+                Ok(None)
+            }
+            Command::RequestKeyFrame { session_id } => {
+                state.screen.request_key_frame(&session_id).await?;
                 Ok(None)
             }
             Command::System { action } => system_control::system(&state.config, action)
@@ -740,7 +746,10 @@ mod tests {
     fn can_pair_publicly_with_default_config_blocks_public() {
         let config = Config::default();
         assert!(!can_pair_publicly(&config, "8.8.8.8:10".parse().unwrap()));
-        assert!(can_pair_publicly(&config, "192.168.1.2:10".parse().unwrap()));
+        assert!(can_pair_publicly(
+            &config,
+            "192.168.1.2:10".parse().unwrap()
+        ));
         assert!(can_pair_publicly(&config, "127.0.0.1:10".parse().unwrap()));
     }
 
@@ -749,7 +758,10 @@ mod tests {
         let mut config = Config::default();
         config.allow_public_pairing = true;
         assert!(can_pair_publicly(&config, "8.8.8.8:10".parse().unwrap()));
-        assert!(can_pair_publicly(&config, "192.168.1.2:10".parse().unwrap()));
+        assert!(can_pair_publicly(
+            &config,
+            "192.168.1.2:10".parse().unwrap()
+        ));
     }
 
     #[test]
@@ -757,7 +769,10 @@ mod tests {
         let mut config = Config::default();
         config.require_private_lan = false;
         assert!(can_pair_publicly(&config, "8.8.8.8:10".parse().unwrap()));
-        assert!(can_pair_publicly(&config, "192.168.1.2:10".parse().unwrap()));
+        assert!(can_pair_publicly(
+            &config,
+            "192.168.1.2:10".parse().unwrap()
+        ));
     }
 
     #[test]

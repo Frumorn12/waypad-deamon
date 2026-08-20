@@ -144,10 +144,20 @@ pub enum Command {
         source_id: Option<String>,
         max_fps: Option<u32>,
         jpeg_quality: Option<u8>,
+        /// H.264 target bitrate. Absent for older clients, which keep steering
+        /// the stream through `jpeg_quality`.
+        #[serde(default)]
+        bitrate_kbps: Option<u32>,
         max_width: Option<u32>,
         max_height: Option<u32>,
     },
     StopScreenStream {
+        session_id: String,
+    },
+    /// Forces an immediate H.264 keyframe on a running session. Android needs
+    /// one whenever its decoder is rebuilt, which happens every time the app
+    /// returns to the foreground and the `SurfaceView` is recreated.
+    RequestKeyFrame {
         session_id: String,
     },
     System {
@@ -316,14 +326,37 @@ mod tests {
             source_id: Some("hyprland:monitor:DP-1".into()),
             max_fps: Some(60),
             jpeg_quality: Some(58),
+            bitrate_kbps: Some(6000),
             max_width: Some(1280),
             max_height: Some(1280),
         };
         let raw = serde_json::to_string(&command).unwrap();
         assert!(raw.contains("start_screen_stream"));
         assert!(raw.contains("max_width"));
+        assert!(raw.contains("bitrate_kbps"));
         let decoded: Command = serde_json::from_str(&raw).unwrap();
         assert!(matches!(decoded, Command::StartScreenStream { .. }));
+
+        let keyframe = Command::RequestKeyFrame {
+            session_id: "abc".into(),
+        };
+        let raw = serde_json::to_string(&keyframe).unwrap();
+        assert!(raw.contains("request_key_frame"));
+        let decoded: Command = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(decoded, Command::RequestKeyFrame { .. }));
+
+        // Clients built before the H.264 switch never send bitrate_kbps.
+        let legacy: Command = serde_json::from_str(
+            r#"{"name":"start_screen_stream","source_id":null,"max_fps":30,"jpeg_quality":70,"max_width":null,"max_height":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Command::StartScreenStream {
+                bitrate_kbps: None,
+                ..
+            }
+        ));
 
         let absolute = Command::PointerMoveAbsolute {
             source_id: Some("hyprland:monitor:DP-1".into()),

@@ -6,7 +6,7 @@ The daemon listens on the local network, pairs Android devices with explicit loc
 
 ## Status
 
-This is a shippable MVP foundation, not a finished remote-desktop suite. It implements secure pairing, encrypted sessions, trusted-device storage, discovery, diagnostics, systemd user integration, Wayland portal input, external controller forwarding, QR invites, and a low-latency remote screen MVP. It supports LAN use and explicit direct-public endpoints for mobile-data tests. It does not bundle a cloud relay, automatic ICE/STUN/TURN traversal, or production WebRTC/H.264 streaming yet.
+This is a shippable MVP foundation, not a finished remote-desktop suite. It implements secure pairing, encrypted sessions, trusted-device storage, discovery, diagnostics, systemd user integration, Wayland portal input, external controller forwarding, QR invites, and a low-latency remote screen MVP. It supports LAN use and explicit direct-public endpoints for mobile-data tests. It does not bundle a cloud relay, automatic ICE/STUN/TURN traversal, or a production WebRTC transport yet.
 
 ## Why Waypad Exists
 
@@ -32,7 +32,7 @@ Waypad is built around the real Wayland path:
 - External Android mouse and keyboard forwarding through the active pointer/keyboard backend.
 - External Android controller/gamepad forwarding through an isolated Linux `uinput` virtual gamepad backend when `/dev/uinput` is available.
 - Remote screen source discovery through XDG Desktop Portal ScreenCast and Hyprland monitor fallback.
-- Token-negotiated direct TCP JPEG frame stream for Android screen viewing, with client-requested FPS, JPEG quality, and maximum frame dimension.
+- Token-negotiated direct TCP frame stream for Android screen viewing, hardware H.264 (NVENC) on the PipeWire path with an `x264enc` and JPEG fallback, with client-requested FPS, bitrate, quality, and maximum frame dimension, plus on-demand keyframes for clients that rebuild their decoder.
 - Expiring `waypad://invite` QR payloads for terminal-driven pairing and direct-public bootstrap.
 - Connectivity capability reporting for LAN direct, public direct, and unsupported relay/signaling/ICE/TURN cases.
 - Absolute pointer command path for interaction with a displayed remote monitor.
@@ -48,7 +48,7 @@ src/
   crypto.rs           Handshake and encrypted frame protocol
   discovery.rs        UDP discovery
   input.rs            Wayland portal input backend
-  screen.rs           Screen sources, ScreenCast/PipeWire streaming, Hyprland grim fallback
+  screen.rs           Screen sources, ScreenCast/PipeWire H.264 streaming, Hyprland grim fallback
   server.rs           Authenticated command server
   state.rs            Host identity and trusted devices
   system_control.rs   Volume/media/brightness/clipboard/system actions
@@ -74,8 +74,13 @@ Minimum build/runtime:
 Recommended on Arch/CachyOS/Hyprland:
 
 ```bash
-sudo pacman -S rust dbus xdg-desktop-portal xdg-desktop-portal-hyprland pipewire wireplumber gst-plugin-pipewire gst-plugins-good grim playerctl brightnessctl wl-clipboard
+sudo pacman -S rust dbus xdg-desktop-portal xdg-desktop-portal-hyprland pipewire wireplumber gst-plugin-pipewire gst-plugins-good gst-plugins-bad gst-plugins-ugly grim playerctl brightnessctl wl-clipboard
 ```
+
+`gst-plugins-bad` provides `h264parse` and, on NVIDIA hosts, the `nvcodec`
+`nvh264enc` hardware encoder; `gst-plugins-ugly` provides the `x264enc` software
+fallback. Without either encoder the screen stream still works and falls back to
+MJPEG at roughly ten times the bandwidth.
 
 ## Build
 
@@ -277,7 +282,7 @@ Supported:
 - Pointer, clicks, scroll, keysyms, text, shortcuts, media, volume, brightness, clipboard set, lock.
 - External mouse and keyboard devices connected to the Android phone when the Android app is in Pad or Screen mode.
 - External Android controllers/gamepads through a Linux `uinput` virtual gamepad when `/dev/uinput` is available to the daemon user.
-- Remote screen viewing through ScreenCast/PipeWire where portal streaming works.
+- Remote screen viewing through ScreenCast/PipeWire where portal streaming works, encoded as H.264 when a usable encoder is present.
 - Hyprland monitor viewing through an isolated `grim` fallback when portal streaming dependencies are incomplete.
 
 Unsupported in MVP:
@@ -287,7 +292,7 @@ Unsupported in MVP:
 - Cloud relay, TURN fallback, and automatic ICE/STUN NAT traversal.
 - End-to-end encrypted media stream separate from the encrypted control channel.
 - Controller forwarding when the host does not expose writable `/dev/uinput` to the daemon user.
-- WebRTC/H.264 transport and congestion-controlled adaptive bitrate.
+- WebRTC transport and congestion-controlled adaptive bitrate: the H.264 bitrate is fixed per session, not adapted to link conditions.
 - iOS client.
 
 ## Troubleshooting
@@ -312,7 +317,7 @@ On Hyprland, Waypad can expose the `hyprland-ipc` backend. It moves the cursor t
 
 Controller forwarding is different from pointer/keyboard forwarding: Wayland portals and Hyprland IPC do not expose a generic gamepad injection API, so the daemon creates a normal Linux virtual gamepad with `uinput`. The daemon still runs as the user session; it just needs permission to open `/dev/uinput`. On systems where that node is unavailable or restricted, `waypad-daemon doctor` reports `external_input.controller = false` with the exact reason.
 
-For remote screen mode, check the `capture` section in `waypad-daemon doctor`. Standard Wayland capture uses XDG Desktop Portal ScreenCast plus PipeWire and GStreamer. Hyprland systems can also expose monitor sources through the `hyprland-grim` fallback. If capture works but input fails, use screen viewing read-only or switch to Pad mode until RemoteDesktop or Hyprland IPC input is available.
+For remote screen mode, check the `capture` section in `waypad-daemon doctor`. Standard Wayland capture uses XDG Desktop Portal ScreenCast plus PipeWire and GStreamer. `capture.h264_encoder` names the encoder the daemon probed successfully (`nvh264enc`, `x264enc`, or `null` when the stream stays on JPEG). Hyprland systems can also expose monitor sources through the `hyprland-grim` fallback, which always sends JPEG. If capture works but input fails, use screen viewing read-only or switch to Pad mode until RemoteDesktop or Hyprland IPC input is available.
 
 For mobile-data/direct-public tests, check the `connectivity` section in
 `waypad-daemon doctor`. Current builds report `lan_direct = true` and expose
@@ -329,6 +334,11 @@ The custom protocol is documented in `docs/PROTOCOL.md`. In short:
 - TCP handshake signs ephemeral ECDH parameters with the daemon host identity.
 - AES-GCM encrypted frames carry pairing, authentication, and commands.
 - Commands require authentication and monotonic sequence numbers.
+- The screen stream rides a separate token-attached TCP connection on the same
+  port. Its handshake line is `WAYPAD_STREAM_V2` for Annex-B H.264 payloads and
+  `WAYPAD_STREAM_V1` for JPEG payloads; the frame envelope is identical for both.
+- `request_key_frame` forces an immediate IDR, which an Android client needs
+  whenever its decoder is rebuilt after the `SurfaceView` is recreated.
 
 ## Development
 
@@ -342,7 +352,7 @@ RUST_LOG=debug cargo run -- serve
 ## Roadmap
 
 - libei sender backend through RemoteDesktop `ConnectToEIS` where supported.
-- WebRTC/H.264 media transport with ICE/STUN/TURN to replace the MVP JPEG frame stream for robust outside-LAN use.
+- WebRTC media transport with ICE/STUN/TURN to replace the MVP frame stream for robust outside-LAN use.
 - More detailed monitor/compositor diagnostics.
 - Signed release packages.
 - Broader integration tests with a fake protocol client.

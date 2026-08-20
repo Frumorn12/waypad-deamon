@@ -4,6 +4,7 @@ use crate::{
     platform::{
         SessionInfo, command_exists, command_output, detect_session, hyprland_ipc_available,
     },
+    uinput::detect_virtual_pointer_support,
 };
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +72,7 @@ pub struct CaptureCapability {
     pub available_cursor_modes: Vec<String>,
     pub pipewire_runtime_available: bool,
     pub gstreamer_pipewire_available: bool,
+    pub h264_encoder: Option<String>,
     pub hyprland_grim_available: bool,
 }
 
@@ -101,7 +103,14 @@ impl Capabilities {
             && !portal.remote_desktop_available
             && session.compositor_hint == "hyprland"
             && hyprland_ipc_available();
-        let input_supported = portal_input_supported || hyprland_ipc_fallback;
+        let (uinput_supported, uinput_reason) = detect_virtual_pointer_support();
+        // uinput is preferred over both other backends: it creates real evdev
+        // devices, so implicit pointer grabs (drag, text selection) and relative
+        // motion for games work, which neither the portal nor Hyprland IPC can
+        // offer on this stack.
+        let uinput_input_available = wayland && uinput_supported;
+        let input_supported =
+            uinput_input_available || portal_input_supported || hyprland_ipc_fallback;
         let (controller_supported, controller_reason) = detect_virtual_gamepad_support();
         let (input_backend, requires_user_approval, input_reason) = if !wayland {
             (
@@ -109,6 +118,8 @@ impl Capabilities {
                 false,
                 Some("Remote input is only enabled for Wayland sessions in this daemon".into()),
             )
+        } else if uinput_input_available {
+            ("uinput", false, Some(uinput_reason))
         } else if portal_input_supported {
             (
                 "wayland-portal",
@@ -130,7 +141,9 @@ impl Capabilities {
             (
                 "noop",
                 false,
-                Some("Remote input unavailable: xdg-desktop-portal is not running".into()),
+                Some(format!(
+                    "Remote input unavailable: xdg-desktop-portal is not running and {uinput_reason}"
+                )),
             )
         } else if !portal.remote_desktop_available {
             (
@@ -153,9 +166,13 @@ impl Capabilities {
         };
 
         let pipewire_runtime_available = command_exists("pipewire") || command_exists("pw-cli");
+        // H.264 is the preferred encoding, but a host with only jpegenc still
+        // streams, so either encoder makes the PipeWire pipeline usable.
+        let h264_encoder = crate::screen::h264_encoder_name();
         let gstreamer_pipewire_available = command_exists("gst-launch-1.0")
             && command_output("gst-inspect-1.0", &["pipewiresrc"]).is_some()
-            && command_output("gst-inspect-1.0", &["jpegenc"]).is_some();
+            && (h264_encoder.is_some()
+                || command_output("gst-inspect-1.0", &["jpegenc"]).is_some());
         let hyprland_grim_available = wayland
             && session.compositor_hint == "hyprland"
             && command_exists("grim")
@@ -212,7 +229,7 @@ impl Capabilities {
                 "noop",
                 false,
                 Some(
-                    "Screen capture unavailable: GStreamer PipeWire/JPEG pipeline is missing"
+                    "Screen capture unavailable: GStreamer PipeWire pipeline is missing an H.264 or JPEG encoder"
                         .into(),
                 ),
             )
@@ -232,7 +249,13 @@ impl Capabilities {
                 keyboard: input_supported,
                 controller: controller_supported,
                 backend: if input_supported && controller_supported {
-                    format!("{input_backend}+uinput")
+                    // The gamepad already rides on uinput, so only name it once
+                    // when the pointer/keyboard backend is uinput as well.
+                    if input_backend == "uinput" {
+                        "uinput".into()
+                    } else {
+                        format!("{input_backend}+uinput")
+                    }
                 } else if controller_supported {
                     "uinput".into()
                 } else if input_supported {
@@ -267,6 +290,7 @@ impl Capabilities {
                 available_cursor_modes: screencast.available_cursor_modes,
                 pipewire_runtime_available,
                 gstreamer_pipewire_available,
+                h264_encoder: h264_encoder.map(ToOwned::to_owned),
                 hyprland_grim_available,
             },
             system: SystemCapabilities {

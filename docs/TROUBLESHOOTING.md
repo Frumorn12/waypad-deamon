@@ -66,10 +66,18 @@ Check PipeWire and GStreamer:
 ```bash
 systemctl --user status pipewire wireplumber
 gst-inspect-1.0 pipewiresrc
-gst-inspect-1.0 jpegenc
+gst-inspect-1.0 h264parse
+gst-inspect-1.0 nvh264enc   # NVIDIA hardware encoder, gst-plugins-bad
+gst-inspect-1.0 x264enc     # software fallback, gst-plugins-ugly
+gst-inspect-1.0 jpegenc     # last-resort MJPEG fallback
 ```
 
 If `pipewiresrc` is missing, install the PipeWire GStreamer plugin package for your distribution.
+
+`waypad-daemon doctor` reports the encoder the daemon actually managed to start
+as `capture.h264_encoder`. Note that an installed plugin is not enough: NVENC
+also needs a usable CUDA context, so the daemon probes each candidate on a
+one-buffer pipeline at startup and logs `H.264 screen encoder selected`.
 
 ## Stream Starts But Input Fails
 
@@ -239,6 +247,17 @@ journalctl --user -u waypad-daemon -f | grep 'backend='
 - `backend=hyprland-grim` — screenshot-per-frame, slow. Switch to Portal picker.
 - `backend=wayland-screencast-portal` — PipeWire pipeline, fast.
 
+If the portal path is selected but the stream is still ~6 FPS, the fast pipeline
+failed and fell back silently in an older build. Current builds log this at
+`error` level and report it to the app:
+
+```bash
+journalctl --user -u waypad-daemon -f | grep 'falling back to the grim'
+```
+
+The same reason is returned as `portal_last_error` in the next
+`start_screen_stream` response.
+
 ### Why grim is slow
 
 Each grim frame spawns a new `grim` process that takes a full-screen JPEG
@@ -265,7 +284,7 @@ If Portal picker appears but stream fails immediately with GStreamer errors
 
 1. Remove forced format caps (done — the pipeline now auto-negotiates format)
 2. Check PipeWire: `systemctl --user status pipewire wireplumber`
-3. Check GStreamer plugins: `gst-inspect-1.0 pipewiresrc jpegenc videoconvert`
+3. Check GStreamer plugins: `gst-inspect-1.0 pipewiresrc videoconvert h264parse nvh264enc`
 4. On NVIDIA GPUs, DMA-BUF negotiation may fail. The pipeline now detects this
    and auto-falls back to grim
 ```bash
@@ -292,13 +311,14 @@ Healthy output: `fps_measured=52.3 fps_target=60 frames=104`
 If measured FPS is still low despite using portal, the bottleneck is in:
 - Compositor capture rate (check compositor is running)
 - PipeWire buffer settings
-- JPEG encode complexity (reduce quality or resolution)
+- Encode complexity (reduce bitrate or resolution)
 - Network bandwidth (TCP cannot keep up with frame size)
 
 ## 60 FPS Setting Does Not Seem To Apply
 
-The Android app sends `max_fps`, `jpeg_quality`, `max_width`, and `max_height`
-when starting a screen stream. The daemon logs the accepted values:
+The Android app sends `max_fps`, `jpeg_quality`, `bitrate_kbps`, `max_width`,
+and `max_height` when starting a screen stream. The daemon logs the accepted
+values:
 
 ```bash
 journalctl --user -u waypad-daemon -f | grep 'starting screen stream'
@@ -306,30 +326,64 @@ journalctl --user -u waypad-daemon -f | grep 'starting screen stream'
 
 For Game Mode or Ultra Low Latency, expect `fps=60` and a smaller max dimension.
 Actual delivered FPS still depends on compositor capture speed, PipeWire/GStreamer
-availability, JPEG encode speed, Wi-Fi quality, and Android decode time.
-The daemon sends each frame with a 12 ms deadline; frames that cannot be sent
-in time are dropped to prevent head-of-line blocking and keep latency low.
+availability, encode speed, Wi-Fi quality, and Android decode time.
+JPEG frames are sent with a 12 ms deadline and dropped when they miss it. H.264
+frames are never dropped on the socket, because every later frame references
+them; backpressure is absorbed by the leaky queue in front of the encoder
+instead.
 
 ### Pipeline low-latency tuning
 
 The GStreamer pipeline is configured for interactive streaming:
 
 ```
-pipewiresrc → videoconvert → videoscale →
-videorate(drop-only=true, skip-to-first=true) →
-caps(video/x-raw,framerate=FPS/1) →
-jpegenc(quality=Q, snapshot=false) →
-queue(leaky=downstream, max-size-buffers=1) →
-fdsink(sync=false)
+pipewiresrc(fd=3) →
+queue(max-size-buffers=4, leaky=downstream) →
+videorate(drop-only=true, max-rate=FPS) → videoscale → videoconvert(n-threads=4) →
+caps(video/x-raw,format=NV12|I420[,width,height],pixel-aspect-ratio=1/1) →
+nvh264enc(bitrate=K, max-bitrate=K, rc-mode=cbr, preset=p4,
+          tune=ultra-low-latency, zerolatency=true, bframes=0,
+          gop-size=2*FPS, repeat-sequence-header=true, aud=true) →
+caps(video/x-h264,profile=high) →
+h264parse(config-interval=-1) →
+caps(video/x-h264,stream-format=byte-stream,alignment=au) →
+queue(max-size-buffers=8) →
+fdsink(fd=1, sync=false)
 ```
 
+`videorate`, `videoscale`, and `videoconvert` are all mandatory, not
+optimizations. A capsfilter constrains but never converts, so any property it
+pins without a converter in front of it becomes a requirement on `pipewiresrc`,
+which cannot satisfy it and fails with:
+
+```
+stream error: error set output format: -22 (Invalid argument)
+streaming stopped, reason not-negotiated (-4)
+ERROR: pipeline doesn't want to preroll.
+```
+
+The daemon then falls back to `grim`, which looks like ~6 FPS slowness rather
+than a failure. If you see that error, check that no capsfilter pins a property
+whose converter is missing.
+
 Each element is tuned to minimize buffering:
-- `drop-only=true, skip-to-first=true` on videorate skips to real-time
-- `snapshot=false` ensures proper streaming encode (not still-image freeze)
+- `drop-only=true` on videorate caps the rate without ever duplicating frames
+  and without holding a buffer back to pace output
+- `leaky=downstream` on the queue in FRONT of the encoder: raw frames are the
+  only ones safe to drop when the network cannot keep up
+- The queue AFTER the encoder is deliberately not leaky
+- `zerolatency` plus `bframes=0` removes reordering delay
+- `rc-mode=cbr` keeps bandwidth predictable so Wi-Fi does not saturate
+- `gop-size=2*FPS` bounds recovery time after a decoder glitch; a client that
+  rebuilds its decoder can also ask for an immediate IDR with `request_key_frame`
+- `repeat-sequence-header` and `config-interval=-1` put SPS/PPS before every IDR
+- `format=NV12` (NVENC) or `I420` (x264) is the cheapest upload/encode path
 - `sync=false` on fdsink avoids blocking on stdout
-- `leaky=downstream` on queue: drops newest frame when the network cannot keep up, preventing encoder backpressure
-- Queue placed AFTER jpegenc to protect the encoder from network stalls
-- `format=I420` auto-negotiates planar YUV for fastest encode path
+
+`x264enc tune=zerolatency speed-preset=veryfast` replaces `nvh264enc` when NVENC
+does not start; `jpegenc` replaces the whole encoder block when neither H.264
+encoder is usable, and the stream then announces `WAYPAD_STREAM_V1` instead of
+`WAYPAD_STREAM_V2`.
 
 ### Honest FPS reporting
 
@@ -536,8 +590,9 @@ pgrep Xwayland
 ### How it works:
 1. ffmpeg captures the X11 screen via `x11grab` at the requested FPS
 2. Frames are encoded as MJPEG and piped to stdout
-3. The daemon reads frames and sends them via TCP (same format as other backends)
-4. Android side decodes JPEG frames as usual — no changes needed
+3. The daemon reads frames and sends them via TCP (same envelope as other backends)
+4. Android side decodes JPEG frames as usual — this backend stays on
+   `WAYPAD_STREAM_V1`; only the PipeWire path sends H.264
 
 ### Limitations:
 - Only captures X11/XWayland windows, not native Wayland apps

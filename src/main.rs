@@ -76,7 +76,9 @@ async fn main() -> anyhow::Result<()> {
                     eprintln!();
                     eprintln!("The portal dialog did not appear or was denied.");
                     eprintln!("This is OK — the daemon will automatically use the grim");
-                    eprintln!("screenshot backend instead. It's slower but works without approval.");
+                    eprintln!(
+                        "screenshot backend instead. It's slower but works without approval."
+                    );
                     eprintln!();
                     eprintln!("To try again later, re-run this command.");
                     // Don't return error — grim still works
@@ -183,12 +185,18 @@ fn invite_command(config: &Config, paths: &StatePaths, trailing: &[String]) -> a
             println!("     allow_public_pairing=true  (keeps LAN-only for reconnect).");
             println!("  2) Set require_private_lan=false to allow all public traffic.");
             println!();
-            println!("Only do this if TCP/{} is port-forwarded and protected by your", port);
+            println!(
+                "Only do this if TCP/{} is port-forwarded and protected by your",
+                port
+            );
             println!("firewall. Pairing still requires the one-time 6-digit code.");
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         } else {
             println!();
-            println!("Remote pairing enabled for this invite. Ensure TCP/{} is reachable", port);
+            println!(
+                "Remote pairing enabled for this invite. Ensure TCP/{} is reachable",
+                port
+            );
             println!("from the internet and that your firewall restricts it appropriately.");
         }
     }

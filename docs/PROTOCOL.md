@@ -151,6 +151,7 @@ Current command names:
 | `list_screen_sources` | Lists portal picker and/or concrete monitor sources. |
 | `start_screen_stream` | Starts a token-protected screen frame stream. |
 | `stop_screen_stream` | Stops a running screen stream session. |
+| `request_key_frame` | Forces an immediate H.264 keyframe on a running session. |
 | `system` | Lock or suspend. Suspend is disabled by default. |
 
 Unsupported commands return an authenticated error with a user-facing reason.
@@ -221,10 +222,15 @@ The Android app starts a stream with:
   "source_id": "hyprland:monitor:DP-1",
   "max_fps": 60,
   "jpeg_quality": 58,
+  "bitrate_kbps": 6000,
   "max_width": 1280,
   "max_height": 1280
 }
 ```
+
+`bitrate_kbps` is optional and only steers the H.264 encoder. Clients that omit
+it keep driving the stream through `jpeg_quality`, which the daemon maps onto a
+bitrate.
 
 The daemon replies:
 
@@ -233,11 +239,18 @@ The daemon replies:
   "session_id": "...",
   "stream_port": 47771,
   "token": "...",
-  "codec": "jpeg",
+  "codec": "h264",
   "transport": "waypad-control-port-stream-v2",
-  "source": { "id": "hyprland:monitor:DP-1" }
+  "source": { "id": "hyprland:monitor:DP-1" },
+  "actual_fps": 30,
+  "actual_quality": 58,
+  "actual_bitrate_kbps": 6000
 }
 ```
+
+`codec` is advisory: it is `h264` when the session will run on the PipeWire
+pipeline with a working H.264 encoder, and `jpeg` otherwise. The handshake line
+below is what actually decides how the payloads must be decoded.
 
 For `waypad-control-port-stream-v2`, the app opens a fresh TCP connection to `stream_port` and writes this JSON line before any encrypted control-channel handshake:
 
@@ -245,27 +258,87 @@ For `waypad-control-port-stream-v2`, the app opens a fresh TCP connection to `st
 {"type":"stream_connect","token":"..."}
 ```
 
-The daemon peeks at new TCP connections on the control listener. If the first line is a valid `stream_connect` token for a pending screen session, that socket is attached to the stream producer and receives:
+The daemon peeks at new TCP connections on the control listener. If the first line is a valid `stream_connect` token for a pending screen session, that socket is attached to the stream producer. Just before the first frame it receives one handshake line naming the payload codec:
 
 ```text
-WAYPAD_STREAM_V1\n
+WAYPAD_STREAM_V2\n   H.264 payloads
+WAYPAD_STREAM_V1\n   JPEG payloads
 ```
 
-Frames then repeat:
+The line is written lazily, once the producer has actually encoded something,
+because the portal path may still fall back to the JPEG `grim` producer while
+the socket is untouched. Clients must therefore wait for the handshake as long
+as they are willing to wait for the first frame; portal approval happens in
+between.
+
+Frames then repeat, identically for both versions:
 
 ```text
 u32_be header_length
 u32_be payload_length
 header_length bytes of UTF-8 JSON
-payload_length bytes of JPEG
+payload_length bytes of payload
 ```
 
-The frame header contains at least `seq`, `timestamp_ms`, `codec`, `width`, and `height`.
+`WAYPAD_STREAM_V1` headers contain `seq`, `timestamp_ms`, `codec` (`jpeg`),
+`width`, and `height`, and the payload is a complete JPEG image.
 
-`max_fps` is clamped to `1..60`, `jpeg_quality` to `35..92`, and maximum
-dimensions to `480..3840`. When a maximum dimension is lower than the source
-size, the daemon downscales before JPEG encoding to reduce bandwidth and decode
-latency. Frame pacing skips missed ticks so slow captures drop stale frames
-instead of building a long queue.
+`WAYPAD_STREAM_V2` headers add two flags:
 
-The current MVP stream is token-protected but not encrypted independently; it is intended for trusted LAN, VPN, or deliberately exposed direct-public testing. The authenticated control channel remains encrypted. Older builds used a dynamic per-session stream port, but current builds reuse the stable control port so phone clients are not broken by LAN firewalls or NAT rules that block random high ports. A future WebRTC/H.264 transport can replace this frame stream while keeping the source and input commands.
+```json
+{"seq": 0, "timestamp_ms": 0, "width": 1920, "height": 1080,
+ "codec": "h264", "key_frame": true, "config": false}
+```
+
+- The payload is one or more H.264 NAL units in Annex-B form, with `00 00 00 01`
+  or `00 00 01` start codes.
+- `config: true` marks a codec-config payload carrying only SPS/PPS. It is sent
+  ahead of the first keyframe and repeated ahead of **every** later keyframe,
+  which is what lets a client rebuild its decoder mid-stream. The same parameter
+  sets also stay inline in the keyframe payload, so a decoder that ignores
+  config frames still finds them before the IDR.
+- `key_frame: true` marks an IDR access unit. Everything else is a single
+  non-IDR access unit that depends on the frames before it, so payloads must be
+  fed to the decoder in order and none may be skipped.
+- `seq` counts envelopes, not pictures: a config frame consumes a `seq` of its
+  own.
+- `width` and `height` describe the encoded video, which is the downscaled size
+  when `max_width`/`max_height` asked for one.
+- The stream always opens on a keyframe. The pipeline is started per attached
+  client, so its first encoded picture is an IDR and nothing is forwarded before
+  it.
+
+### Requesting a keyframe
+
+A client whose decoder was destroyed and rebuilt — on Android this happens every
+time the app returns to the foreground and the `SurfaceView` recreates its
+`Surface` — stays black until it sees SPS/PPS followed by an IDR. It asks for one
+on the control channel:
+
+```json
+{"name": "request_key_frame", "session_id": "..."}
+```
+
+The daemon replies with an empty ok. The next frames on the stream are a
+`config: true` payload followed by a `key_frame: true` IDR. Requests are
+coalesced and rate limited to one per second; a request for a session that has
+not attached a client yet succeeds and does nothing, because such a stream
+always opens on a keyframe anyway. An unknown or expired `session_id` is an
+error.
+
+Because the daemon drives GStreamer through `gst-launch-1.0`, there is no way to
+push a force-key-unit event into a running pipeline: the keyframe is served by
+respawning the encoder, which costs a few hundred milliseconds of stream gap.
+JPEG sessions accept the command and ignore it, since every JPEG frame is
+already a keyframe.
+
+`max_fps` is clamped to `1..60`, `jpeg_quality` to `35..92`, `bitrate_kbps` to
+`500..40000`, and maximum dimensions to `480..3840`. When a maximum dimension is
+lower than the source size, the daemon downscales before encoding to reduce
+bandwidth and decode latency. H.264 runs CBR with a keyframe every two seconds
+and no B-frames. JPEG frame pacing skips missed ticks so slow captures drop
+stale frames instead of building a long queue; H.264 never drops encoded frames
+on the socket, because a dropped frame would break every frame referencing it,
+and instead lets backpressure reach the leaky queue in front of the encoder.
+
+The current MVP stream is token-protected but not encrypted independently; it is intended for trusted LAN, VPN, or deliberately exposed direct-public testing. The authenticated control channel remains encrypted. Older builds used a dynamic per-session stream port, but current builds reuse the stable control port so phone clients are not broken by LAN firewalls or NAT rules that block random high ports. A future WebRTC transport can replace this frame stream while keeping the source and input commands.

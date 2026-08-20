@@ -10,3 +10,4 @@ pub mod screen;
 pub mod server;
 pub mod state;
 pub mod system_control;
+pub mod uinput;

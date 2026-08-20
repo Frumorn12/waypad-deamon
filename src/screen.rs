@@ -1,4 +1,8 @@
-use crate::{capability::Capabilities, input::InputManager, platform::{command_exists, command_output}};
+use crate::{
+    capability::Capabilities,
+    input::InputManager,
+    platform::{command_exists, command_output},
+};
 use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -6,22 +10,23 @@ use serde_json::json;
 use std::{
     collections::HashMap,
     os::fd::AsRawFd,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    process::{ChildStderr, Command},
-    sync::{Mutex, RwLock, oneshot},
+    process::{ChildStderr, ChildStdout, Command},
+    sync::{Mutex, RwLock, mpsc, oneshot},
     task::JoinHandle,
-    time::{timeout},
+    time::timeout,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use zbus::zvariant::{OwnedFd, OwnedObjectPath, OwnedValue, Value};
 
-const STREAM_MAGIC: &[u8] = b"WAYPAD_STREAM_V1\n";
+const STREAM_MAGIC_V1: &[u8] = b"WAYPAD_STREAM_V1\n";
+const STREAM_MAGIC_V2: &[u8] = b"WAYPAD_STREAM_V2\n";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenSource {
@@ -42,6 +47,7 @@ pub struct StreamStartOptions {
     pub source_id: Option<String>,
     pub max_fps: Option<u32>,
     pub jpeg_quality: Option<u8>,
+    pub bitrate_kbps: Option<u32>,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
 }
@@ -56,6 +62,21 @@ pub struct StreamStartResponse {
     pub source: ScreenSource,
     pub actual_fps: u32,
     pub actual_quality: u8,
+    pub actual_bitrate_kbps: u32,
+    /// Why the fast PipeWire pipeline last fell back to the slow `grim`
+    /// screenshot backend. Surfaced so a broken fast path cannot sit unnoticed
+    /// behind a fallback that merely looks slow.
+    pub portal_last_error: Option<String>,
+}
+
+/// Encoder knobs the Android client negotiates per session.
+#[derive(Clone, Copy, Debug)]
+struct StreamTuning {
+    fps: u32,
+    quality: u8,
+    bitrate_kbps: Option<u32>,
+    max_width: Option<u32>,
+    max_height: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -64,6 +85,7 @@ pub struct ScreenManager {
     stream_port: u16,
     sessions: Arc<Mutex<HashMap<String, StreamSession>>>,
     paths: Arc<super::state::StatePaths>,
+    last_portal_error: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug)]
@@ -76,25 +98,28 @@ enum StreamSession {
 struct PendingStream {
     token: String,
     source: ScreenSource,
-    fps: u32,
-    quality: u8,
-    max_width: Option<u32>,
-    max_height: Option<u32>,
+    tuning: StreamTuning,
 }
 
 #[derive(Debug)]
 struct RunningStream {
     stop: oneshot::Sender<()>,
+    keyframe: mpsc::Sender<()>,
     task: JoinHandle<()>,
 }
 
 impl ScreenManager {
-    pub fn new(capabilities: Arc<RwLock<Capabilities>>, stream_port: u16, paths: super::state::StatePaths) -> Self {
+    pub fn new(
+        capabilities: Arc<RwLock<Capabilities>>,
+        stream_port: u16,
+        paths: super::state::StatePaths,
+    ) -> Self {
         Self {
             capabilities,
             stream_port,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             paths: Arc::new(paths),
+            last_portal_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -132,7 +157,8 @@ impl ScreenManager {
             }
         }
         // X11 ffmpeg backend — high performance, no portal approval needed
-        if std::env::var("DISPLAY").is_ok() && command_exists("xrandr") && command_exists("ffmpeg") {
+        if std::env::var("DISPLAY").is_ok() && command_exists("xrandr") && command_exists("ffmpeg")
+        {
             match list_x11_monitors().await {
                 Ok(monitors) => {
                     for (i, mut monitor) in monitors.into_iter().enumerate() {
@@ -175,12 +201,31 @@ impl ScreenManager {
         let source = self.select_source(options.source_id.as_deref()).await?;
 
         let _is_grim = source.backend == "hyprland-grim";
-        let fps = options.max_fps.unwrap_or(30).clamp(1, 60);
-        let quality = options.jpeg_quality.unwrap_or(70).clamp(35, 92);
-        let max_width = options.max_width.map(|value| value.clamp(480, 3840));
-        let max_height = options.max_height.map(|value| value.clamp(480, 3840));
+        let tuning = StreamTuning {
+            fps: options.max_fps.unwrap_or(30).clamp(1, 60),
+            quality: options.jpeg_quality.unwrap_or(70).clamp(35, 92),
+            bitrate_kbps: options.bitrate_kbps,
+            max_width: options.max_width.map(|value| value.clamp(480, 3840)),
+            max_height: options.max_height.map(|value| value.clamp(480, 3840)),
+        };
         let session_id = Uuid::new_v4().to_string();
         let token = Uuid::new_v4().to_string();
+        // Hardware H.264 only rides on the PipeWire pipeline; the grim and X11
+        // fallbacks stay on JPEG, so the announced codec follows the backend.
+        let h264 = source.backend == "wayland-screencast-portal" && detect_h264_encoder().is_some();
+        let (target_width, target_height) = target_dimensions(
+            source.width,
+            source.height,
+            tuning.max_width,
+            tuning.max_height,
+        );
+        let bitrate_kbps = resolve_bitrate_kbps(
+            tuning.bitrate_kbps,
+            target_width.unwrap_or(source.width),
+            target_height.unwrap_or(source.height),
+            tuning.fps,
+            tuning.quality,
+        );
         // Save the selected source for future sessions
         if let Err(err) = crate::state::save_preferred_source(&self.paths, &source.id) {
             warn!(%err, source_id = %source.id, "failed to save preferred source");
@@ -190,10 +235,7 @@ impl ScreenManager {
             StreamSession::Pending(PendingStream {
                 token: token.clone(),
                 source: source.clone(),
-                fps,
-                quality,
-                max_width,
-                max_height,
+                tuning,
             }),
         );
         info!(
@@ -202,21 +244,25 @@ impl ScreenManager {
             source_id = %source.id,
             backend = %source.backend,
             requested_fps = options.max_fps,
-            actual_fps = fps,
-            actual_quality = quality,
-            ?max_width,
-            ?max_height,
+            actual_fps = tuning.fps,
+            actual_quality = tuning.quality,
+            actual_bitrate_kbps = bitrate_kbps,
+            codec = if h264 { "h264" } else { "jpeg" },
+            max_width = ?tuning.max_width,
+            max_height = ?tuning.max_height,
             "screen stream session pending client attach"
         );
         Ok(StreamStartResponse {
             session_id,
             stream_port: self.stream_port,
             token,
-            codec: "jpeg".into(),
+            codec: if h264 { "h264".into() } else { "jpeg".into() },
             transport: "waypad-control-port-stream-v2".into(),
             source,
-            actual_fps: fps,
-            actual_quality: quality,
+            actual_fps: tuning.fps,
+            actual_quality: tuning.quality,
+            actual_bitrate_kbps: bitrate_kbps,
+            portal_last_error: self.last_portal_error.lock().await.clone(),
         })
     }
 
@@ -271,7 +317,6 @@ impl ScreenManager {
         };
 
         let peer = socket.peer_addr().ok();
-        socket.write_all(STREAM_MAGIC).await?;
         info!(
             %session_id,
             ?peer,
@@ -280,40 +325,58 @@ impl ScreenManager {
             "screen stream client attached"
         );
         let (stop_tx, mut stop_rx) = oneshot::channel();
+        // Depth 1: repeated keyframe requests before the encoder restarts are
+        // the same request, so they coalesce instead of queueing restarts.
+        let (keyframe_tx, mut keyframe_rx) = mpsc::channel(1);
         let task_sessions = self.sessions.clone();
         let task_session = session_id.clone();
         let source = pending.source.clone();
         let task_paths = self.paths.clone();
+        let task_last_error = self.last_portal_error.clone();
         let task = tokio::spawn(async move {
+            // The handshake line names the codec, and the codec is only known
+            // once a producer actually emits a frame, so it is written lazily.
+            // That also keeps the grim fallback usable: it may only take over
+            // while the socket is still untouched.
+            let mut magic_sent = false;
             let result = if source.backend == "wayland-screencast-portal" {
                 let portal_result = run_portal_stream(
                     &mut socket,
+                    &mut magic_sent,
                     task_session.clone(),
                     source.clone(),
-                    pending.fps,
-                    pending.quality,
-                    pending.max_width,
-                    pending.max_height,
+                    pending.tuning,
                     &mut stop_rx,
+                    &mut keyframe_rx,
                     task_paths.as_ref().clone(),
                 )
                 .await;
                 match portal_result {
-                    Ok(()) => Ok(()),
+                    Ok(()) => {
+                        *task_last_error.lock().await = None;
+                        Ok(())
+                    }
                     Err(portal_err) => {
-                        if is_client_disconnect(&portal_err) {
+                        let detail = format!("{portal_err:#}");
+                        *task_last_error.lock().await = Some(detail.clone());
+                        if is_client_disconnect(&portal_err) || magic_sent {
                             Err(portal_err)
                         } else {
-                            warn!(session_id = %task_session, %portal_err, "portal stream failed; falling back to grim");
+                            // Loud on purpose: the grim fallback still produces
+                            // a picture, so a permanently broken fast path is
+                            // invisible unless the reason is reported.
+                            error!(
+                                session_id = %task_session,
+                                error = %detail,
+                                "portal screen pipeline failed; falling back to the grim screenshot backend, which caps out near 6 FPS"
+                            );
                             // Use grim with the same connection
                             run_grim_stream_on_open(
                                 &mut socket,
+                                &mut magic_sent,
                                 task_session.clone(),
                                 source,
-                                pending.fps,
-                                pending.quality,
-                                pending.max_width,
-                                pending.max_height,
+                                pending.tuning,
                                 &mut stop_rx,
                             )
                             .await
@@ -323,24 +386,20 @@ impl ScreenManager {
             } else if source.backend == "x11-ffmpeg" {
                 run_x11_stream(
                     &mut socket,
+                    &mut magic_sent,
                     task_session.clone(),
                     source,
-                    pending.fps,
-                    pending.quality,
-                    pending.max_width,
-                    pending.max_height,
+                    pending.tuning,
                     &mut stop_rx,
                 )
                 .await
             } else {
                 run_grim_stream_on_open(
                     &mut socket,
+                    &mut magic_sent,
                     task_session.clone(),
                     source,
-                    pending.fps,
-                    pending.quality,
-                    pending.max_width,
-                    pending.max_height,
+                    pending.tuning,
                     &mut stop_rx,
                 )
                 .await
@@ -359,10 +418,37 @@ impl ScreenManager {
             session_id,
             StreamSession::Running(RunningStream {
                 stop: stop_tx,
+                keyframe: keyframe_tx,
                 task,
             }),
         );
         Ok(())
+    }
+
+    /// Forces an immediate IDR on a running session. Android recreates its
+    /// decoder whenever the app returns to the foreground and the `SurfaceView`
+    /// is rebuilt, and it stays black until it sees SPS/PPS plus an IDR.
+    pub async fn request_key_frame(&self, session_id: &str) -> anyhow::Result<()> {
+        let sessions = self.sessions.lock().await;
+        match sessions.get(session_id) {
+            Some(StreamSession::Running(running)) => {
+                match running.keyframe.try_send(()) {
+                    Ok(()) => debug!(%session_id, "keyframe requested for screen stream"),
+                    // Full means a restart is already pending; the client gets
+                    // its keyframe from that one.
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        debug!(%session_id, "keyframe request coalesced into a pending one")
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        debug!(%session_id, "keyframe request ignored; stream is shutting down")
+                    }
+                }
+                Ok(())
+            }
+            // The producer has not started yet, and it always opens on an IDR.
+            Some(StreamSession::Pending(_)) => Ok(()),
+            None => bail!("Unknown or expired screen stream session"),
+        }
     }
 
     async fn select_source(&self, requested: Option<&str>) -> anyhow::Result<ScreenSource> {
@@ -375,11 +461,11 @@ impl ScreenManager {
         } else {
             // Try preferred source first, then focused, then first
             let preferred = crate::state::load_preferred_source(&self.paths);
-            if let Some(ref pref_id) = preferred {
-                if let Some(source) = sources.iter().find(|s| s.id == *pref_id) {
-                    info!(source_id = %pref_id, "restored preferred screen source");
-                    return Ok(source.clone());
-                }
+            if let Some(ref pref_id) = preferred
+                && let Some(source) = sources.iter().find(|s| s.id == *pref_id)
+            {
+                info!(source_id = %pref_id, "restored preferred screen source");
+                return Ok(source.clone());
             }
             sources
                 .iter()
@@ -418,27 +504,30 @@ pub async fn pointer_move_absolute(
 
 async fn run_grim_stream_on_open(
     socket: &mut TcpStream,
+    magic_sent: &mut bool,
     session_id: String,
     source: ScreenSource,
-    fps: u32,
-    quality: u8,
-    max_width: Option<u32>,
-    max_height: Option<u32>,
+    tuning: StreamTuning,
     stop_rx: &mut oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    run_grim_stream_impl(socket, session_id, source, fps, quality, max_width, max_height, stop_rx).await
+    run_grim_stream_impl(socket, magic_sent, session_id, source, tuning, stop_rx).await
 }
 
 async fn run_grim_stream_impl(
     socket: &mut TcpStream,
+    magic_sent: &mut bool,
     session_id: String,
     source: ScreenSource,
-    fps: u32,
-    quality: u8,
-    max_width: Option<u32>,
-    max_height: Option<u32>,
+    tuning: StreamTuning,
     stop_rx: &mut oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
+    let StreamTuning {
+        fps,
+        quality,
+        max_width,
+        max_height,
+        ..
+    } = tuning;
     let target_interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
     let mut seq = 0u64;
     // Force aggressive scale for grim (screenshot tool is slow at full res)
@@ -453,6 +542,7 @@ async fn run_grim_stream_impl(
             _ = &mut *stop_rx => break,
             jpeg = capture_grim_frame(&source, quality, scale) => {
                 let jpeg = jpeg?;
+                send_stream_magic(&mut *socket, magic_sent, STREAM_MAGIC_V1).await?;
                 send_frame_grim(&mut *socket, seq, source.width, source.height, &jpeg).await?;
                 seq += 1;
                 frame_count += 1;
@@ -478,17 +568,24 @@ async fn run_grim_stream_impl(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_portal_stream(
     socket: &mut TcpStream,
+    magic_sent: &mut bool,
     session_id: String,
     _selected_source: ScreenSource,
-    fps: u32,
-    quality: u8,
-    max_width: Option<u32>,
-    max_height: Option<u32>,
+    tuning: StreamTuning,
     stop_rx: &mut oneshot::Receiver<()>,
+    keyframe_rx: &mut mpsc::Receiver<()>,
     paths: super::state::StatePaths,
 ) -> anyhow::Result<()> {
+    let StreamTuning {
+        fps,
+        quality,
+        max_width,
+        max_height,
+        ..
+    } = tuning;
     info!(%session_id, fps, quality, "portal stream client connected; starting ScreenCast approval");
 
     let restore_token = crate::state::load_portal_restore_token(&paths);
@@ -504,10 +601,10 @@ async fn run_portal_stream(
             }
         }
     };
-    if let Some(ref token) = portal.restore_token {
-        if let Err(err) = crate::state::save_portal_restore_token(&paths, token) {
-            warn!(%session_id, %err, "failed to save portal restore token");
-        }
+    if let Some(ref token) = portal.restore_token
+        && let Err(err) = crate::state::save_portal_restore_token(&paths, token)
+    {
+        warn!(%session_id, %err, "failed to save portal restore token");
     }
     let source = ScreenSource {
         id: format!("portal:stream:{}", portal.stream_id),
@@ -521,24 +618,183 @@ async fn run_portal_stream(
         scale: 1.0,
         focused: true,
     };
-    let (target_width, target_height) =
+    let (mut target_width, mut target_height) =
         target_dimensions(source.width, source.height, max_width, max_height);
-    let mut child = spawn_gstreamer_pipewire(portal, fps, quality, target_width, target_height)?;
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(log_child_stderr(session_id.clone(), "gstreamer", stderr));
+    let encoding = match detect_h264_encoder() {
+        Some(encoder) => {
+            // H.264 macroblocks are 16x16 and chroma is subsampled, so both
+            // dimensions have to stay even or the encoder refuses to negotiate.
+            target_width = target_width.map(even_dimension);
+            target_height = target_height.map(even_dimension);
+            PipelineEncoding::H264 {
+                encoder,
+                bitrate_kbps: resolve_bitrate_kbps(
+                    tuning.bitrate_kbps,
+                    target_width.unwrap_or(source.width),
+                    target_height.unwrap_or(source.height),
+                    fps,
+                    quality,
+                ),
+                gop_size: keyframe_interval(fps),
+            }
+        }
+        None => PipelineEncoding::Jpeg { quality },
+    };
+    let width = target_width.unwrap_or(source.width);
+    let height = target_height.unwrap_or(source.height);
+    info!(
+        %session_id,
+        source_id = %source.id,
+        encoder = encoding.label(),
+        codec = encoding.codec(),
+        bitrate_kbps = encoding.bitrate_kbps(),
+        width,
+        height,
+        "portal stream started"
+    );
+    let producer_error: ProducerError = Arc::new(std::sync::Mutex::new(None));
+    let mut counters = StreamCounters::default();
+    // Restart loop. Shelling out to gst-launch leaves no way to push a
+    // force-key-unit event into a running pipeline, so an on-demand keyframe is
+    // served by respawning the encoder: a fresh pipeline always opens on an IDR
+    // with its parameter sets.
+    let pumped = loop {
+        let mut child =
+            spawn_gstreamer_pipewire(&portal, fps, encoding, target_width, target_height)?;
+        let stderr_task = child.stderr.take().map(|stderr| {
+            tokio::spawn(log_child_stderr(
+                session_id.clone(),
+                "gstreamer",
+                stderr,
+                producer_error.clone(),
+            ))
+        });
+        let mut stdout = child
+            .stdout
+            .take()
+            .context("GStreamer stdout unavailable")?;
+        let pumped = match encoding {
+            PipelineEncoding::H264 { .. } => {
+                pump_h264_stream(
+                    socket,
+                    magic_sent,
+                    &mut stdout,
+                    stop_rx,
+                    keyframe_rx,
+                    &mut counters,
+                    &session_id,
+                    FrameGeometry {
+                        width,
+                        height,
+                        source_width: source.width,
+                        source_height: source.height,
+                    },
+                    fps,
+                )
+                .await
+            }
+            PipelineEncoding::Jpeg { .. } => {
+                // Every JPEG frame is already a keyframe, so this path ignores
+                // the request channel and never restarts.
+                pump_jpeg_stream(
+                    socket,
+                    magic_sent,
+                    &mut stdout,
+                    stop_rx,
+                    &mut counters,
+                    &session_id,
+                    source.width,
+                    source.height,
+                    fps,
+                    "portal",
+                )
+                .await
+                .map(|()| PumpOutcome::Finished)
+            }
+        };
+        let _ = child.kill().await;
+        // Killing the child closes the stderr pipe, so draining it now costs
+        // almost nothing and makes the producer's own diagnostic available.
+        if let Some(task) = stderr_task {
+            let _ = timeout(Duration::from_millis(500), task).await;
+        }
+        match pumped {
+            Ok(PumpOutcome::KeyFrameRequested) => {
+                info!(%session_id, "restarting encoder pipeline to serve a keyframe request");
+                continue;
+            }
+            other => break other,
+        }
+    };
+    pumped?;
+    let frames = counters.frames;
+    if frames == 0 {
+        // GStreamer pipeline failed before producing any frames. Return an error
+        // so the grim fallback can take over, carrying the real reason instead
+        // of a guess.
+        let detail = producer_error.lock().ok().and_then(|slot| slot.clone());
+        match detail {
+            Some(detail) => {
+                anyhow::bail!("Portal GStreamer pipeline produced no frames: {detail}")
+            }
+            None => anyhow::bail!(
+                "Portal GStreamer pipeline produced no frames (PipeWire format may be incompatible)"
+            ),
+        }
     }
-    let mut stdout = child
-        .stdout
-        .take()
-        .context("GStreamer stdout unavailable")?;
-    let mut reader = JpegStreamReader::new();
-    let mut buffer = [0u8; 32 * 1024];
-    let mut seq = 0u64;
+    debug!(%session_id, frames, "portal stream stopped");
+    Ok(())
+}
+
+/// Envelope counters that survive an encoder restart, so `seq` stays monotonic
+/// across a keyframe-driven respawn.
+#[derive(Debug, Default)]
+struct StreamCounters {
+    seq: u64,
+    frames: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PumpOutcome {
+    Finished,
+    KeyFrameRequested,
+}
+
+/// Encoder restarts are cheap but not free, so a client that asks repeatedly
+/// cannot make the pipeline thrash.
+const KEYFRAME_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Reads Annex-B access units off the encoder pipe and forwards them as
+/// `WAYPAD_STREAM_V2` frames.
+#[allow(clippy::too_many_arguments)]
+async fn pump_h264_stream(
+    socket: &mut TcpStream,
+    magic_sent: &mut bool,
+    stdout: &mut ChildStdout,
+    stop_rx: &mut oneshot::Receiver<()>,
+    keyframe_rx: &mut mpsc::Receiver<()>,
+    counters: &mut StreamCounters,
+    session_id: &str,
+    geometry: FrameGeometry,
+    fps: u32,
+) -> anyhow::Result<PumpOutcome> {
+    let mut reader = AnnexBStreamReader::new();
+    let mut buffer = vec![0u8; 64 * 1024];
     let mut frame_count = 0u64;
     let mut throughput_start = tokio::time::Instant::now();
-    info!(%session_id, source_id = %source.id, ?target_width, ?target_height, "portal stream started");
+    let started = tokio::time::Instant::now();
+    // A decoder that joins on a P-frame shows nothing until the next IDR, so
+    // nothing is forwarded before the first keyframe of the fresh pipeline.
+    let mut waiting_for_keyframe = true;
+    let mut keyframe_channel_open = true;
+    // Half a frame interval, bounded so the pipe is unambiguously idle before
+    // the buffered picture is released early.
+    let flush_idle = Duration::from_millis((500 / u64::from(fps.max(1))).clamp(4, 12));
     loop {
-        tokio::select! {
+        let units = tokio::select! {
+            // Draining the pipe always wins over the idle flush, so a stall in
+            // this task can never cut an access unit that has already arrived.
+            biased;
             _ = &mut *stop_rx => break,
             read = stdout.read(&mut buffer) => {
                 let n = read?;
@@ -546,32 +802,127 @@ async fn run_portal_stream(
                     warn!(%session_id, "portal stream producer closed stdout");
                     break;
                 }
+                reader.push(&buffer[..n])
+            }
+            request = keyframe_rx.recv(), if keyframe_channel_open => {
+                if request.is_none() {
+                    // Sender dropped: the session is being torn down and
+                    // stop_rx is about to fire.
+                    keyframe_channel_open = false;
+                } else if started.elapsed() >= KEYFRAME_RESTART_MIN_INTERVAL {
+                    return Ok(PumpOutcome::KeyFrameRequested);
+                } else {
+                    debug!(%session_id, "keyframe request ignored; the encoder just restarted");
+                }
+                Vec::new()
+            }
+            _ = tokio::time::sleep(flush_idle), if reader.has_pending_picture() => {
+                reader.flush_pending().into_iter().collect()
+            }
+        };
+        for unit in units {
+            if waiting_for_keyframe {
+                if !unit.key_frame {
+                    continue;
+                }
+                waiting_for_keyframe = false;
+            }
+            send_stream_magic(&mut *socket, magic_sent, STREAM_MAGIC_V2).await?;
+            if let Some(parameter_sets) = unit.parameter_sets.as_deref() {
+                send_h264_frame(
+                    &mut *socket,
+                    counters.seq,
+                    geometry,
+                    parameter_sets,
+                    false,
+                    true,
+                )
+                .await?;
+                counters.seq += 1;
+                counters.frames += 1;
+            }
+            send_h264_frame(
+                &mut *socket,
+                counters.seq,
+                geometry,
+                &unit.data,
+                unit.key_frame,
+                false,
+            )
+            .await?;
+            counters.seq += 1;
+            counters.frames += 1;
+            frame_count += 1;
+        }
+        let elapsed = throughput_start.elapsed().as_secs_f64();
+        if elapsed >= 2.0 {
+            let measured = frame_count as f64 / elapsed;
+            debug!(%session_id, fps_measured = measured, fps_target = fps, frames = frame_count, "h264 stream throughput");
+            frame_count = 0;
+            throughput_start = tokio::time::Instant::now();
+        }
+    }
+    Ok(PumpOutcome::Finished)
+}
+
+/// Reads concatenated JPEG frames off a producer pipe and forwards them as
+/// `WAYPAD_STREAM_V1` frames.
+#[allow(clippy::too_many_arguments)]
+async fn pump_jpeg_stream(
+    socket: &mut TcpStream,
+    magic_sent: &mut bool,
+    stdout: &mut ChildStdout,
+    stop_rx: &mut oneshot::Receiver<()>,
+    counters: &mut StreamCounters,
+    session_id: &str,
+    width: u32,
+    height: u32,
+    fps: u32,
+    producer: &'static str,
+) -> anyhow::Result<()> {
+    let mut reader = JpegStreamReader::new();
+    let mut buffer = [0u8; 32 * 1024];
+    let mut frame_count = 0u64;
+    let mut throughput_start = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = &mut *stop_rx => break,
+            read = stdout.read(&mut buffer) => {
+                let n = read?;
+                if n == 0 {
+                    warn!(%session_id, producer, "jpeg stream producer closed stdout");
+                    break;
+                }
                 for frame in reader.push(&buffer[..n]) {
-                    send_frame(&mut *socket, seq, source.width, source.height, &frame).await?;
-                    seq += 1;
+                    send_stream_magic(&mut *socket, magic_sent, STREAM_MAGIC_V1).await?;
+                    send_frame(&mut *socket, counters.seq, width, height, &frame).await?;
+                    counters.seq += 1;
+                    counters.frames += 1;
                     frame_count += 1;
                 }
                 let elapsed = throughput_start.elapsed().as_secs_f64();
                 if elapsed >= 2.0 {
                     let measured = frame_count as f64 / elapsed;
-                    debug!(%session_id, fps_measured = measured, fps_target = fps, frames = frame_count, "portal stream throughput");
+                    debug!(%session_id, producer, fps_measured = measured, fps_target = fps, frames = frame_count, "jpeg stream throughput");
                     frame_count = 0;
                     throughput_start = tokio::time::Instant::now();
                 }
             }
         }
     }
-    let _ = child.kill().await;
-    if seq == 0 {
-        // GStreamer pipeline failed before producing any frames
-        // Kill child and return error so the grim fallback can take over
-        anyhow::bail!("Portal GStreamer pipeline produced no frames (PipeWire format may be incompatible)");
-    }
-    debug!(%session_id, "portal stream stopped");
     Ok(())
 }
 
-async fn log_child_stderr(session_id: String, label: &'static str, mut stderr: ChildStderr) {
+/// Producer stderr is both logged and kept, so a pipeline that dies before its
+/// first frame can report why instead of silently degrading to the fallback.
+type ProducerError = Arc<std::sync::Mutex<Option<String>>>;
+
+async fn log_child_stderr(
+    session_id: String,
+    label: &'static str,
+    mut stderr: ChildStderr,
+    sink: ProducerError,
+) {
     let mut buffer = [0u8; 2048];
     loop {
         match stderr.read(&mut buffer).await {
@@ -580,6 +931,18 @@ async fn log_child_stderr(session_id: String, label: &'static str, mut stderr: C
                 let text = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
                 if !text.is_empty() {
                     warn!(%session_id, producer = label, stderr = %text, "screen stream producer stderr");
+                    if let Ok(mut slot) = sink.lock() {
+                        // Keep the first real error: later lines are usually
+                        // teardown noise that hides the actual cause.
+                        let first_error = text
+                            .lines()
+                            .find(|line| line.contains("ERROR"))
+                            .map(str::trim)
+                            .map(ToOwned::to_owned);
+                        if slot.is_none() || first_error.is_some() && !slot_has_error(&slot) {
+                            *slot = first_error.or(Some(text));
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -590,7 +953,88 @@ async fn log_child_stderr(session_id: String, label: &'static str, mut stderr: C
     }
 }
 
+fn slot_has_error(slot: &Option<String>) -> bool {
+    slot.as_deref().is_some_and(|text| text.contains("ERROR"))
+}
+
 const SEND_FRAME_DEADLINE_MS: u64 = 12;
+const H264_SEND_TIMEOUT_SECS: u64 = 10;
+
+async fn send_stream_magic(
+    socket: &mut TcpStream,
+    magic_sent: &mut bool,
+    magic: &[u8],
+) -> anyhow::Result<()> {
+    if *magic_sent {
+        return Ok(());
+    }
+    socket.write_all(magic).await?;
+    *magic_sent = true;
+    Ok(())
+}
+
+fn frame_envelope(header: &str, payload: &[u8]) -> Vec<u8> {
+    let header = header.as_bytes();
+    let mut buf = Vec::with_capacity(4 + 4 + header.len() + payload.len());
+    buf.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    buf.extend_from_slice(header);
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// Encoded size of the picture together with the size of the desktop it came from.
+///
+/// The two differ whenever the client asks for a smaller stream. Only the encoded
+/// size describes the pixels on the wire, but the client maps touches onto desktop
+/// coordinates, so it needs the source size too: mapping against the encoded size
+/// would confine the pointer to a corner of the screen, silently and with no error.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+}
+
+impl FrameGeometry {
+    fn header_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("width".into(), self.width.into());
+        fields.insert("height".into(), self.height.into());
+        fields.insert("source_width".into(), self.source_width.into());
+        fields.insert("source_height".into(), self.source_height.into());
+        fields
+    }
+}
+
+async fn send_h264_frame(
+    socket: &mut TcpStream,
+    seq: u64,
+    geometry: FrameGeometry,
+    payload: &[u8],
+    key_frame: bool,
+    config: bool,
+) -> anyhow::Result<()> {
+    let mut header_object = geometry.header_fields();
+    header_object.insert("seq".into(), seq.into());
+    header_object.insert("timestamp_ms".into(), json!(now_millis()));
+    header_object.insert("codec".into(), "h264".into());
+    header_object.insert("key_frame".into(), key_frame.into());
+    header_object.insert("config".into(), config.into());
+    let header = serde_json::Value::Object(header_object).to_string();
+    let buf = frame_envelope(&header, payload);
+    // Unlike JPEG, an H.264 frame is referenced by everything that follows it,
+    // so partial or dropped writes would corrupt the rest of the session:
+    // frames are always written whole and only a wedged client aborts.
+    timeout(
+        Duration::from_secs(H264_SEND_TIMEOUT_SECS),
+        socket.write_all(&buf),
+    )
+    .await
+    .context("screen stream client stalled while receiving an H.264 frame")??;
+    Ok(())
+}
 
 async fn send_frame(
     socket: &mut TcpStream,
@@ -610,27 +1054,24 @@ async fn send_frame_grim(
     jpeg: &[u8],
 ) -> anyhow::Result<()> {
     // Grim frames are large JPEG screenshots — no deadline, send at TCP speed
-    let header = json!({
+    let buf = frame_envelope(&jpeg_frame_header(seq, width, height), jpeg);
+    socket.write_all(&buf).await?;
+    Ok(())
+}
+
+/// The JPEG path reports the source size as the frame size: the picture may be
+/// downscaled on the wire, but the client only ever needs desktop coordinates.
+fn jpeg_frame_header(seq: u64, width: u32, height: u32) -> String {
+    json!({
         "seq": seq,
         "timestamp_ms": now_millis(),
         "codec": "jpeg",
         "width": width,
-        "height": height
+        "height": height,
+        "source_width": width,
+        "source_height": height
     })
-    .to_string();
-    let header = header.as_bytes();
-    let header_len = (header.len() as u32).to_be_bytes();
-    let payload_len = (jpeg.len() as u32).to_be_bytes();
-
-    let total = 4 + 4 + header.len() + jpeg.len();
-    let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(&header_len);
-    buf.extend_from_slice(&payload_len);
-    buf.extend_from_slice(header);
-    buf.extend_from_slice(jpeg);
-
-    socket.write_all(&buf).await?;
-    Ok(())
+    .to_string()
 }
 
 async fn send_frame_deadline(
@@ -641,24 +1082,7 @@ async fn send_frame_deadline(
     jpeg: &[u8],
     deadline_ms: u64,
 ) -> anyhow::Result<()> {
-    let header = json!({
-        "seq": seq,
-        "timestamp_ms": now_millis(),
-        "codec": "jpeg",
-        "width": width,
-        "height": height
-    })
-    .to_string();
-    let header = header.as_bytes();
-    let header_len = (header.len() as u32).to_be_bytes();
-    let payload_len = (jpeg.len() as u32).to_be_bytes();
-
-    let total = 4 + 4 + header.len() + jpeg.len();
-    let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(&header_len);
-    buf.extend_from_slice(&payload_len);
-    buf.extend_from_slice(header);
-    buf.extend_from_slice(jpeg);
+    let buf = frame_envelope(&jpeg_frame_header(seq, width, height), jpeg);
 
     let result = timeout(Duration::from_millis(deadline_ms), async {
         let mut offset = 0;
@@ -827,7 +1251,7 @@ impl PortalScreenCastSession {
             "session_handle_token",
             Value::from(session_token).try_into()?,
         );
-        
+
         if let Some(ref token) = restore_token {
             create_options.insert("restore_token", Value::from(token.as_str()).try_into()?);
             info!("portal restore_token provided, attempting session restoration");
@@ -921,7 +1345,9 @@ impl PortalScreenCastSession {
 
 impl Drop for PortalScreenCastSession {
     fn drop(&mut self) {
-        if let (Some(connection), Some(handle)) = (self.connection.take(), self.session_handle.take()) {
+        if let (Some(connection), Some(handle)) =
+            (self.connection.take(), self.session_handle.take())
+        {
             tokio::spawn(async move {
                 let proxy = zbus::Proxy::new(
                     &connection,
@@ -930,13 +1356,10 @@ impl Drop for PortalScreenCastSession {
                     "org.freedesktop.portal.ScreenCast",
                 )
                 .await;
-                match proxy {
-                    Ok(proxy) => {
-                        let _: Result<(), _> = proxy
-                            .call::<_, _, ()>("CloseSession", &(handle.as_str()))
-                            .await;
-                    }
-                    Err(_) => {}
+                if let Ok(proxy) = proxy {
+                    let _: Result<(), _> = proxy
+                        .call::<_, _, ()>("CloseSession", &(handle.as_str()))
+                        .await;
                 }
             });
         }
@@ -948,57 +1371,220 @@ struct PortalResponse {
     response: u32,
     results: HashMap<String, OwnedValue>,
 }
-fn spawn_gstreamer_pipewire(
-    session: PortalScreenCastSession,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum H264Encoder {
+    Nvenc,
+    X264,
+}
+
+impl H264Encoder {
+    fn element(self) -> &'static str {
+        match self {
+            Self::Nvenc => "nvh264enc",
+            Self::X264 => "x264enc",
+        }
+    }
+
+    /// Pixel format fed to the encoder: NVENC uploads NV12 to the GPU with the
+    /// least PCIe traffic, x264 encodes I420 without an internal conversion.
+    fn raw_format(self) -> &'static str {
+        match self {
+            Self::Nvenc => "NV12",
+            Self::X264 => "I420",
+        }
+    }
+
+    fn settings(self, bitrate_kbps: u32, gop_size: u32) -> Vec<String> {
+        match self {
+            Self::Nvenc => vec![
+                format!("bitrate={bitrate_kbps}"),
+                format!("max-bitrate={bitrate_kbps}"),
+                "rc-mode=cbr".into(),
+                "preset=p4".into(),
+                "tune=ultra-low-latency".into(),
+                "zerolatency=true".into(),
+                "bframes=0".into(),
+                format!("gop-size={gop_size}"),
+                "repeat-sequence-header=true".into(),
+                "aud=true".into(),
+            ],
+            Self::X264 => vec![
+                "tune=zerolatency".into(),
+                "speed-preset=veryfast".into(),
+                format!("bitrate={bitrate_kbps}"),
+                format!("key-int-max={gop_size}"),
+                "bframes=0".into(),
+                "byte-stream=true".into(),
+                "aud=true".into(),
+            ],
+        }
+    }
+}
+
+static H264_ENCODER: OnceLock<Option<H264Encoder>> = OnceLock::new();
+
+/// Picks the H.264 encoder once per process. `gst-inspect-1.0` only proves the
+/// plugin is installed, while NVENC additionally needs a usable CUDA context on
+/// this hybrid GPU, so each candidate is exercised on a one-buffer pipeline
+/// before it is trusted. Falls through to `x264enc` and, when neither works, to
+/// the JPEG paths.
+fn detect_h264_encoder() -> Option<H264Encoder> {
+    *H264_ENCODER.get_or_init(|| {
+        let selected = [H264Encoder::Nvenc, H264Encoder::X264]
+            .into_iter()
+            .find(|candidate| probe_h264_encoder(*candidate));
+        match selected {
+            Some(encoder) => info!(encoder = encoder.element(), "H.264 screen encoder selected"),
+            None => info!("no usable H.264 encoder found; screen streaming stays on JPEG"),
+        }
+        selected
+    })
+}
+
+fn probe_h264_encoder(encoder: H264Encoder) -> bool {
+    if command_output("gst-inspect-1.0", &[encoder.element()]).is_none() {
+        debug!(encoder = encoder.element(), "H.264 encoder element missing");
+        return false;
+    }
+    let args = [
+        "-q".into(),
+        "videotestsrc".into(),
+        "num-buffers=1".into(),
+        "!".into(),
+        "video/x-raw,width=320,height=240,framerate=30/1".into(),
+        "!".into(),
+        "videoconvert".into(),
+        "!".into(),
+        format!("video/x-raw,format={}", encoder.raw_format()),
+        "!".into(),
+        encoder.element().into(),
+        "!".into(),
+        "h264parse".into(),
+        "!".into(),
+        "fakesink".into(),
+    ];
+    let ok = std::process::Command::new("gst-launch-1.0")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !ok {
+        warn!(
+            encoder = encoder.element(),
+            "H.264 encoder element is installed but failed to initialise"
+        );
+    }
+    ok
+}
+
+pub fn h264_encoder_name() -> Option<&'static str> {
+    detect_h264_encoder().map(H264Encoder::element)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PipelineEncoding {
+    H264 {
+        encoder: H264Encoder,
+        bitrate_kbps: u32,
+        gop_size: u32,
+    },
+    Jpeg {
+        quality: u8,
+    },
+}
+
+impl PipelineEncoding {
+    fn codec(self) -> &'static str {
+        match self {
+            Self::H264 { .. } => "h264",
+            Self::Jpeg { .. } => "jpeg",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::H264 { encoder, .. } => encoder.element(),
+            Self::Jpeg { .. } => "jpegenc",
+        }
+    }
+
+    fn bitrate_kbps(self) -> u32 {
+        match self {
+            Self::H264 { bitrate_kbps, .. } => bitrate_kbps,
+            Self::Jpeg { .. } => 0,
+        }
+    }
+}
+
+const DEFAULT_BITRATE_WIDTH: u32 = 1920;
+const DEFAULT_BITRATE_HEIGHT: u32 = 1080;
+
+/// Resolves the CBR target. `bitrate_kbps` wins when the client sends it;
+/// otherwise the legacy `jpeg_quality` knob is mapped onto bits per pixel so
+/// older clients still get a sane H.264 stream (1080p30 at quality 70 lands
+/// around 7 Mbit/s instead of the 45-90 Mbit/s the MJPEG path used).
+fn resolve_bitrate_kbps(
+    requested: Option<u32>,
+    width: u32,
+    height: u32,
     fps: u32,
     quality: u8,
+) -> u32 {
+    if let Some(kbps) = requested {
+        return kbps.clamp(500, 40_000);
+    }
+    let width = if width == 0 {
+        DEFAULT_BITRATE_WIDTH
+    } else {
+        width
+    };
+    let height = if height == 0 {
+        DEFAULT_BITRATE_HEIGHT
+    } else {
+        height
+    };
+    let quality = f64::from(quality.clamp(35, 92));
+    let bits_per_pixel = 0.05 + (quality - 35.0) / 57.0 * 0.11;
+    let bits = f64::from(width) * f64::from(height) * f64::from(fps.max(1)) * bits_per_pixel;
+    ((bits / 1000.0).round() as u32).clamp(800, 25_000)
+}
+
+/// Keyframe every two seconds: short enough that a reconnecting client recovers
+/// quickly, long enough that IDR spikes do not dominate the bitrate.
+fn keyframe_interval(fps: u32) -> u32 {
+    (fps.max(1) * 2).clamp(15, 120)
+}
+
+fn even_dimension(value: u32) -> u32 {
+    value.max(2) & !1
+}
+
+/// Borrows the portal session rather than consuming it: the PipeWire fd has to
+/// stay open for the whole stream so the encoder can be respawned for a
+/// keyframe request, and dropping the session would also close the portal.
+fn spawn_gstreamer_pipewire(
+    session: &PortalScreenCastSession,
+    fps: u32,
+    encoding: PipelineEncoding,
     target_width: Option<u32>,
     target_height: Option<u32>,
 ) -> anyhow::Result<tokio::process::Child> {
     let fd = session.pipewire_fd.as_raw_fd();
+    let args = gstreamer_pipeline_args(
+        session.stream_id,
+        fps,
+        encoding,
+        target_width,
+        target_height,
+    );
+
+    debug!(pipeline = %args.join(" "), "launching GStreamer PipeWire pipeline");
     let mut command = Command::new("gst-launch-1.0");
     command
         .env("PIPEWIRE_VIDEO_BUFFER_TYPE", "mem")
-        .arg("-q")
-        .arg("pipewiresrc")
-        .arg("fd=3")
-        .arg(format!("path={}", session.stream_id))
-        .arg("do-timestamp=true")
-        .arg("keepalive-time=1000")
-        .arg("!")
-        .arg("queue")
-        .arg("max-size-buffers=4")
-        .arg("leaky=downstream")
-        .arg("!")
-        .arg("videoconvert")
-        .arg("n-threads=4")
-        .arg("!");
-
-    // Scale + framerate in a single capsfilter (avoids separate videoscale + videorate overhead)
-    match (target_width, target_height) {
-        (Some(width), Some(height)) => {
-            command.arg(format!(
-                "video/x-raw,width={width},height={height},framerate={fps}/1"
-            ));
-        }
-        _ => {
-            command.arg(format!("video/x-raw,framerate={fps}/1"));
-        }
-    }
-
-    command
-        .arg("!")
-        .arg("jpegenc")
-        .arg(format!("quality={}", quality.min(75)))
-        .arg("idct-method=1")
-        .arg("!")
-        .arg("queue")
-        .arg("max-size-buffers=8")
-        .arg("leaky=downstream")
-        .arg("!")
-        .arg("fdsink")
-        .arg("fd=1")
-        .arg("sync=false")
+        .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     unsafe {
@@ -1012,6 +1598,101 @@ fn spawn_gstreamer_pipewire(
     command
         .spawn()
         .context("failed to launch GStreamer PipeWire pipeline")
+}
+
+fn gstreamer_pipeline_args(
+    stream_id: u32,
+    fps: u32,
+    encoding: PipelineEncoding,
+    target_width: Option<u32>,
+    target_height: Option<u32>,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-q".into(),
+        "pipewiresrc".into(),
+        "fd=3".into(),
+        format!("path={stream_id}"),
+        "do-timestamp=true".into(),
+        "keepalive-time=1000".into(),
+        "!".into(),
+        "queue".into(),
+        "max-size-buffers=4".into(),
+        "leaky=downstream".into(),
+        "!".into(),
+        // A capsfilter constrains, it never converts. Everything the capsfilter
+        // below asks for that videoconvert cannot do itself — frame rate and
+        // frame size — must have its own converter here, or the constraint
+        // travels back up to pipewiresrc, which then demands a format the
+        // portal cannot deliver and fails with "error set output format: -22"
+        // before a single frame is produced.
+        "videorate".into(),
+        // drop-only never duplicates frames, so a still screen costs no
+        // bandwidth, and it never holds a buffer back to pace the output.
+        "drop-only=true".into(),
+        format!("max-rate={fps}"),
+        "!".into(),
+        "videoscale".into(),
+        "!".into(),
+        "videoconvert".into(),
+        "n-threads=4".into(),
+        "!".into(),
+    ];
+
+    // Pixel format and frame size only. The frame rate is already bounded by
+    // videorate, and pinning it here would over-constrain the source for no
+    // gain. Square pixels are requested explicitly because some sources
+    // otherwise negotiate a non-square aspect the phone cannot correct.
+    let mut caps = String::from("video/x-raw");
+    if let PipelineEncoding::H264 { encoder, .. } = encoding {
+        caps.push_str(&format!(",format={}", encoder.raw_format()));
+    }
+    if let (Some(width), Some(height)) = (target_width, target_height) {
+        caps.push_str(&format!(",width={width},height={height}"));
+    }
+    caps.push_str(",pixel-aspect-ratio=1/1");
+    args.push(caps);
+    args.push("!".into());
+
+    match encoding {
+        PipelineEncoding::H264 {
+            encoder,
+            bitrate_kbps,
+            gop_size,
+        } => {
+            args.push(encoder.element().into());
+            args.extend(encoder.settings(bitrate_kbps, gop_size));
+            args.push("!".into());
+            args.push("video/x-h264,profile=high".into());
+            args.push("!".into());
+            // config-interval=-1 guarantees SPS/PPS in front of every IDR even
+            // for encoders that cannot repeat them on their own.
+            args.push("h264parse".into());
+            args.push("config-interval=-1".into());
+            args.push("!".into());
+            args.push("video/x-h264,stream-format=byte-stream,alignment=au".into());
+            args.push("!".into());
+            // No leaky queue after the encoder: dropping an encoded frame here
+            // would break every frame that references it. Backpressure instead
+            // travels upstream to the leaky queue in front of videoconvert.
+            args.push("queue".into());
+            args.push("max-size-buffers=8".into());
+        }
+        PipelineEncoding::Jpeg { quality } => {
+            args.push("jpegenc".into());
+            args.push(format!("quality={}", quality.min(75)));
+            args.push("idct-method=1".into());
+            args.push("!".into());
+            args.push("queue".into());
+            args.push("max-size-buffers=8".into());
+            args.push("leaky=downstream".into());
+        }
+    }
+
+    args.push("!".into());
+    args.push("fdsink".into());
+    args.push("fd=1".into());
+    args.push("sync=false".into());
+    args
 }
 
 #[cfg(unix)]
@@ -1059,6 +1740,176 @@ fn find_marker(buffer: &[u8], marker: [u8; 2], from: usize) -> Option<usize> {
         .enumerate()
         .skip(from)
         .find_map(|(index, window)| (window == marker).then_some(index))
+}
+
+/// Largest Annex-B payload kept while looking for the next access unit. A 1080p
+/// IDR stays far below this, so hitting the cap means the producer is emitting
+/// something that is not a byte stream and the reader resynchronises.
+const MAX_ANNEX_B_BUFFER: usize = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+struct AccessUnit {
+    data: Vec<u8>,
+    key_frame: bool,
+    /// SPS/PPS copied out of the access unit, sent ahead of it as a config
+    /// frame. They stay inline in `data` as well so a decoder that ignores
+    /// config frames still finds them before the IDR.
+    parameter_sets: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NalRef {
+    /// Offset of the leading byte of the start code, not of the NAL header.
+    start: usize,
+    kind: u8,
+    /// `first_mb_in_slice == 0`, only meaningful for slice NAL units.
+    first_slice: bool,
+}
+
+impl NalRef {
+    fn is_slice(self) -> bool {
+        matches!(self.kind, 1..=5)
+    }
+
+    fn starts_access_unit(self, has_slice: bool) -> bool {
+        match self.kind {
+            // Access unit delimiter: always opens a picture.
+            9 => true,
+            // Parameter sets and SEI belong to the picture that follows them.
+            6 | 7 | 8 | 13 | 14 | 15 => has_slice,
+            // A slice opens a new picture only when it restarts the macroblock
+            // scan, which keeps multi-slice frames (x264 sliced threads) whole.
+            1..=5 => has_slice && self.first_slice,
+            _ => false,
+        }
+    }
+}
+
+/// Splits the encoder's Annex-B byte stream into whole access units. Reads from
+/// the producer pipe land on arbitrary boundaries, so NAL units are only cut
+/// once the start code of the following one has actually been seen.
+struct AnnexBStreamReader {
+    buffer: Vec<u8>,
+    nals: Vec<NalRef>,
+    scan_from: usize,
+}
+
+impl AnnexBStreamReader {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::new(),
+            nals: Vec::new(),
+            scan_from: 0,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Vec<AccessUnit> {
+        self.buffer.extend_from_slice(chunk);
+        self.scan();
+        let mut units = Vec::new();
+        while let Some(boundary) = self.next_boundary() {
+            units.push(self.take_access_unit(boundary));
+        }
+        if self.buffer.len() > MAX_ANNEX_B_BUFFER {
+            warn!(
+                bytes = self.buffer.len(),
+                "annex-b buffer overflow; resynchronising on the next start code"
+            );
+            self.buffer.clear();
+            self.nals.clear();
+            self.scan_from = 0;
+        }
+        units
+    }
+
+    fn scan(&mut self) {
+        // A start code plus the two bytes needed to classify the NAL span five
+        // bytes, so scanning resumes far enough back to complete a pattern that
+        // was still truncated on the previous read.
+        let mut index = self.scan_from;
+        while index + 5 <= self.buffer.len() {
+            if self.buffer[index] != 0 || self.buffer[index + 1] != 0 || self.buffer[index + 2] != 1
+            {
+                index += 1;
+                continue;
+            }
+            // Four-byte start codes are three-byte ones with a leading zero;
+            // that zero can never be payload because emulation prevention
+            // forbids `00 00 00` inside a NAL.
+            let start = if index > 0 && self.buffer[index - 1] == 0 {
+                index - 1
+            } else {
+                index
+            };
+            self.nals.push(NalRef {
+                start,
+                kind: self.buffer[index + 3] & 0x1f,
+                first_slice: self.buffer[index + 4] & 0x80 != 0,
+            });
+            index += 3;
+        }
+        self.scan_from = self.buffer.len().saturating_sub(4);
+    }
+
+    fn next_boundary(&self) -> Option<usize> {
+        let mut has_slice = false;
+        for (index, nal) in self.nals.iter().enumerate() {
+            if index > 0 && nal.starts_access_unit(has_slice) {
+                return Some(index);
+            }
+            if nal.is_slice() {
+                has_slice = true;
+            }
+        }
+        None
+    }
+
+    fn has_pending_picture(&self) -> bool {
+        self.nals.iter().any(|nal| nal.is_slice())
+    }
+
+    /// Releases the buffered access unit without waiting for the start code of
+    /// the next one, which would otherwise cost a full frame interval of
+    /// latency. Only safe once the producer pipe has gone idle: the encoder
+    /// writes one access unit per pipe write, so an idle pipe means the picture
+    /// is complete.
+    fn flush_pending(&mut self) -> Option<AccessUnit> {
+        if !self.has_pending_picture() {
+            return None;
+        }
+        let end = self.buffer.len();
+        Some(self.take_access_unit_before(self.nals.len(), end))
+    }
+
+    fn take_access_unit(&mut self, boundary: usize) -> AccessUnit {
+        let end = self.nals[boundary].start;
+        self.take_access_unit_before(boundary, end)
+    }
+
+    fn take_access_unit_before(&mut self, boundary: usize, end: usize) -> AccessUnit {
+        let begin = self.nals[0].start;
+        let key_frame = self.nals[..boundary].iter().any(|nal| nal.kind == 5);
+        let mut parameter_sets = Vec::new();
+        for (index, nal) in self.nals[..boundary].iter().enumerate() {
+            if !matches!(nal.kind, 7 | 8) {
+                continue;
+            }
+            let stop = self.nals.get(index + 1).map_or(end, |next| next.start);
+            parameter_sets.extend_from_slice(&self.buffer[nal.start..stop]);
+        }
+        let data = self.buffer[begin..end].to_vec();
+        self.buffer.drain(..end);
+        self.nals.drain(..boundary);
+        for nal in &mut self.nals {
+            nal.start -= end;
+        }
+        self.scan_from = self.scan_from.saturating_sub(end);
+        AccessUnit {
+            data,
+            key_frame,
+            parameter_sets: (!parameter_sets.is_empty()).then_some(parameter_sets),
+        }
+    }
 }
 
 async fn wait_request(
@@ -1144,10 +1995,18 @@ async fn list_x11_monitors() -> anyhow::Result<Vec<ScreenSource>> {
         if res_parts.len() != 2 {
             continue;
         }
-        let Ok(w) = res_parts[0].parse::<u32>() else { continue };
-        let Ok(h) = res_parts[1].parse::<u32>() else { continue };
-        let Ok(x) = main_parts[1].parse::<i32>() else { continue };
-        let Ok(y) = main_parts[2].parse::<i32>() else { continue };
+        let Ok(w) = res_parts[0].parse::<u32>() else {
+            continue;
+        };
+        let Ok(h) = res_parts[1].parse::<u32>() else {
+            continue;
+        };
+        let Ok(x) = main_parts[1].parse::<i32>() else {
+            continue;
+        };
+        let Ok(y) = main_parts[2].parse::<i32>() else {
+            continue;
+        };
 
         monitors.push(ScreenSource {
             id: format!("x11:{}", name),
@@ -1170,14 +2029,19 @@ async fn list_x11_monitors() -> anyhow::Result<Vec<ScreenSource>> {
 
 async fn run_x11_stream(
     socket: &mut TcpStream,
+    magic_sent: &mut bool,
     session_id: String,
     source: ScreenSource,
-    fps: u32,
-    quality: u8,
-    max_width: Option<u32>,
-    max_height: Option<u32>,
+    tuning: StreamTuning,
     stop_rx: &mut oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
+    let StreamTuning {
+        fps,
+        quality,
+        max_width,
+        max_height,
+        ..
+    } = tuning;
     let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
     let (target_w, target_h) =
         target_dimensions(source.width, source.height, max_width, max_height);
@@ -1191,65 +2055,68 @@ async fn run_x11_stream(
     let input_spec = format!("{}.0+{},{}", display, source.x, source.y);
     let mut cmd = tokio::process::Command::new("ffmpeg");
     cmd.args([
-        "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "x11grab",
-        "-framerate", &fps.to_string(),
-        "-video_size", &format!("{cap_w}x{cap_h}"),
-        "-i", &input_spec,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "x11grab",
+        "-framerate",
+        &fps.to_string(),
+        "-video_size",
+        &format!("{cap_w}x{cap_h}"),
+        "-i",
+        &input_spec,
     ]);
     // Scale if needed
     if target_w.is_some() || target_h.is_some() {
         cmd.args(["-vf", &format!("scale={}:{}", cap_w, cap_h)]);
     }
     cmd.args([
-        "-c:v", "mjpeg",
-        "-q:v", &quality.to_string(),
-        "-f", "mjpeg",
+        "-c:v",
+        "mjpeg",
+        "-q:v",
+        &quality.to_string(),
+        "-f",
+        "mjpeg",
         "pipe:1",
     ])
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::piped());
 
-    let mut child = cmd.spawn().context("failed to spawn ffmpeg for X11 capture")?;
+    let mut child = cmd
+        .spawn()
+        .context("failed to spawn ffmpeg for X11 capture")?;
     if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(log_child_stderr(session_id.clone(), "ffmpeg", stderr));
+        tokio::spawn(log_child_stderr(
+            session_id.clone(),
+            "ffmpeg",
+            stderr,
+            Arc::new(std::sync::Mutex::new(None)),
+        ));
     }
     let mut stdout = child.stdout.take().context("ffmpeg stdout unavailable")?;
-    let mut reader = JpegStreamReader::new();
-    let mut buffer = [0u8; 32 * 1024];
-    let mut seq = 0u64;
-    let mut frame_count = 0u64;
-    let mut throughput_start = tokio::time::Instant::now();
-
-    loop {
-        tokio::select! {
-            _ = &mut *stop_rx => break,
-            read = stdout.read(&mut buffer) => {
-                let n = read?;
-                if n == 0 {
-                    warn!(%session_id, "ffmpeg x11 producer closed stdout");
-                    break;
-                }
-                for frame in reader.push(&buffer[..n]) {
-                    send_frame(&mut *socket, seq, source.width, source.height, &frame).await?;
-                    seq += 1;
-                    frame_count += 1;
-                }
-                let elapsed = throughput_start.elapsed().as_secs_f64();
-                if elapsed >= 2.0 {
-                    let measured = frame_count as f64 / elapsed;
-                    info!(%session_id, fps_measured = measured, fps_target = fps, frames = frame_count, "x11 stream throughput");
-                    frame_count = 0;
-                    throughput_start = tokio::time::Instant::now();
-                }
-            }
-        }
-    }
+    let mut counters = StreamCounters::default();
+    let pumped = pump_jpeg_stream(
+        socket,
+        magic_sent,
+        &mut stdout,
+        stop_rx,
+        &mut counters,
+        &session_id,
+        source.width,
+        source.height,
+        fps,
+        "ffmpeg",
+    )
+    .await;
     let _ = child.kill().await;
-    if seq == 0 {
+    pumped?;
+    let frames = counters.frames;
+    if frames == 0 {
         anyhow::bail!("ffmpeg x11 produced no frames");
     }
-    info!(%session_id, total_frames = seq, "x11 stream stopped");
+    info!(%session_id, total_frames = frames, "x11 stream stopped");
     Ok(())
 }
 
@@ -1273,7 +2140,7 @@ pub async fn authorize_portal() -> anyhow::Result<String> {
         "session_handle_token",
         Value::from(format!("waypad_auth_session_{}", portal_token())).try_into()?,
     );
-    
+
     let create_handle: OwnedObjectPath = proxy.call("CreateSession", &(create_options)).await?;
     let create_response = wait_request(&connection, &create_handle).await?;
     if create_response.response != 0 {
@@ -1313,7 +2180,9 @@ pub async fn authorize_portal() -> anyhow::Result<String> {
         .await?;
     let start_response = wait_request(&connection, &start_handle).await?;
     if start_response.response != 0 {
-        bail!("ScreenCast authorization was denied or cancelled. Approve the dialog on your desktop.");
+        bail!(
+            "ScreenCast authorization was denied or cancelled. Approve the dialog on your desktop."
+        );
     }
 
     let restore_token = start_response
@@ -1329,11 +2198,15 @@ pub async fn authorize_portal() -> anyhow::Result<String> {
             Ok(token)
         }
         None => {
-            warn!("portal authorization succeeded but no restore_token returned; persist_mode may not be supported by this backend");
+            warn!(
+                "portal authorization succeeded but no restore_token returned; persist_mode may not be supported by this backend"
+            );
             let _: Result<(), _> = proxy
                 .call::<_, _, ()>("CloseSession", &(session_handle.as_str()))
                 .await;
-            anyhow::bail!("Portal authorization completed but restore_token not available. The portal should now be approved for this session. Try streaming immediately.")
+            anyhow::bail!(
+                "Portal authorization completed but restore_token not available. The portal should now be approved for this session. Try streaming immediately."
+            )
         }
     }
 }
@@ -1341,8 +2214,305 @@ pub async fn authorize_portal() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        JpegStreamReader, capture_scale, find_marker, is_client_disconnect, target_dimensions,
+        AnnexBStreamReader, FrameGeometry, H264Encoder, JpegStreamReader, PipelineEncoding,
+        capture_scale, even_dimension, find_marker, gstreamer_pipeline_args, is_client_disconnect,
+        jpeg_frame_header, keyframe_interval, resolve_bitrate_kbps, target_dimensions,
     };
+
+    #[test]
+    fn frame_header_carries_the_desktop_size_next_to_the_encoded_size() {
+        // A phone asking for a smaller stream still points at desktop pixels, so
+        // both sizes have to travel: mapping touches against the encoded size
+        // would silently confine the pointer to a corner of the screen.
+        let geometry = FrameGeometry {
+            width: 1600,
+            height: 900,
+            source_width: 1920,
+            source_height: 1080,
+        };
+        let fields = geometry.header_fields();
+        assert_eq!(fields["width"], 1600);
+        assert_eq!(fields["height"], 900);
+        assert_eq!(fields["source_width"], 1920);
+        assert_eq!(fields["source_height"], 1080);
+    }
+
+    #[test]
+    fn jpeg_header_reports_the_desktop_size_as_the_source() {
+        let header = jpeg_frame_header(7, 1920, 1080);
+        let parsed: serde_json::Value = serde_json::from_str(&header).unwrap();
+        assert_eq!(parsed["source_width"], 1920);
+        assert_eq!(parsed["source_height"], 1080);
+        assert_eq!(parsed["codec"], "jpeg");
+    }
+
+    fn pipeline(encoding: PipelineEncoding, width: Option<u32>, height: Option<u32>) -> String {
+        gstreamer_pipeline_args(42, 30, encoding, width, height).join(" ")
+    }
+
+    fn h264(encoder: H264Encoder) -> PipelineEncoding {
+        PipelineEncoding::H264 {
+            encoder,
+            bitrate_kbps: 6000,
+            gop_size: 60,
+        }
+    }
+
+    /// A capsfilter constrains but never converts, so every property it pins
+    /// which `videoconvert` cannot change on its own needs its own converter
+    /// upstream. Without `videorate` the framerate constraint alone travels
+    /// back to `pipewiresrc`, which then fails to negotiate with the portal and
+    /// the stream silently degrades to the grim fallback.
+    #[test]
+    fn pipeline_can_convert_everything_the_capsfilter_pins() {
+        let cases = [
+            pipeline(h264(H264Encoder::Nvenc), None, None),
+            pipeline(h264(H264Encoder::Nvenc), Some(1280), Some(720)),
+            pipeline(h264(H264Encoder::X264), Some(1280), Some(720)),
+            pipeline(PipelineEncoding::Jpeg { quality: 70 }, None, None),
+            pipeline(PipelineEncoding::Jpeg { quality: 70 }, Some(960), Some(540)),
+        ];
+        for pipeline in cases {
+            let caps = pipeline
+                .find("video/x-raw")
+                .expect("raw capsfilter is present");
+            let upstream = &pipeline[..caps];
+            for converter in ["videorate", "videoscale", "videoconvert"] {
+                assert!(
+                    upstream.contains(converter),
+                    "{converter} missing upstream of the capsfilter in: {pipeline}"
+                );
+            }
+            // The frame rate is bounded by videorate instead, so pinning it in
+            // the capsfilter would over-constrain the source for nothing.
+            assert!(
+                !pipeline.contains("framerate="),
+                "capsfilter must not pin a framerate: {pipeline}"
+            );
+            assert!(pipeline.contains("max-rate=30"), "{pipeline}");
+            assert!(pipeline.contains("pixel-aspect-ratio=1/1"), "{pipeline}");
+        }
+    }
+
+    #[test]
+    fn h264_pipeline_never_drops_encoded_frames() {
+        let nvenc = pipeline(h264(H264Encoder::Nvenc), None, None);
+        let encoder = nvenc.find("nvh264enc").expect("encoder is present");
+        // Backpressure may only drop raw frames, never encoded ones: a dropped
+        // encoded frame breaks every frame that references it.
+        assert!(nvenc[..encoder].contains("leaky=downstream"), "{nvenc}");
+        assert!(!nvenc[encoder..].contains("leaky="), "{nvenc}");
+        // Annex-B with SPS/PPS ahead of every IDR is what the phone decodes.
+        assert!(nvenc.contains("repeat-sequence-header=true"), "{nvenc}");
+        assert!(nvenc.contains("h264parse config-interval=-1"), "{nvenc}");
+        assert!(
+            nvenc.contains("video/x-h264,stream-format=byte-stream,alignment=au"),
+            "{nvenc}"
+        );
+        assert!(nvenc.contains("bframes=0"), "{nvenc}");
+        assert!(nvenc.contains("format=NV12"), "{nvenc}");
+        assert!(pipeline(h264(H264Encoder::X264), None, None).contains("format=I420"));
+    }
+
+    /// Annex-B NAL unit with a four-byte start code. `header` is the raw NAL
+    /// header byte, `first` the byte after it (its top bit carries
+    /// `first_mb_in_slice == 0` for slices).
+    fn nal(header: u8, first: u8, payload: &[u8]) -> Vec<u8> {
+        let mut unit = vec![0, 0, 0, 1, header, first];
+        unit.extend_from_slice(payload);
+        unit
+    }
+
+    fn short_nal(header: u8, first: u8, payload: &[u8]) -> Vec<u8> {
+        let mut unit = vec![0, 0, 1, header, first];
+        unit.extend_from_slice(payload);
+        unit
+    }
+
+    fn aud() -> Vec<u8> {
+        nal(0x09, 0x10, &[])
+    }
+
+    fn sps() -> Vec<u8> {
+        nal(0x67, 0x64, &[0x00, 0x28])
+    }
+
+    fn pps() -> Vec<u8> {
+        nal(0x68, 0xeb, &[0xe3, 0xcb])
+    }
+
+    fn idr() -> Vec<u8> {
+        nal(0x65, 0x88, &[1, 2, 3, 4])
+    }
+
+    fn slice() -> Vec<u8> {
+        nal(0x41, 0x9a, &[5, 6, 7, 8])
+    }
+
+    #[test]
+    fn splits_annex_b_access_units() {
+        let mut reader = AnnexBStreamReader::new();
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&aud());
+        stream.extend_from_slice(&sps());
+        stream.extend_from_slice(&pps());
+        stream.extend_from_slice(&idr());
+        let keyframe_len = stream.len();
+        stream.extend_from_slice(&aud());
+        stream.extend_from_slice(&slice());
+
+        let units = reader.push(&stream);
+        // The trailing access unit stays buffered until the next one starts.
+        assert_eq!(units.len(), 1);
+        assert!(units[0].key_frame);
+        assert_eq!(units[0].data.len(), keyframe_len);
+        let mut parameter_sets = sps();
+        parameter_sets.extend_from_slice(&pps());
+        assert_eq!(
+            units[0].parameter_sets.as_deref(),
+            Some(&parameter_sets[..])
+        );
+
+        let mut tail = aud();
+        tail.extend_from_slice(&slice());
+        let units = reader.push(&tail);
+        assert_eq!(units.len(), 1);
+        assert!(!units[0].key_frame);
+        assert!(units[0].parameter_sets.is_none());
+    }
+
+    #[test]
+    fn flushes_the_buffered_picture_when_the_producer_goes_idle() {
+        let mut reader = AnnexBStreamReader::new();
+        let mut stream = aud();
+        stream.extend_from_slice(&sps());
+        stream.extend_from_slice(&pps());
+        stream.extend_from_slice(&idr());
+
+        assert!(reader.push(&stream).is_empty());
+        assert!(reader.has_pending_picture());
+        let unit = reader.flush_pending().expect("buffered keyframe");
+        assert!(unit.key_frame);
+        assert_eq!(unit.data, stream);
+        assert!(unit.parameter_sets.is_some());
+
+        // Nothing is left to flush, and a parameter-set-only tail is never
+        // mistaken for a picture.
+        assert!(!reader.has_pending_picture());
+        assert!(reader.flush_pending().is_none());
+        assert!(reader.push(&sps()).is_empty());
+        assert!(!reader.has_pending_picture());
+        assert!(reader.flush_pending().is_none());
+    }
+
+    #[test]
+    fn splits_annex_b_units_across_buffer_reads() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&aud());
+        stream.extend_from_slice(&sps());
+        stream.extend_from_slice(&pps());
+        stream.extend_from_slice(&idr());
+        let keyframe = stream.clone();
+        stream.extend_from_slice(&aud());
+        stream.extend_from_slice(&slice());
+        let second = stream[keyframe.len()..].to_vec();
+        stream.extend_from_slice(&aud());
+        stream.extend_from_slice(&slice());
+
+        // Every possible split point must yield the same two access units,
+        // including cuts that land in the middle of a start code.
+        for split in 1..stream.len() {
+            let mut reader = AnnexBStreamReader::new();
+            let mut units = reader.push(&stream[..split]);
+            units.extend(reader.push(&stream[split..]));
+            assert_eq!(units.len(), 2, "split at {split}");
+            assert_eq!(units[0].data, keyframe, "split at {split}");
+            assert!(units[0].key_frame, "split at {split}");
+            assert_eq!(units[1].data, second, "split at {split}");
+            assert!(!units[1].key_frame, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn accepts_three_and_four_byte_start_codes() {
+        let mut reader = AnnexBStreamReader::new();
+        let mut stream = short_nal(0x67, 0x64, &[0x00, 0x28]);
+        stream.extend_from_slice(&short_nal(0x68, 0xeb, &[0xe3, 0xcb]));
+        stream.extend_from_slice(&short_nal(0x65, 0x88, &[1, 2, 3, 4]));
+        let keyframe_len = stream.len();
+        stream.extend_from_slice(&sps());
+        stream.extend_from_slice(&idr());
+
+        let units = reader.push(&stream);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].data.len(), keyframe_len);
+        assert!(units[0].key_frame);
+        let mut parameter_sets = short_nal(0x67, 0x64, &[0x00, 0x28]);
+        parameter_sets.extend_from_slice(&short_nal(0x68, 0xeb, &[0xe3, 0xcb]));
+        assert_eq!(
+            units[0].parameter_sets.as_deref(),
+            Some(&parameter_sets[..])
+        );
+    }
+
+    #[test]
+    fn keeps_multi_slice_pictures_in_one_access_unit() {
+        let mut reader = AnnexBStreamReader::new();
+        let mut stream = nal(0x41, 0x9a, &[1, 2]);
+        // Second slice of the same picture: first_mb_in_slice != 0.
+        stream.extend_from_slice(&nal(0x41, 0x0a, &[3, 4]));
+        stream.extend_from_slice(&nal(0x41, 0x0a, &[5, 6]));
+        let picture_len = stream.len();
+        stream.extend_from_slice(&nal(0x41, 0x9a, &[7, 8]));
+        stream.extend_from_slice(&nal(0x41, 0x0a, &[9, 10]));
+
+        let units = reader.push(&stream);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].data.len(), picture_len);
+    }
+
+    #[test]
+    fn ignores_leading_bytes_before_the_first_start_code() {
+        let mut reader = AnnexBStreamReader::new();
+        let mut stream = vec![0xde, 0xad, 0xbe, 0xef];
+        stream.extend_from_slice(&aud());
+        stream.extend_from_slice(&idr());
+        let keyframe = stream[4..].to_vec();
+        stream.extend_from_slice(&aud());
+        stream.extend_from_slice(&slice());
+
+        let units = reader.push(&stream);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].data, keyframe);
+    }
+
+    #[test]
+    fn maps_legacy_quality_and_explicit_bitrate() {
+        assert_eq!(resolve_bitrate_kbps(Some(4500), 1920, 1080, 30, 70), 4500);
+        assert_eq!(
+            resolve_bitrate_kbps(Some(90_000), 1920, 1080, 30, 70),
+            40_000
+        );
+        // Unknown portal geometry falls back to 1080p so the estimate stays sane.
+        assert_eq!(
+            resolve_bitrate_kbps(None, 0, 0, 30, 70),
+            resolve_bitrate_kbps(None, 1920, 1080, 30, 70)
+        );
+        let quality_70 = resolve_bitrate_kbps(None, 1920, 1080, 30, 70);
+        assert!((5_000..=9_000).contains(&quality_70), "{quality_70}");
+        assert!(resolve_bitrate_kbps(None, 1920, 1080, 30, 92) > quality_70);
+        assert!(resolve_bitrate_kbps(None, 1920, 1080, 30, 35) < quality_70);
+    }
+
+    #[test]
+    fn clamps_keyframe_interval_and_dimensions() {
+        assert_eq!(keyframe_interval(30), 60);
+        assert_eq!(keyframe_interval(1), 15);
+        assert_eq!(keyframe_interval(60), 120);
+        assert_eq!(even_dimension(1081), 1080);
+        assert_eq!(even_dimension(1080), 1080);
+        assert_eq!(even_dimension(1), 2);
+    }
 
     #[test]
     fn parses_concatenated_jpeg_frames() {

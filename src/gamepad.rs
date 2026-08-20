@@ -1,26 +1,16 @@
 use crate::protocol::ButtonState;
+use crate::uinput::{
+    BUS_USB, EV_ABS, EV_KEY, EV_SYN, InputEvent, SYN_REPORT, UINPUT_PATH, UInputUserDev,
+    ioctl_noarg, set_absbit, set_evbit, set_keybit, ui_dev_create, ui_dev_destroy, write_struct,
+};
 use anyhow::{Context, bail};
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::Write,
-    mem::{self, size_of},
-    os::fd::AsRawFd,
     path::Path,
 };
 use tracing::{debug, info, warn};
-
-const UINPUT_PATH: &str = "/dev/uinput";
-const UINPUT_IOCTL_BASE: u8 = b'U';
-const UINPUT_MAX_NAME_SIZE: usize = 80;
-const ABS_CNT: usize = 0x40;
-
-const EV_SYN: u16 = 0x00;
-const EV_KEY: u16 = 0x01;
-const EV_ABS: u16 = 0x03;
-const SYN_REPORT: u16 = 0x00;
-
-const BUS_USB: u16 = 0x03;
 
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
@@ -308,134 +298,12 @@ impl Drop for VirtualGamepadBackend {
     }
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct InputId {
-    bustype: u16,
-    vendor: u16,
-    product: u16,
-    version: u16,
-}
-
-#[repr(C)]
-struct UInputUserDev {
-    name: [u8; UINPUT_MAX_NAME_SIZE],
-    id: InputId,
-    ff_effects_max: u32,
-    absmax: [i32; ABS_CNT],
-    absmin: [i32; ABS_CNT],
-    absfuzz: [i32; ABS_CNT],
-    absflat: [i32; ABS_CNT],
-}
-
-impl UInputUserDev {
-    fn named(name: &str) -> Self {
-        let mut device = Self {
-            name: [0; UINPUT_MAX_NAME_SIZE],
-            id: InputId {
-                bustype: 0,
-                vendor: 0,
-                product: 0,
-                version: 0,
-            },
-            ff_effects_max: 0,
-            absmax: [0; ABS_CNT],
-            absmin: [0; ABS_CNT],
-            absfuzz: [0; ABS_CNT],
-            absflat: [0; ABS_CNT],
-        };
-        let bytes = name.as_bytes();
-        let len = bytes.len().min(UINPUT_MAX_NAME_SIZE - 1);
-        device.name[..len].copy_from_slice(&bytes[..len]);
-        device
-    }
-}
-
-#[repr(C)]
-struct InputEvent {
-    time: libc::timeval,
-    event_type: u16,
-    code: u16,
-    value: i32,
-}
-
 fn configure_axis(device: &mut UInputUserDev, code: u16, min: i32, max: i32, flat: i32, fuzz: i32) {
     let index = code as usize;
     device.absmin[index] = min;
     device.absmax[index] = max;
     device.absflat[index] = flat;
     device.absfuzz[index] = fuzz;
-}
-
-fn write_struct<T>(file: &mut File, value: &T) -> anyhow::Result<()> {
-    let bytes =
-        unsafe { std::slice::from_raw_parts(value as *const T as *const u8, mem::size_of::<T>()) };
-    file.write_all(bytes).map_err(Into::into)
-}
-
-fn set_evbit(file: &File, code: u16) -> anyhow::Result<()> {
-    ioctl_int(file, ui_set_evbit(), code)
-}
-
-fn set_keybit(file: &File, code: u16) -> anyhow::Result<()> {
-    ioctl_int(file, ui_set_keybit(), code)
-}
-
-fn set_absbit(file: &File, code: u16) -> anyhow::Result<()> {
-    ioctl_int(file, ui_set_absbit(), code)
-}
-
-fn ioctl_int(file: &File, request: libc::c_ulong, value: u16) -> anyhow::Result<()> {
-    let result = unsafe { libc::ioctl(file.as_raw_fd(), request, value as libc::c_int) };
-    if result < 0 {
-        Err(std::io::Error::last_os_error()).context("uinput ioctl failed")
-    } else {
-        Ok(())
-    }
-}
-
-fn ioctl_noarg(file: &File, request: libc::c_ulong) -> anyhow::Result<()> {
-    let result = unsafe { libc::ioctl(file.as_raw_fd(), request) };
-    if result < 0 {
-        Err(std::io::Error::last_os_error()).context("uinput ioctl failed")
-    } else {
-        Ok(())
-    }
-}
-
-fn ui_dev_create() -> libc::c_ulong {
-    ioc(0, UINPUT_IOCTL_BASE, 1, 0)
-}
-
-fn ui_dev_destroy() -> libc::c_ulong {
-    ioc(0, UINPUT_IOCTL_BASE, 2, 0)
-}
-
-fn ui_set_evbit() -> libc::c_ulong {
-    iow(UINPUT_IOCTL_BASE, 100, size_of::<libc::c_int>())
-}
-
-fn ui_set_keybit() -> libc::c_ulong {
-    iow(UINPUT_IOCTL_BASE, 101, size_of::<libc::c_int>())
-}
-
-fn ui_set_absbit() -> libc::c_ulong {
-    iow(UINPUT_IOCTL_BASE, 103, size_of::<libc::c_int>())
-}
-
-fn iow(io_type: u8, nr: u8, size: usize) -> libc::c_ulong {
-    ioc(1, io_type, nr, size)
-}
-
-fn ioc(dir: u8, io_type: u8, nr: u8, size: usize) -> libc::c_ulong {
-    const NRSHIFT: u32 = 0;
-    const TYPESHIFT: u32 = 8;
-    const SIZESHIFT: u32 = 16;
-    const DIRSHIFT: u32 = 30;
-    ((dir as libc::c_ulong) << DIRSHIFT)
-        | ((io_type as libc::c_ulong) << TYPESHIFT)
-        | ((nr as libc::c_ulong) << NRSHIFT)
-        | ((size as libc::c_ulong) << SIZESHIFT)
 }
 
 fn button_code(button: &str) -> anyhow::Result<u16> {
