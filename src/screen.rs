@@ -613,8 +613,8 @@ async fn run_portal_stream(
         backend: "wayland-screencast-portal".into(),
         width: portal.width.unwrap_or(0),
         height: portal.height.unwrap_or(0),
-        x: 0,
-        y: 0,
+        x: portal.position.0,
+        y: portal.position.1,
         scale: 1.0,
         focused: true,
     };
@@ -1223,6 +1223,8 @@ struct PortalScreenCastSession {
     stream_id: u32,
     width: Option<u32>,
     height: Option<u32>,
+    /// Origin of the captured source on the desktop, for absolute pointing.
+    position: (i32, i32),
     pipewire_fd: OwnedFd,
     restore_token: Option<String>,
     connection: Option<zbus::Connection>,
@@ -1241,11 +1243,10 @@ impl PortalScreenCastSession {
         .await
         .context("ScreenCast portal not available")?;
 
+        let create_token = format!("waypad_create_{}", portal_token());
+        let mut create_stream = subscribe_portal_request(&connection, &create_token).await?;
         let mut create_options = HashMap::<&str, OwnedValue>::new();
-        create_options.insert(
-            "handle_token",
-            Value::from(format!("waypad_create_{}", portal_token())).try_into()?,
-        );
+        create_options.insert("handle_token", Value::from(create_token).try_into()?);
         let session_token = format!("waypad_screen_{}", portal_token());
         create_options.insert(
             "session_handle_token",
@@ -1256,8 +1257,8 @@ impl PortalScreenCastSession {
             create_options.insert("restore_token", Value::from(token.as_str()).try_into()?);
             info!("portal restore_token provided, attempting session restoration");
         }
-        let create_handle: OwnedObjectPath = proxy.call("CreateSession", &(create_options)).await?;
-        let create_response = wait_request(&connection, &create_handle).await?;
+        let _: OwnedObjectPath = proxy.call("CreateSession", &(create_options)).await?;
+        let create_response = await_portal_response(&mut create_stream).await?;
         if create_response.response != 0 {
             bail!("Portal permission denied while creating ScreenCast session");
         }
@@ -1277,29 +1278,27 @@ impl PortalScreenCastSession {
             select_options.insert("multiple", Value::from(false).try_into()?);
             select_options.insert("cursor_mode", Value::from(2u32).try_into()?);
             select_options.insert("persist_mode", Value::from(2u32).try_into()?);
-            select_options.insert(
-                "handle_token",
-                Value::from(format!("waypad_select_{}", portal_token())).try_into()?,
-            );
-            let select_handle: OwnedObjectPath = proxy
+            let select_token = format!("waypad_select_{}", portal_token());
+            let mut select_stream = subscribe_portal_request(&connection, &select_token).await?;
+            select_options.insert("handle_token", Value::from(select_token).try_into()?);
+            let _: OwnedObjectPath = proxy
                 .call("SelectSources", &(&session_handle, select_options))
                 .await?;
-            let select_response = wait_request(&connection, &select_handle).await?;
+            let select_response = await_portal_response(&mut select_stream).await?;
             if select_response.response != 0 {
                 bail!("ScreenCast source selection was denied by the portal");
             }
             None
         };
 
+        let start_token = format!("waypad_start_{}", portal_token());
+        let mut start_stream = subscribe_portal_request(&connection, &start_token).await?;
         let mut start_options = HashMap::<&str, OwnedValue>::new();
-        start_options.insert(
-            "handle_token",
-            Value::from(format!("waypad_start_{}", portal_token())).try_into()?,
-        );
-        let start_handle: OwnedObjectPath = proxy
+        start_options.insert("handle_token", Value::from(start_token).try_into()?);
+        let _: OwnedObjectPath = proxy
             .call("Start", &(&session_handle, "", start_options))
             .await?;
-        let start_response = wait_request(&connection, &start_handle).await?;
+        let start_response = await_portal_response(&mut start_stream).await?;
         if start_response.response != 0 {
             bail!("ScreenCast portal approval was denied or cancelled");
         }
@@ -1313,6 +1312,7 @@ impl PortalScreenCastSession {
             .next()
             .context("ScreenCast portal returned an empty stream list")?;
         let (width, height) = stream_size(&properties);
+        let position = stream_position(&properties);
 
         let saved_token = new_restore_token.or_else(|| {
             start_response
@@ -1335,6 +1335,7 @@ impl PortalScreenCastSession {
             stream_id,
             width,
             height,
+            position,
             pipewire_fd,
             restore_token: saved_token,
             connection: Some(connection),
@@ -1912,18 +1913,37 @@ impl AnnexBStreamReader {
     }
 }
 
-async fn wait_request(
+/// Subscribes to a portal request's `Response` before the request exists.
+///
+/// The portal can emit `Response` before the method call that creates the
+/// request has even returned, and does exactly that once a permission has been
+/// persisted and no dialog needs to be shown. Subscribing afterwards misses the
+/// signal and then waits out the full timeout for something that already
+/// happened. The request path is therefore derived from the token up front,
+/// which is the reason the portal API accepts a `handle_token` at all.
+async fn subscribe_portal_request(
     connection: &zbus::Connection,
-    handle: &OwnedObjectPath,
-) -> anyhow::Result<PortalResponse> {
+    token: &str,
+) -> anyhow::Result<zbus::proxy::SignalStream<'static>> {
+    let unique = connection
+        .unique_name()
+        .map(|name| name.as_str().to_string())
+        .unwrap_or_default();
+    let sender = unique.trim_start_matches(':').replace('.', "_");
+    let path = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
     let proxy = zbus::Proxy::new(
         connection,
         "org.freedesktop.portal.Desktop",
-        handle.as_str(),
+        path,
         "org.freedesktop.portal.Request",
     )
     .await?;
-    let mut stream = proxy.receive_signal("Response").await?;
+    Ok(proxy.receive_signal("Response").await?)
+}
+
+async fn await_portal_response(
+    stream: &mut zbus::proxy::SignalStream<'static>,
+) -> anyhow::Result<PortalResponse> {
     let message = timeout(Duration::from_secs(60), stream.next())
         .await
         .context("Timed out waiting for portal response")?
@@ -1944,14 +1964,37 @@ fn owned_value_to_streams(value: &OwnedValue) -> Option<Vec<(u32, HashMap<String
     value.try_clone().ok()?.try_into().ok()
 }
 
+/// Reads the source size the portal reports for a stream.
+///
+/// The portal declares `size` as a pair of *signed* 32-bit integers, so asking
+/// zvariant for `(u32, u32)` fails on a signature mismatch and silently drops
+/// the dimensions. That is not a cosmetic loss: the client would receive a 0x0
+/// source size, leaving the decoder with no format to configure and the touch
+/// mapping with nothing to map against.
 fn stream_size(properties: &HashMap<String, OwnedValue>) -> (Option<u32>, Option<u32>) {
-    let Some(value) = properties.get("size") else {
-        return (None, None);
-    };
-    if let Ok((width, height)) = value.try_clone().and_then(TryInto::try_into) {
-        return (Some(width), Some(height));
+    match stream_int_pair(properties, "size") {
+        Some((width, height)) if width > 0 && height > 0 => {
+            (Some(width as u32), Some(height as u32))
+        }
+        _ => (None, None),
     }
-    (None, None)
+}
+
+/// Reads where the captured source sits on the desktop.
+///
+/// Absolute pointer commands are in desktop coordinates, so a stream of the
+/// second monitor needs its origin added or every touch lands on the first one.
+fn stream_position(properties: &HashMap<String, OwnedValue>) -> (i32, i32) {
+    stream_int_pair(properties, "position").unwrap_or((0, 0))
+}
+
+fn stream_int_pair(properties: &HashMap<String, OwnedValue>, key: &str) -> Option<(i32, i32)> {
+    let value = properties.get(key)?;
+    if let Ok(pair) = value.try_clone().ok()?.try_into() {
+        return Some(pair);
+    }
+    let (width, height): (u32, u32) = value.try_clone().ok()?.try_into().ok()?;
+    Some((width as i32, height as i32))
 }
 
 // ============================================================
@@ -2131,18 +2174,17 @@ pub async fn authorize_portal() -> anyhow::Result<String> {
     .await
     .context("ScreenCast portal not available")?;
 
+    let create_token = format!("waypad_auth_create_{}", portal_token());
+    let mut create_stream = subscribe_portal_request(&connection, &create_token).await?;
     let mut create_options = HashMap::<&str, OwnedValue>::new();
-    create_options.insert(
-        "handle_token",
-        Value::from(format!("waypad_auth_create_{}", portal_token())).try_into()?,
-    );
+    create_options.insert("handle_token", Value::from(create_token).try_into()?);
     create_options.insert(
         "session_handle_token",
         Value::from(format!("waypad_auth_session_{}", portal_token())).try_into()?,
     );
 
-    let create_handle: OwnedObjectPath = proxy.call("CreateSession", &(create_options)).await?;
-    let create_response = wait_request(&connection, &create_handle).await?;
+    let _: OwnedObjectPath = proxy.call("CreateSession", &(create_options)).await?;
+    let create_response = await_portal_response(&mut create_stream).await?;
     if create_response.response != 0 {
         bail!("Portal permission denied while creating ScreenCast authorization");
     }
@@ -2158,27 +2200,25 @@ pub async fn authorize_portal() -> anyhow::Result<String> {
     select_options.insert("multiple", Value::from(false).try_into()?);
     select_options.insert("cursor_mode", Value::from(2u32).try_into()?);
     select_options.insert("persist_mode", Value::from(2u32).try_into()?);
-    select_options.insert(
-        "handle_token",
-        Value::from(format!("waypad_auth_select_{}", portal_token())).try_into()?,
-    );
-    let select_handle: OwnedObjectPath = proxy
+    let select_token = format!("waypad_auth_select_{}", portal_token());
+    let mut select_stream = subscribe_portal_request(&connection, &select_token).await?;
+    select_options.insert("handle_token", Value::from(select_token).try_into()?);
+    let _: OwnedObjectPath = proxy
         .call("SelectSources", &(&session_handle, select_options))
         .await?;
-    let select_response = wait_request(&connection, &select_handle).await?;
+    let select_response = await_portal_response(&mut select_stream).await?;
     if select_response.response != 0 {
         bail!("ScreenCast source selection was denied");
     }
 
+    let start_token = format!("waypad_auth_start_{}", portal_token());
+    let mut start_stream = subscribe_portal_request(&connection, &start_token).await?;
     let mut start_options = HashMap::<&str, OwnedValue>::new();
-    start_options.insert(
-        "handle_token",
-        Value::from(format!("waypad_auth_start_{}", portal_token())).try_into()?,
-    );
-    let start_handle: OwnedObjectPath = proxy
+    start_options.insert("handle_token", Value::from(start_token).try_into()?);
+    let _: OwnedObjectPath = proxy
         .call("Start", &(&session_handle, "", start_options))
         .await?;
-    let start_response = wait_request(&connection, &start_handle).await?;
+    let start_response = await_portal_response(&mut start_stream).await?;
     if start_response.response != 0 {
         bail!(
             "ScreenCast authorization was denied or cancelled. Approve the dialog on your desktop."
@@ -2216,8 +2256,47 @@ mod tests {
     use super::{
         AnnexBStreamReader, FrameGeometry, H264Encoder, JpegStreamReader, PipelineEncoding,
         capture_scale, even_dimension, find_marker, gstreamer_pipeline_args, is_client_disconnect,
-        jpeg_frame_header, keyframe_interval, resolve_bitrate_kbps, target_dimensions,
+        jpeg_frame_header, keyframe_interval, resolve_bitrate_kbps, stream_position, stream_size,
+        target_dimensions,
     };
+    use std::collections::HashMap;
+    use zbus::zvariant::{OwnedValue, Value};
+
+    fn portal_properties(key: &str, pair: (i32, i32)) -> HashMap<String, OwnedValue> {
+        let mut properties = HashMap::new();
+        let value = Value::from((pair.0, pair.1));
+        properties.insert(key.to_string(), OwnedValue::try_from(value).unwrap());
+        properties
+    }
+
+    #[test]
+    fn reads_the_signed_integer_pair_the_screencast_portal_actually_sends() {
+        // The portal declares size and position as (ii). Asking zvariant for
+        // (u32, u32) fails the signature check and silently yields nothing,
+        // which left the client with a 0x0 source and a black picture.
+        let properties = portal_properties("size", (1920, 1080));
+        assert_eq!(stream_size(&properties), (Some(1920), Some(1080)));
+    }
+
+    #[test]
+    fn treats_a_degenerate_portal_size_as_unknown() {
+        assert_eq!(
+            stream_size(&portal_properties("size", (0, 0))),
+            (None, None)
+        );
+        assert_eq!(stream_size(&HashMap::new()), (None, None));
+    }
+
+    #[test]
+    fn reads_the_source_origin_for_absolute_pointing() {
+        // A stream of the second monitor reports a non-zero origin; without it
+        // every absolute touch would land on the first monitor.
+        assert_eq!(
+            stream_position(&portal_properties("position", (1920, 0))),
+            (1920, 0)
+        );
+        assert_eq!(stream_position(&HashMap::new()), (0, 0));
+    }
 
     #[test]
     fn frame_header_carries_the_desktop_size_next_to_the_encoded_size() {
