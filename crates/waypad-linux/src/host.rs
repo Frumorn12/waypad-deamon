@@ -96,6 +96,14 @@ impl PlatformHost for LinuxHost {
     fn system_backend(&self) -> Arc<dyn SystemBackend> {
         self.system.clone()
     }
+
+    fn autostart_enabled(&self) -> anyhow::Result<bool> {
+        crate::autostart::is_enabled()
+    }
+
+    fn set_autostart(&self, enabled: bool) -> anyhow::Result<()> {
+        crate::autostart::set_enabled(enabled)
+    }
 }
 
 /// Pulls the `src` address out of `ip -4 route get`, ignoring a loopback

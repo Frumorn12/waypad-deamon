@@ -296,6 +296,18 @@ pub fn random_token() -> Result<String, CryptoError> {
     Ok(b64(&bytes))
 }
 
+/// A random token safe to put in a URL.
+///
+/// Hex rather than base64 because [`random_token`] produces standard base64,
+/// whose `+` decodes back as a space in a query string — a token containing one
+/// could never match itself. Half the density, none of the ambiguity.
+pub fn random_url_token() -> Result<String, CryptoError> {
+    let rng = SystemRandom::new();
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes)?;
+    Ok(hex::encode(bytes))
+}
+
 pub fn random_pairing_code() -> Result<String, CryptoError> {
     let rng = SystemRandom::new();
     let mut bytes = [0u8; 4];
@@ -313,6 +325,19 @@ mod tests {
         let fp = fingerprint(b"abc");
         assert!(fp.contains(':'));
         assert_eq!(fp.replace(':', ""), sha256_hex(b"abc"));
+    }
+
+    #[test]
+    fn url_tokens_survive_a_query_string_round_trip() {
+        let token = random_url_token().unwrap();
+        assert_eq!(token.len(), 64);
+        // The characters that would be mangled: `+` becomes a space, `/` ends
+        // a path segment, `=` splits a query pair.
+        assert!(
+            token.chars().all(|c| c.is_ascii_hexdigit()),
+            "not URL safe: {token}"
+        );
+        assert_ne!(token, random_url_token().unwrap());
     }
 
     #[test]

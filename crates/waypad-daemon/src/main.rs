@@ -4,8 +4,8 @@
 //! compile time and everything else is the same code on Linux and Windows.
 
 use anyhow::{Context, bail};
-use std::{path::PathBuf, sync::Arc};
-use tracing_subscriber::EnvFilter;
+use std::{io::IsTerminal, path::PathBuf, sync::Arc};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use waypad_core::{
     backend::PlatformHost,
     config::Config,
@@ -16,6 +16,7 @@ use waypad_core::{
         rotate_identity, save_trusted_devices,
     },
 };
+use waypad_ui::{LogBuffer, LogBufferLayer};
 
 #[cfg(target_os = "linux")]
 fn platform_host(paths: &StatePaths) -> Arc<dyn PlatformHost> {
@@ -31,13 +32,31 @@ fn platform_host(_paths: &StatePaths) -> Arc<dyn PlatformHost> {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = Config::load(cli.config.as_deref())?;
-    init_logging(&config.log_level);
+    let logs = LogBuffer::new();
+    init_logging(&config.log_level, logs.clone());
     let paths = StatePaths::new(&config);
     let host = platform_host(&paths);
 
     match cli.command.as_deref().unwrap_or("serve") {
         "serve" => {
-            let identity = load_or_create_identity(&paths)?;
+            let identity = Arc::new(load_or_create_identity(&paths)?);
+            let panel = waypad_ui::start(waypad_ui::PanelContext {
+                config: config.clone(),
+                paths: paths.clone(),
+                identity: identity.clone(),
+                host: host.clone(),
+                logs,
+            })
+            .await?;
+            println!("Waypad control panel: {}", panel.url());
+            // Only when a person is watching. Started from the login item there
+            // is no console and no one asked for a browser window; the tray
+            // icon is the way in then.
+            if std::io::stdout().is_terminal()
+                && let Err(err) = waypad_ui::open_in_browser(panel.url())
+            {
+                tracing::debug!(%err, "could not open the panel automatically");
+            }
             server::run(config, paths, identity, host).await
         }
         "pair-code" => {
@@ -266,13 +285,22 @@ fn devices_command(paths: &StatePaths, trailing: &[String]) -> anyhow::Result<()
     }
 }
 
-fn init_logging(default_level: &str) {
+/// Sends logs to the console and to the control panel at once.
+///
+/// The panel copy is what makes a daemon started from a login item
+/// diagnosable: it has no console, and on Windows there is no journal to fall
+/// back on either.
+fn init_logging(default_level: &str, logs: LogBuffer) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .compact()
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .compact(),
+        )
+        .with(LogBufferLayer::new(logs))
         .init();
 }
 

@@ -84,10 +84,14 @@ async fn refresh_capabilities(state: &AppState) -> Capabilities {
     capabilities
 }
 
+/// Serves the control channel until the process ends.
+///
+/// Takes the identity already shared, because the control panel holds it too:
+/// both need the fingerprint, and there is exactly one host key.
 pub async fn run(
     config: Config,
     paths: StatePaths,
-    identity: HostIdentity,
+    identity: Arc<HostIdentity>,
     host: Arc<dyn PlatformHost>,
 ) -> anyhow::Result<()> {
     let devices = load_trusted_devices(&paths)?;
@@ -103,7 +107,6 @@ pub async fn run(
         config.control_port,
         paths.clone(),
     ));
-    let identity = Arc::new(identity);
     let state = AppState {
         config: config.clone(),
         paths,
@@ -120,13 +123,11 @@ pub async fn run(
 
     let discovery_config = config.clone();
     let discovery_identity = identity;
+    let discovery_capabilities = capabilities.clone();
     tokio::spawn(async move {
-        if let Err(err) = discovery::run_discovery(
-            discovery_config,
-            discovery_identity,
-            capabilities.read().await.clone(),
-        )
-        .await
+        if let Err(err) =
+            discovery::run_discovery(discovery_config, discovery_identity, discovery_capabilities)
+                .await
         {
             warn!(%err, "discovery listener stopped");
         }

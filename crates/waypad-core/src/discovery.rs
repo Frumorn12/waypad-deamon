@@ -6,7 +6,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::{net::SocketAddr, sync::Arc};
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, sync::RwLock};
 use tracing::{debug, warn};
 
 #[derive(Debug, Serialize)]
@@ -22,10 +22,15 @@ struct DiscoveryReply<'a> {
     capture_supported: bool,
 }
 
+/// Answers discovery probes for as long as the daemon runs.
+///
+/// Takes the live capability cell rather than a snapshot, and reads it per
+/// reply. A snapshot would go stale the moment a portal was approved or a
+/// monitor was unplugged, and would advertise a backend the host no longer has.
 pub async fn run_discovery(
     config: Config,
     identity: Arc<HostIdentity>,
-    capabilities: Capabilities,
+    capabilities: Arc<RwLock<Capabilities>>,
 ) -> anyhow::Result<()> {
     let bind = format!("0.0.0.0:{}", config.discovery_port);
     let socket = UdpSocket::bind(&bind).await?;
@@ -43,16 +48,19 @@ pub async fn run_discovery(
             warn!(%peer, "rejecting discovery from non-local address");
             continue;
         }
+        // Read and released within one reply. Holding this across an await
+        // would block every writer for the life of the daemon.
+        let current = capabilities.read().await.clone();
         let reply = DiscoveryReply {
             service: "dev.waypad.daemon",
             protocol: PROTOCOL_VERSION,
             host_name: hostname(),
             control_port: config.control_port,
             host_fingerprint: &identity.fingerprint,
-            input_backend: capabilities.input.backend.clone(),
-            input_supported: capabilities.input.supported,
-            capture_backend: capabilities.capture.backend.clone(),
-            capture_supported: capabilities.capture.supported,
+            input_backend: current.input.backend.clone(),
+            input_supported: current.input.supported,
+            capture_backend: current.capture.backend.clone(),
+            capture_supported: current.capture.supported,
         };
         let raw = serde_json::to_vec(&reply)?;
         socket

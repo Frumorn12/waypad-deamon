@@ -194,6 +194,14 @@ impl PlatformHost for WindowsHost {
     fn system_backend(&self) -> Arc<dyn SystemBackend> {
         self.system.clone()
     }
+
+    fn autostart_enabled(&self) -> anyhow::Result<bool> {
+        crate::autostart::is_enabled()
+    }
+
+    fn set_autostart(&self, enabled: bool) -> anyhow::Result<()> {
+        crate::autostart::set_enabled(enabled)
+    }
 }
 
 #[cfg(test)]

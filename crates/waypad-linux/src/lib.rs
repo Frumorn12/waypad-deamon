@@ -11,6 +11,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod audio;
+pub mod autostart;
 pub mod capability;
 pub mod gamepad;
 pub mod host;

@@ -59,6 +59,20 @@ pub trait PlatformHost: Send + Sync + 'static {
     fn audio_backend(&self) -> Arc<dyn AudioBackend>;
 
     fn system_backend(&self) -> Arc<dyn SystemBackend>;
+
+    /// Whether the daemon is registered to start when the user logs in.
+    ///
+    /// Host management rather than remote control, but it belongs to the
+    /// platform all the same — a registry value on Windows, a systemd user unit
+    /// on Linux — and putting it here keeps the control panel free of any
+    /// platform code at all.
+    fn autostart_enabled(&self) -> anyhow::Result<bool>;
+
+    /// Registers or unregisters the daemon for login start.
+    ///
+    /// Per-user on both platforms: starting a remote-control daemon for every
+    /// account on the machine is not a decision one user gets to make.
+    fn set_autostart(&self, enabled: bool) -> anyhow::Result<()>;
 }
 
 /// Pointer and keyboard injection.

@@ -1312,11 +1312,11 @@ name = "waypad-ui"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "qrcode",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "waypad-core",
 ]
 
