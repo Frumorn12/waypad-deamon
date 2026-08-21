@@ -9,6 +9,7 @@
 
 #![cfg(windows)]
 
+pub mod audio;
 pub mod capture;
 pub mod encoder;
 pub mod host;

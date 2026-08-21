@@ -1,0 +1,9 @@
+# libopus reaches us through audiopus_sys, whose vendored copy still declares a
+# cmake_minimum_required that CMake 4 refuses outright. This is the escape hatch
+# CMake itself documents for exactly that case.
+#
+# Set here rather than in a build script or a README step so a plain
+# `cargo build` works on a fresh checkout, including in CI. It can go the day
+# the vendored copy is updated upstream.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

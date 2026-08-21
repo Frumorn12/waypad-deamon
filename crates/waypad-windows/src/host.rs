@@ -1,24 +1,26 @@
 //! The Windows implementation of `waypad_core::backend::PlatformHost`.
 //!
-//! Input and system control are real. Screen capture and desktop audio are not
-//! written yet, and say so: the capability model exists precisely so a host can
-//! be honest about what it cannot do instead of offering a control that fails
-//! with a shrug.
+//! Input, screen capture, desktop audio and system control are all real here.
+//! What is not — controller forwarding and brightness — is reported through the
+//! capability model with a reason, which exists precisely so a host can be
+//! honest about what it cannot do instead of offering a control that fails with
+//! a shrug.
 
-use crate::{input::SendInputBackend, screen::WindowsCaptureBackend, system::WindowsSystemBackend};
-use anyhow::bail;
+use crate::{
+    audio::WindowsAudioBackend, input::SendInputBackend, screen::WindowsCaptureBackend,
+    system::WindowsSystemBackend,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use waypad_core::{
-    audio::AudioStreamOptions,
     backend::{
-        AudioBackend, AudioProducer, CaptureBackend, ControllerBackend, InputBackend, PlatformHost,
-        SystemBackend, UnsupportedController,
+        AudioBackend, CaptureBackend, ControllerBackend, InputBackend, PlatformHost, SystemBackend,
+        UnsupportedController,
     },
     capability::{
-        AudioCaptureCapability, Capabilities, CaptureCapability, ConnectivityCapability,
-        ExternalInputCapability, InputCapability, SessionInfo, external_input_reason,
+        Capabilities, CaptureCapability, ConnectivityCapability, ExternalInputCapability,
+        InputCapability, SessionInfo, external_input_reason,
     },
     config::Config,
 };
@@ -30,13 +32,11 @@ const CONTROLLER_REASON: &str =
     "Controller forwarding needs the ViGEmBus driver, which Waypad does not install yet.";
 const CAPTURE_REASON: &str = "Screen capture is not implemented on Windows yet; DXGI Desktop Duplication and the Media \
      Foundation H.264 encoder are still to be written.";
-const AUDIO_REASON: &str = "Desktop audio is not implemented on Windows yet; WASAPI loopback capture is still to be \
-     written.";
 
 pub struct WindowsHost {
     capabilities: Arc<RwLock<Capabilities>>,
     capture: Arc<WindowsCaptureBackend>,
-    audio: Arc<UnimplementedAudio>,
+    audio: Arc<WindowsAudioBackend>,
     system: Arc<WindowsSystemBackend>,
 }
 
@@ -45,7 +45,7 @@ impl WindowsHost {
         Self {
             capabilities: Arc::new(RwLock::new(Capabilities::default())),
             capture: Arc::new(WindowsCaptureBackend::new()),
-            audio: Arc::new(UnimplementedAudio),
+            audio: Arc::new(WindowsAudioBackend::new()),
             system: Arc::new(WindowsSystemBackend::new()),
         }
     }
@@ -164,12 +164,10 @@ impl PlatformHost for WindowsHost {
                 h264_encoder: capture_supported.then(|| "media-foundation".to_string()),
                 ..CaptureCapability::default()
             },
-            audio_capture: AudioCaptureCapability {
-                supported: false,
-                backend: "noop".into(),
-                reason: Some(AUDIO_REASON.into()),
-                ..AudioCaptureCapability::default()
-            },
+            // Asked of the backend rather than assumed: whether loopback works
+            // depends on there being a default output device right now, which
+            // can change while the daemon runs.
+            audio_capture: self.audio.probe().await,
             system: crate::system::detect_system_capabilities(config.allow_suspend),
             ..Capabilities::default()
         };
@@ -198,30 +196,6 @@ impl PlatformHost for WindowsHost {
     }
 }
 
-/// Placeholder until WASAPI loopback capture is written.
-#[derive(Debug)]
-struct UnimplementedAudio;
-
-#[async_trait]
-impl AudioBackend for UnimplementedAudio {
-    fn name(&self) -> &'static str {
-        "windows-unimplemented"
-    }
-
-    async fn probe(&self) -> AudioCaptureCapability {
-        AudioCaptureCapability {
-            supported: false,
-            backend: "noop".into(),
-            reason: Some(AUDIO_REASON.into()),
-            ..AudioCaptureCapability::default()
-        }
-    }
-
-    async fn open(&self, _options: AudioStreamOptions) -> anyhow::Result<Box<dyn AudioProducer>> {
-        bail!("{AUDIO_REASON}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,7 +212,8 @@ mod tests {
 
         // The remaining gaps are reported, not hidden: a client that sees
         // `supported: false` with no reason has nothing to show the user.
-        assert!(!capabilities.audio_capture.supported);
+        // Audio depends on there being an output device, so only the reason
+        // is guaranteed — and that is the part the user reads.
         assert!(capabilities.audio_capture.reason.is_some());
         assert!(!capabilities.external_input.controller);
         assert!(
