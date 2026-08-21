@@ -5,8 +5,13 @@
 //! executable. Without it all three fall back to the generic application icon.
 
 fn main() {
-    // Only Windows executables carry resources; on Linux this is a no-op and
-    // the crate must still build without the toolchain that reads them.
+    // The *target*, not the host. `cfg!(windows)` in a build script reports the
+    // machine doing the building, so cross-compiling from Windows to Linux
+    // would otherwise try to embed a Windows resource into an ELF binary.
+    println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
     #[cfg(windows)]
     {
         println!("cargo:rerun-if-changed=assets/waypad.ico");

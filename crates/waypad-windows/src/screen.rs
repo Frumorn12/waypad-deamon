@@ -409,6 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn lists_the_monitors_as_h264_sources() {
+        crate::skip_without_desktop!();
         let backend = WindowsCaptureBackend::new();
         let sources = backend.list_sources().await.unwrap();
         assert!(!sources.is_empty(), "a desktop host has a monitor");
@@ -423,6 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "opens desktop duplication and an H.264 encoder"]
     async fn opening_an_unknown_source_falls_back_rather_than_failing() {
         // A client reconnecting after the monitor layout changed should get a
         // stream of something, not an error it cannot act on.

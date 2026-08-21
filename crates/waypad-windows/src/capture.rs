@@ -313,6 +313,7 @@ mod tests {
 
     #[test]
     fn enumerates_at_least_the_primary_monitor() {
+        crate::skip_without_desktop!();
         let outputs = enumerate_outputs().expect("enumeration succeeds on a desktop host");
         assert!(!outputs.is_empty(), "a desktop host has a monitor");
         assert!(
@@ -327,6 +328,7 @@ mod tests {
 
     #[test]
     fn source_ids_are_stable_and_backend_tagged() {
+        crate::skip_without_desktop!();
         let outputs = enumerate_outputs().unwrap();
         let source = outputs[0].to_source();
         assert!(source.id.starts_with("windows:monitor:"));
@@ -339,6 +341,7 @@ mod tests {
 
     #[test]
     fn resolve_falls_back_to_the_primary_for_an_unknown_id() {
+        crate::skip_without_desktop!();
         let resolved = resolve_output("windows:monitor:\\\\.\\NOPE").unwrap();
         assert!(resolved.primary || enumerate_outputs().unwrap().len() == 1);
     }

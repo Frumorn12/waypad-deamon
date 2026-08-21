@@ -254,6 +254,7 @@ mod tests {
 
     #[tokio::test]
     async fn capture_is_reported_as_working_now_that_it_is() {
+        crate::skip_without_desktop!();
         let host = WindowsHost::new();
         let capabilities = host.detect_capabilities(&Config::default()).await;
         assert!(capabilities.capture.supported);

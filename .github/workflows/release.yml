@@ -1,0 +1,90 @@
+name: daemon-release
+
+on:
+  push:
+    tags: ["v*"]
+  # Buildable on demand so a release can be rehearsed before a tag is cut.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: linux binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p waypad-daemon --locked
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          staging="waypad-daemon-${version}-linux-x86_64"
+          mkdir -p "$staging"
+          cp target/release/waypad-daemon "$staging/"
+          # Everything a host needs to install it without cloning the repo.
+          cp README.md LICENSE "$staging/"
+          cp systemd/waypad-daemon.service "$staging/"
+          tar czf "${staging}.tar.gz" "$staging"
+          sha256sum "${staging}.tar.gz" > "${staging}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: waypad-daemon-*-linux-x86_64.tar.gz*
+
+  windows:
+    name: windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p waypad-daemon --locked
+      # Inno Setup is not on the runner image; the compile step needs it and
+      # nothing else does, so it is installed here rather than in the matrix.
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+      - name: Compile the installer
+        shell: pwsh
+        run: |
+          $version = "${env:GITHUB_REF_NAME}" -replace '^v', ''
+          if (-not $version) { $version = "0.0.0-dev" }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" `
+            "/DAppVersion=$version" "/Odist" packaging\windows\waypad.iss
+          Get-ChildItem dist
+      - name: Checksum
+        shell: pwsh
+        run: |
+          Get-ChildItem dist\*.exe | ForEach-Object {
+            (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() + "  " + $_.Name |
+              Out-File -Encoding ascii "$($_.FullName).sha256"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  publish:
+    name: publish the release
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    # Only a tag produces a release; a manual run just leaves the artifacts.
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          body: |
+            Install the Windows host with `WaypadSetup-*.exe`. It installs for
+            the current user and asks for no administrator rights; the firewall
+            rule is an optional checkbox that raises its own prompt.
+
+            On Linux, unpack the tarball and follow the README. The Android app
+            is released separately, from the `waypad` repository, under the
+            matching tag.
