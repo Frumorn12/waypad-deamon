@@ -262,27 +262,28 @@ fn capture_loop(
     );
 
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(tuning.fps.max(1)));
-    let mut next_frame = Instant::now();
+    // Duplication is the clock. It returns only when the desktop has actually
+    // changed, so the loop is already paced by the display — and sleeping a
+    // frame interval on top of that does not slow the stream to the target, it
+    // halves it: the sleep ends just as an update lands, the acquire misses it,
+    // and the next one is a whole refresh away. `frame_interval` is used below
+    // as a ceiling on how often a frame is *kept*, never as a delay before
+    // asking for one.
+    //
+    // Dated one interval into the past so the first frame is never held back.
+    let mut last_kept = Instant::now() - frame_interval;
     // A decoder joining on a P-frame shows nothing until the next IDR, so the
     // stream is held back until the encoder's first keyframe.
     let mut waiting_for_keyframe = true;
 
     while !stop.load(Ordering::Relaxed) {
-        // Paced from now rather than from the previous deadline: a slow frame
-        // must not leave a backlog of missed ticks to catch up on.
-        let now = Instant::now();
-        if next_frame > now {
-            std::thread::sleep(next_frame - now);
-        }
-        next_frame = Instant::now() + frame_interval;
-
         if keyframe.swap(false, Ordering::Relaxed)
             && let Err(err) = state.encoder.request_key_frame()
         {
             warn!(%err, "could not force a keyframe; the stream continues without one");
         }
 
-        let encoded = match state.next_encoded() {
+        let encoded = match state.next_encoded(frame_interval, &mut last_kept) {
             Ok(Some(encoded)) => encoded,
             // Nothing changed on screen. Sending nothing is right: the client
             // holds the last picture and the link stays quiet.
@@ -341,10 +342,24 @@ impl CaptureState {
 
     /// Captures one frame if the desktop changed, and returns whatever the
     /// encoder produced from it.
-    fn next_encoded(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+    ///
+    /// A desktop that updates faster than the client asked for has its extra
+    /// frames dropped here, before anything is paid for them: the check sits
+    /// between the acquire and the conversion because converting and encoding
+    /// a frame nobody will receive is the most expensive way to do nothing.
+    fn next_encoded(
+        &mut self,
+        min_interval: Duration,
+        last_kept: &mut Instant,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
         let Some(frame) = self.duplicated.acquire(ACQUIRE_TIMEOUT_MS)? else {
             return Ok(None);
         };
+        if last_kept.elapsed() < min_interval {
+            self.duplicated.release()?;
+            return Ok(None);
+        }
+        *last_kept = Instant::now();
         let result = self.convert(&frame);
         // Released before anything else can fail: duplication hands out one
         // surface at a time, and holding it stalls the desktop for every

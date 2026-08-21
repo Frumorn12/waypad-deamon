@@ -13,6 +13,11 @@
 //! BT.709 limited range, because that is what a decoder assumes for HD when
 //! nothing says otherwise, and what the media type is tagged with.
 
+/// Threads the conversion is spread over. Past this the per-frame spawn cost
+/// starts to matter more than the work saved, and a capture path has no
+/// business taking every core on the machine anyway.
+const MAX_CONVERT_THREADS: usize = 8;
+
 /// A destination buffer sized for one NV12 frame.
 ///
 /// Reused across frames: at 1080p this is 3 MB, and reallocating it sixty times
@@ -84,17 +89,75 @@ pub fn bgra_to_nv12(
     let luma_len = dst.luma_len();
     let (luma, chroma) = dst.data.split_at_mut(luma_len);
 
-    for y in 0..dst_height {
+    // Split into bands of two destination rows. Two, because a 4:2:0 chroma
+    // row describes exactly two luma rows: any other split would have threads
+    // writing the same chroma sample.
+    let luma_bands = luma.chunks_mut(dst_width * 2);
+    let chroma_bands = chroma.chunks_mut(dst_width);
+    let mut bands: Vec<(usize, &mut [u8], &mut [u8])> = luma_bands
+        .zip(chroma_bands)
+        .enumerate()
+        .map(|(index, (l, c))| (index * 2, l, c))
+        .collect();
+
+    // One frame at 1080p is a few million independent pixels, and this is the
+    // single most expensive step in the capture path. Threads are scoped and
+    // spawned per frame: at sixty frames a second that costs tens of
+    // microseconds, against the milliseconds it saves.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(MAX_CONVERT_THREADS))
+        .unwrap_or(1)
+        .max(1);
+    let per_thread = bands.len().div_ceil(threads).max(1);
+
+    std::thread::scope(|scope| {
+        for group in bands.chunks_mut(per_thread) {
+            scope.spawn(|| {
+                for (first_row, luma_band, chroma_band) in group.iter_mut() {
+                    convert_band(
+                        src,
+                        src_width as usize,
+                        src_height as usize,
+                        src_stride,
+                        dst_width,
+                        dst_height,
+                        *first_row,
+                        luma_band,
+                        chroma_band,
+                    );
+                }
+            });
+        }
+    });
+    Ok(())
+}
+
+/// Converts the two destination rows starting at `first_row`.
+///
+/// Split out so the work can be handed to a thread whole: each band owns a
+/// distinct slice of both planes, which is what makes the parallel version
+/// need no synchronisation at all.
+#[allow(clippy::too_many_arguments)]
+fn convert_band(
+    src: &[u8],
+    src_width: usize,
+    src_height: usize,
+    src_stride: usize,
+    dst_width: usize,
+    dst_height: usize,
+    first_row: usize,
+    luma: &mut [u8],
+    chroma: &mut [u8],
+) {
+    for (offset, luma_row) in luma.chunks_mut(dst_width).enumerate() {
+        let y = first_row + offset;
         // Sampled at the centre of the destination pixel rather than its corner,
         // which keeps a downscaled picture from drifting half a pixel up and left.
-        let src_y =
-            ((y * 2 + 1) * (src_height as usize) / (dst_height * 2)).min(src_height as usize - 1);
+        let src_y = ((y * 2 + 1) * src_height / (dst_height * 2)).min(src_height - 1);
         let src_row = &src[src_y * src_stride..];
-        let luma_row = &mut luma[y * dst_width..(y + 1) * dst_width];
 
         for (x, luma_out) in luma_row.iter_mut().enumerate() {
-            let src_x =
-                ((x * 2 + 1) * (src_width as usize) / (dst_width * 2)).min(src_width as usize - 1);
+            let src_x = ((x * 2 + 1) * src_width / (dst_width * 2)).min(src_width - 1);
             let pixel = &src_row[src_x * 4..src_x * 4 + 4];
             let (b, g, r) = (pixel[0] as i32, pixel[1] as i32, pixel[2] as i32);
             *luma_out = luma_709(r, g, b);
@@ -102,14 +165,12 @@ pub fn bgra_to_nv12(
             // One chroma pair per 2x2 block, taken from the block's top-left
             // pixel. Averaging the four would be more correct and is not worth
             // the read amplification at this bitrate.
-            if y % 2 == 0 && x % 2 == 0 {
-                let index = (y / 2) * dst_width + x;
-                chroma[index] = chroma_u_709(r, g, b);
-                chroma[index + 1] = chroma_v_709(r, g, b);
+            if offset == 0 && x % 2 == 0 && x + 1 < chroma.len() {
+                chroma[x] = chroma_u_709(r, g, b);
+                chroma[x + 1] = chroma_v_709(r, g, b);
             }
         }
     }
-    Ok(())
 }
 
 // BT.709 limited range in fixed point, 1/256ths.
