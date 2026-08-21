@@ -5,7 +5,7 @@
 //! be honest about what it cannot do instead of offering a control that fails
 //! with a shrug.
 
-use crate::{input::SendInputBackend, system::WindowsSystemBackend};
+use crate::{input::SendInputBackend, screen::WindowsCaptureBackend, system::WindowsSystemBackend};
 use anyhow::bail;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -13,15 +13,14 @@ use tokio::sync::RwLock;
 use waypad_core::{
     audio::AudioStreamOptions,
     backend::{
-        AudioBackend, AudioProducer, CaptureBackend, ControllerBackend, FrameProducer,
-        InputBackend, PlatformHost, SystemBackend, UnsupportedController,
+        AudioBackend, AudioProducer, CaptureBackend, ControllerBackend, InputBackend, PlatformHost,
+        SystemBackend, UnsupportedController,
     },
     capability::{
         AudioCaptureCapability, Capabilities, CaptureCapability, ConnectivityCapability,
         ExternalInputCapability, InputCapability, SessionInfo, external_input_reason,
     },
     config::Config,
-    stream::{ScreenSource, StreamTuning},
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
@@ -36,7 +35,7 @@ const AUDIO_REASON: &str = "Desktop audio is not implemented on Windows yet; WAS
 
 pub struct WindowsHost {
     capabilities: Arc<RwLock<Capabilities>>,
-    capture: Arc<UnimplementedCapture>,
+    capture: Arc<WindowsCaptureBackend>,
     audio: Arc<UnimplementedAudio>,
     system: Arc<WindowsSystemBackend>,
 }
@@ -45,7 +44,7 @@ impl WindowsHost {
     pub fn new() -> Self {
         Self {
             capabilities: Arc::new(RwLock::new(Capabilities::default())),
-            capture: Arc::new(UnimplementedCapture),
+            capture: Arc::new(WindowsCaptureBackend::new()),
             audio: Arc::new(UnimplementedAudio),
             system: Arc::new(WindowsSystemBackend::new()),
         }
@@ -92,6 +91,12 @@ impl PlatformHost for WindowsHost {
             )
         };
         let input_supported = width > 0 && height > 0;
+        // Enumeration is cheap and is the only honest way to answer: a session
+        // with no attached output cannot be duplicated no matter what else is
+        // true of the machine.
+        let capture_supported = crate::capture::enumerate_outputs()
+            .map(|outputs| !outputs.is_empty())
+            .unwrap_or(false);
         let detected = Capabilities {
             session: SessionInfo {
                 session_type: "windows".into(),
@@ -141,9 +146,22 @@ impl PlatformHost for WindowsHost {
                 ..ConnectivityCapability::default()
             },
             capture: CaptureCapability {
-                supported: false,
-                backend: "noop".into(),
-                reason: Some(CAPTURE_REASON.into()),
+                supported: capture_supported,
+                backend: if capture_supported {
+                    "windows-dxgi".into()
+                } else {
+                    "noop".into()
+                },
+                // Nothing to approve: duplication is granted to any process in
+                // the user's own session.
+                requires_user_approval: false,
+                reason: Some(if capture_supported {
+                    CAPTURE_REASON.into()
+                } else {
+                    "Screen capture unavailable: Windows reports no monitor attached to this                      session"
+                        .to_string()
+                }),
+                h264_encoder: capture_supported.then(|| "media-foundation".to_string()),
                 ..CaptureCapability::default()
             },
             audio_capture: AudioCaptureCapability {
@@ -177,44 +195,6 @@ impl PlatformHost for WindowsHost {
 
     fn system_backend(&self) -> Arc<dyn SystemBackend> {
         self.system.clone()
-    }
-}
-
-/// Placeholder until DXGI Desktop Duplication is written.
-///
-/// Returns no sources rather than a fake one: the client then shows the
-/// capability reason instead of offering a stream that cannot start.
-#[derive(Debug)]
-struct UnimplementedCapture;
-
-#[async_trait]
-impl CaptureBackend for UnimplementedCapture {
-    fn name(&self) -> &'static str {
-        "windows-unimplemented"
-    }
-
-    async fn list_sources(&self) -> anyhow::Result<Vec<ScreenSource>> {
-        Ok(Vec::new())
-    }
-
-    async fn open(
-        &self,
-        _source: &ScreenSource,
-        _tuning: StreamTuning,
-    ) -> anyhow::Result<Box<dyn FrameProducer>> {
-        bail!("{CAPTURE_REASON}")
-    }
-
-    async fn last_error(&self) -> Option<String> {
-        Some(CAPTURE_REASON.into())
-    }
-
-    async fn announced_codec(&self, _source: &ScreenSource) -> String {
-        "jpeg".into()
-    }
-
-    fn source_origin(&self, _source: &ScreenSource) -> Option<(i32, i32)> {
-        None
     }
 }
 
@@ -256,10 +236,8 @@ mod tests {
         assert!(!capabilities.input.requires_user_approval);
         assert_eq!(capabilities.session.session_type, "windows");
 
-        // The gaps are reported, not hidden: a client that sees `supported:
-        // false` with no reason has nothing to show the user.
-        assert!(!capabilities.capture.supported);
-        assert!(capabilities.capture.reason.is_some());
+        // The remaining gaps are reported, not hidden: a client that sees
+        // `supported: false` with no reason has nothing to show the user.
         assert!(!capabilities.audio_capture.supported);
         assert!(capabilities.audio_capture.reason.is_some());
         assert!(!capabilities.external_input.controller);
@@ -292,9 +270,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unimplemented_capture_offers_no_sources_rather_than_a_broken_one() {
-        let capture = UnimplementedCapture;
-        assert!(capture.list_sources().await.unwrap().is_empty());
-        assert!(capture.last_error().await.is_some());
+    async fn capture_is_reported_as_working_now_that_it_is() {
+        let host = WindowsHost::new();
+        let capabilities = host.detect_capabilities(&Config::default()).await;
+        assert!(capabilities.capture.supported);
+        assert_eq!(capabilities.capture.backend, "windows-dxgi");
+        assert!(!capabilities.capture.requires_user_approval);
+        assert_eq!(
+            capabilities.capture.h264_encoder.as_deref(),
+            Some("media-foundation")
+        );
     }
 }

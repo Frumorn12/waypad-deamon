@@ -539,10 +539,20 @@ impl ScreenManager {
     async fn select_source(&self, requested: Option<&str>) -> anyhow::Result<ScreenSource> {
         let sources = self.list_sources().await?;
         if let Some(id) = requested.filter(|value| !value.is_empty()) {
-            return sources
-                .into_iter()
-                .find(|source| source.id == id)
-                .with_context(|| format!("Screen source not found: {id}"));
+            if let Some(found) = sources.iter().find(|source| source.id == id) {
+                return Ok(found.clone());
+            }
+            // Not an error. A phone remembers the source it last used, and that
+            // id stops existing whenever the monitor layout changes or the
+            // phone reconnects to a different host — which is how a client
+            // paired against a Linux daemon ends up asking a Windows one for
+            // `portal:chooser`. Failing here leaves the user staring at a dead
+            // end they cannot act on, while the response names the source that
+            // was actually used, so falling back tells them what they got.
+            warn!(
+                requested = %id,
+                "requested screen source is gone; falling back to the default"
+            );
         }
         if let Some(preferred) = crate::state::load_preferred_source(&self.paths)
             && let Some(source) = sources.iter().find(|source| source.id == preferred)

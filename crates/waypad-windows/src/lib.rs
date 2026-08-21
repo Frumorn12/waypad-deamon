@@ -10,7 +10,9 @@
 #![cfg(windows)]
 
 pub mod capture;
+pub mod encoder;
 pub mod host;
 pub mod input;
 pub mod nv12;
+pub mod screen;
 pub mod system;
