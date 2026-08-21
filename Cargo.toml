@@ -1,17 +1,36 @@
-[package]
-name = "waypad-daemon"
-version = "0.1.0"
+[workspace]
+resolver = "3"
+members = [
+    "crates/waypad-core",
+    "crates/waypad-ui",
+]
+
+# The platform backends are workspace members only where they can build. A
+# Linux checkout must not try to compile Win32 bindings, and a Windows checkout
+# must not try to compile zbus, so each is pulled in by the daemon through a
+# `[target.'cfg(target_os = ...)']` dependency instead of being listed here.
+exclude = []
+
+[workspace.package]
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 license = "NOASSERTION"
-description = "Secure Wayland-focused remote control daemon for Waypad"
+repository = "https://github.com/Frumorn12/waypad-host"
 
-[dependencies]
+[workspace.dependencies]
+waypad-core = { path = "crates/waypad-core" }
+waypad-linux = { path = "crates/waypad-linux" }
+waypad-windows = { path = "crates/waypad-windows" }
+waypad-ui = { path = "crates/waypad-ui" }
+
 anyhow = "1.0.102"
+async-trait = "0.1.89"
 base64 = "0.22.1"
 futures-util = "0.3.32"
 hex = "0.4.3"
 libc = "0.2.186"
+qrcode = { version = "0.14.1", default-features = false }
 ring = "0.17.14"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -24,3 +43,11 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1.23.1", features = ["v4", "serde"] }
 zbus = { version = "5.14.0", default-features = false, features = ["tokio"] }
 zvariant = "5.10.0"
+
+[profile.release]
+# The Windows installer ships this binary directly, so it is worth the longer
+# link: LTO plus one codegen unit takes the daemon well under the size where an
+# installer download starts being something a user notices.
+lto = "thin"
+codegen-units = 1
+strip = true

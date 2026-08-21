@@ -8,7 +8,7 @@
 //!
 //! It uses the daemon's own host identity, so what it proves is exactly what the daemon would do.
 
-use waypad_daemon::{
+use waypad_core::{
     config::Config,
     signal::{SignalClient, SignalEvent},
     state::{StatePaths, load_or_create_identity},

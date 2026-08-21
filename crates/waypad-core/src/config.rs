@@ -66,12 +66,30 @@ impl Config {
     }
 }
 
+/// Where the JSON config lives, following each platform's own convention
+/// rather than forcing XDG onto Windows: an installer-managed app has no
+/// business creating a `.config` directory in a Windows user profile.
+#[cfg(not(windows))]
 pub fn config_home() -> PathBuf {
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".config"))
 }
 
+#[cfg(windows)]
+pub fn config_home() -> PathBuf {
+    env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"))
+}
+
+/// Host identity, trusted devices, and pairing state.
+///
+/// Kept separate from the config directory because the contents are secrets:
+/// on Unix the directory is chmod 700, and on Windows it sits under
+/// `%LOCALAPPDATA%`, which is per-user and outside roaming profiles — a host
+/// key must not follow the user onto another machine.
+#[cfg(not(windows))]
 pub fn default_state_dir() -> PathBuf {
     env::var_os("WAYPAD_STATE_DIR")
         .map(PathBuf::from)
@@ -79,8 +97,24 @@ pub fn default_state_dir() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".local/state/waypad-daemon"))
 }
 
+#[cfg(windows)]
+pub fn default_state_dir() -> PathBuf {
+    env::var_os("WAYPAD_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Waypad").join("state"))
+        })
+        .unwrap_or_else(|| {
+            home_dir()
+                .join("AppData")
+                .join("Local")
+                .join("Waypad")
+                .join("state")
+        })
+}
+
 pub fn home_dir() -> PathBuf {
-    env::var_os("HOME")
+    env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
 }

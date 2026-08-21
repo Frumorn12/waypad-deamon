@@ -1,0 +1,22 @@
+[package]
+name = "waypad-windows"
+description = "Windows backends for the Waypad host: SendInput, DXGI Desktop Duplication, Media Foundation, WASAPI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+waypad-core.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+# Win32 bindings are added with `cargo add` so the feature list stays exactly
+# what the backends import; see crates/waypad-windows/src/lib.rs.

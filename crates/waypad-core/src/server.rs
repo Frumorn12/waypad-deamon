@@ -1,21 +1,19 @@
 use crate::{
     audio::AudioStreamOptions,
+    backend::{ControllerBackend, InputBackend, PlatformHost, SystemBackend},
     capability::Capabilities,
     config::Config,
     crypto::{HostIdentity, SecureChannel},
     discovery,
-    gamepad::ControllerInputManager,
-    input::InputManager,
     protocol::{
         ApiError, ClientSecureMessage, Command, ExternalDeviceType, ExternalInputEvent,
-        PROTOCOL_VERSION, response_empty, response_error, response_ok,
+        PROTOCOL_VERSION, SystemAction, response_empty, response_error, response_ok,
     },
-    screen::{self, ScreenManager, StreamStartOptions},
     state::{
         StatePaths, TrustedDevice, TrustedDevices, load_trusted_devices, save_trusted_devices,
         validate_pairing_code,
     },
-    system_control,
+    stream::{self, ScreenManager, StreamStartOptions},
 };
 use anyhow::Context;
 use serde_json::json;
@@ -40,8 +38,11 @@ pub struct AppState {
     pub paths: StatePaths,
     pub identity: Arc<HostIdentity>,
     pub devices: Arc<Mutex<TrustedDevices>>,
-    pub input: Arc<Mutex<InputManager>>,
-    pub gamepad: Arc<Mutex<ControllerInputManager>>,
+    /// The platform, kept so backends can be rebuilt when capabilities change.
+    pub host: Arc<dyn PlatformHost>,
+    pub input: Arc<Mutex<Box<dyn InputBackend>>>,
+    pub gamepad: Arc<Mutex<Box<dyn ControllerBackend>>>,
+    pub system: Arc<dyn SystemBackend>,
     pub capabilities: Arc<RwLock<Capabilities>>,
     pub screen: Arc<ScreenManager>,
     pub rate_limiter: Arc<Mutex<PairRateLimiter>>,
@@ -71,36 +72,33 @@ impl PairRateLimiter {
     }
 }
 
-fn controller_manager_from_capabilities(capabilities: &Capabilities) -> ControllerInputManager {
-    ControllerInputManager::new(
-        capabilities.external_input.controller,
-        capabilities
-            .external_input
-            .reason
-            .clone()
-            .unwrap_or_else(|| "Controller forwarding unsupported on this host".into()),
-    )
+/// Re-detects capabilities and rebuilds the backends that depend on them.
+///
+/// Called whenever the client asks for capabilities or an input attempt failed,
+/// because a portal approval — or a controller driver being installed — can
+/// appear at any point in a session's life.
+async fn refresh_capabilities(state: &AppState) -> Capabilities {
+    let capabilities = state.host.detect_capabilities(&state.config).await;
+    *state.capabilities.write().await = capabilities.clone();
+    *state.gamepad.lock().await = state.host.controller_backend(&capabilities);
+    capabilities
 }
 
-async fn refresh_controller_manager(state: &AppState, capabilities: &Capabilities) {
-    state.gamepad.lock().await.refresh(
-        capabilities.external_input.controller,
-        capabilities
-            .external_input
-            .reason
-            .clone()
-            .unwrap_or_else(|| "Controller forwarding unsupported on this host".into()),
-    );
-}
-
-pub async fn run(config: Config, paths: StatePaths, identity: HostIdentity) -> anyhow::Result<()> {
+pub async fn run(
+    config: Config,
+    paths: StatePaths,
+    identity: HostIdentity,
+    host: Arc<dyn PlatformHost>,
+) -> anyhow::Result<()> {
     let devices = load_trusted_devices(&paths)?;
-    let capabilities = Capabilities::detect(&config).await;
-    let input = InputManager::from_capabilities(&capabilities).await;
-    let gamepad = controller_manager_from_capabilities(&capabilities);
-    let capabilities = Arc::new(RwLock::new(capabilities.clone()));
+    let detected = host.detect_capabilities(&config).await;
+    let input = host.input_backend(&detected).await;
+    let gamepad = host.controller_backend(&detected);
+    let capabilities = Arc::new(RwLock::new(detected));
     let screen = Arc::new(ScreenManager::new(
         capabilities.clone(),
+        host.capture_backend(),
+        host.audio_backend(),
         config.control_port,
         paths.clone(),
     ));
@@ -110,8 +108,10 @@ pub async fn run(config: Config, paths: StatePaths, identity: HostIdentity) -> a
         paths,
         identity: identity.clone(),
         devices: Arc::new(Mutex::new(devices)),
+        host: host.clone(),
         input: Arc::new(Mutex::new(input)),
         gamepad: Arc::new(Mutex::new(gamepad)),
+        system: host.system_backend(),
         capabilities: capabilities.clone(),
         screen,
         rate_limiter: Arc::new(Mutex::new(PairRateLimiter::default())),
@@ -133,7 +133,7 @@ pub async fn run(config: Config, paths: StatePaths, identity: HostIdentity) -> a
 
     let bind = format!("{}:{}", config.bind_address, config.control_port);
     let listener = TcpListener::bind(&bind).await?;
-    info!("Waypad daemon listening on tcp://{bind}");
+    info!(platform = host.name(), "Waypad daemon listening on tcp://{bind}");
     loop {
         let (stream, peer) = listener.accept().await?;
         let state = state.clone();
@@ -168,6 +168,22 @@ async fn handle_connection(
     let mut authenticated: Option<TrustedDevice> = None;
     info!(%peer, "secure channel established");
 
+    let result = serve_channel(&mut channel, &state, peer, &mut authenticated).await;
+    // A client that vanishes mid-gesture leaves the host holding whatever was
+    // pressed. Releasing here is what keeps a dropped connection during a drag
+    // from wedging the desktop's mouse button.
+    if authenticated.is_some() {
+        state.input.lock().await.release_all();
+    }
+    result
+}
+
+async fn serve_channel(
+    channel: &mut SecureChannel,
+    state: &AppState,
+    peer: SocketAddr,
+    authenticated: &mut Option<TrustedDevice>,
+) -> anyhow::Result<()> {
     loop {
         let message: ClientSecureMessage = channel.recv().await?;
         match message {
@@ -178,7 +194,7 @@ async fn handle_connection(
                 app_version,
             } => {
                 let (response, device) = handle_pair(
-                    &state,
+                    state,
                     peer,
                     request_id,
                     device_name,
@@ -187,7 +203,7 @@ async fn handle_connection(
                 )
                 .await;
                 if let Some(device) = device {
-                    authenticated = Some(device);
+                    *authenticated = Some(device);
                 }
                 channel.send(&response).await?;
             }
@@ -198,9 +214,9 @@ async fn handle_connection(
                 app_version,
             } => {
                 let (response, device) =
-                    handle_auth(&state, request_id, device_id, session_token, app_version).await;
+                    handle_auth(state, request_id, device_id, session_token, app_version).await;
                 if let Some(device) = device {
-                    authenticated = Some(device);
+                    *authenticated = Some(device);
                 }
                 channel.send(&response).await?;
             }
@@ -221,7 +237,7 @@ async fn handle_connection(
                         .await?;
                     continue;
                 }
-                let response = handle_command(&state, request_id, command).await;
+                let response = handle_command(state, request_id, command).await;
                 channel.send(&response).await?;
             }
             ClientSecureMessage::Ping { request_id } => {
@@ -374,7 +390,7 @@ async fn handle_pair(
             json!({
                 "device_id": device_id,
                 "session_token": token,
-                "host_name": discovery::hostname(),
+                "host_name": state.host.hostname(),
                 "host_fingerprint": state.identity.fingerprint,
                 "capabilities": capabilities
             }),
@@ -408,7 +424,7 @@ async fn handle_auth(
                 request_id,
                 json!({
                     "authenticated": true,
-                    "host_name": discovery::hostname(),
+                    "host_name": state.host.hostname(),
                     "capabilities": capabilities
                 }),
             ),
@@ -442,25 +458,22 @@ async fn handle_command(
                 "protocol": PROTOCOL_VERSION
             }))),
             Command::GetHostInfo => Ok(Some(json!({
-                "host_name": discovery::hostname(),
+                "host_name": state.host.hostname(),
                 "host_fingerprint": state.identity.fingerprint,
+                "platform": state.host.name(),
                 "protocol": PROTOCOL_VERSION
             }))),
-            Command::GetCapabilities => {
-                let capabilities = Capabilities::detect(&state.config).await;
-                *state.capabilities.write().await = capabilities.clone();
-                refresh_controller_manager(state, &capabilities).await;
-                Ok(Some(json!(capabilities)))
-            }
+            Command::GetCapabilities => Ok(Some(json!(refresh_capabilities(state).await))),
             Command::PrepareInput => {
                 let mut input = state.input.lock().await;
                 match input.prepare().await {
                     Ok(value) => Ok(Some(value)),
                     Err(first_error) => {
-                        let capabilities = Capabilities::detect(&state.config).await;
-                        *state.capabilities.write().await = capabilities.clone();
-                        refresh_controller_manager(state, &capabilities).await;
-                        *input = InputManager::from_capabilities(&capabilities).await;
+                        // An approval may have appeared, or the previous
+                        // backend may have gone stale; rebuild once and retry
+                        // before reporting failure to the user.
+                        let capabilities = refresh_capabilities(state).await;
+                        *input = state.host.input_backend(&capabilities).await;
                         input.prepare().await.map(Some).map_err(|second_error| {
                             anyhow::anyhow!("{first_error}; after refresh: {second_error}")
                         })
@@ -473,10 +486,13 @@ async fn handle_command(
                 Ok(None)
             }
             Command::PointerMoveAbsolute { source_id, x, y } => {
-                validate_absolute(x, y)?;
                 let source = state.screen.source_by_id(source_id.as_deref()).await?;
+                let origin = match source.as_ref() {
+                    Some(source) => state.screen.source_origin(source).await,
+                    None => None,
+                };
                 let input = state.input.lock().await;
-                screen::pointer_move_absolute(&input, source, x, y).await?;
+                stream::pointer_move_absolute(input.as_ref(), origin, x, y).await?;
                 Ok(None)
             }
             Command::PointerButton { button, state: st } => {
@@ -501,13 +517,14 @@ async fn handle_command(
             }
             Command::Text { text } => send_text(state, text).await.map(|_| None),
             Command::Shortcut { keys } => send_shortcut(state, keys).await.map(|_| None),
-            Command::Media { action } => system_control::media(action).await.map(|_| None),
-            Command::Volume { action } => system_control::volume(action).await.map(|_| None),
-            Command::Brightness { action } => {
-                system_control::brightness(action).await.map(|_| None)
-            }
+            Command::Media { action } => state.system.media(action).await.map(|_| None),
+            Command::Volume { action } => state.system.volume(action).await.map(|_| None),
+            Command::Brightness { action } => state.system.brightness(action).await.map(|_| None),
             Command::ClipboardSet { text } => {
-                system_control::clipboard_set(&text).await.map(|_| None)
+                if text.len() > 64 * 1024 {
+                    anyhow::bail!("Clipboard text rejected: maximum length is 64 KiB");
+                }
+                state.system.clipboard_set(&text).await.map(|_| None)
             }
             Command::ListScreenSources => Ok(Some(json!({
                 "sources": state.screen.list_sources().await?
@@ -568,9 +585,15 @@ async fn handle_command(
                 state.screen.request_key_frame(&session_id).await?;
                 Ok(None)
             }
-            Command::System { action } => system_control::system(&state.config, action)
-                .await
-                .map(|_| None),
+            Command::System { action } => match action {
+                SystemAction::Lock => state.system.lock().await.map(|_| None),
+                SystemAction::Suspend => {
+                    if !state.config.allow_suspend {
+                        anyhow::bail!("Suspend is disabled by daemon configuration");
+                    }
+                    state.system.suspend().await.map(|_| None)
+                }
+            },
         }
     }
     .await;
@@ -719,19 +742,6 @@ fn validate_delta(dx: f64, dy: f64) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_absolute(x: f64, y: f64) -> anyhow::Result<()> {
-    if !x.is_finite()
-        || !y.is_finite()
-        || x < -100_000.0
-        || y < -100_000.0
-        || x > 100_000.0
-        || y > 100_000.0
-    {
-        anyhow::bail!("Absolute pointer coordinate rejected as invalid");
-    }
-    Ok(())
-}
-
 pub fn is_private_or_local(addr: SocketAddr) -> bool {
     match addr.ip() {
         IpAddr::V4(ip) => is_private_ipv4(ip),
@@ -808,5 +818,17 @@ mod tests {
     fn shortcut_map_rejects_unknown_keys() {
         assert_eq!(shortcut_key_to_keysym("ctrl").unwrap(), 0xffe3);
         assert!(shortcut_key_to_keysym("definitely-not-a-key").is_err());
+    }
+
+    #[test]
+    fn pair_rate_limiter_blocks_after_the_configured_burst() {
+        let mut limiter = PairRateLimiter::default();
+        let ip: IpAddr = "192.168.1.9".parse().unwrap();
+        for _ in 0..5 {
+            assert!(limiter.allow(ip, 5));
+        }
+        assert!(!limiter.allow(ip, 5));
+        // A different peer has its own bucket.
+        assert!(limiter.allow("192.168.1.10".parse().unwrap(), 5));
     }
 }

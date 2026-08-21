@@ -1,0 +1,31 @@
+[package]
+name = "waypad-daemon"
+description = "Secure remote-control daemon for Waypad hosts (Linux/Wayland and Windows)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "waypad-daemon"
+path = "src/main.rs"
+
+[dependencies]
+waypad-core.workspace = true
+waypad-ui.workspace = true
+
+anyhow.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# One of these is picked per host. Listing them as target dependencies rather
+# than features means a Linux build never resolves Win32 bindings and a Windows
+# build never resolves zbus, so neither platform pays for the other's stack.
+[target.'cfg(target_os = "linux")'.dependencies]
+waypad-linux.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+waypad-windows.workspace = true

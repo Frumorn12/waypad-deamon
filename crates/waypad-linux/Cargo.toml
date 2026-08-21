@@ -1,0 +1,25 @@
+[package]
+name = "waypad-linux"
+description = "Linux/Wayland backends for the Waypad host: xdg-desktop-portal, Hyprland IPC, PipeWire, uinput"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+waypad-core.workspace = true
+
+anyhow.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+zbus.workspace = true
+zvariant.workspace = true

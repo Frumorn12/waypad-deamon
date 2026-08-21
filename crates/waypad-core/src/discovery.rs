@@ -69,15 +69,35 @@ fn reply_addr(peer: SocketAddr, fallback_port: u16) -> SocketAddr {
     }
 }
 
+/// The name shown in the phone's host list.
+///
+/// Falls back rather than failing: a host with no resolvable name is still
+/// perfectly usable, and a blank entry in the client's list is worse than a
+/// generic one.
 pub fn hostname() -> String {
-    std::env::var("HOSTNAME")
+    let from_env = if cfg!(windows) {
+        std::env::var("COMPUTERNAME")
+    } else {
+        std::env::var("HOSTNAME")
+    };
+    from_env
         .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::fs::read_to_string("/etc/hostname")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "linux-host".into())
+        .filter(|value| !value.is_empty())
+        .or_else(read_system_hostname)
+        .unwrap_or_else(|| "waypad-host".into())
+}
+
+#[cfg(unix)]
+fn read_system_hostname() -> Option<String> {
+    // `HOSTNAME` is a shell variable and is usually not exported to a systemd
+    // user unit, so the file is the reliable source on Linux.
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(not(unix))]
+fn read_system_hostname() -> Option<String> {
+    None
 }
