@@ -16,6 +16,7 @@ pub struct Capabilities {
     pub external_input: ExternalInputCapability,
     pub connectivity: ConnectivityCapability,
     pub capture: CaptureCapability,
+    pub audio_capture: AudioCaptureCapability,
     pub system: SystemCapabilities,
 }
 
@@ -74,6 +75,28 @@ pub struct CaptureCapability {
     pub gstreamer_pipewire_available: bool,
     pub h264_encoder: Option<String>,
     pub hyprland_grim_available: bool,
+}
+
+/// Whether the desktop's own output can be streamed alongside the picture.
+///
+/// Reported separately from [`CaptureCapability`] on purpose: audio is optional
+/// and a host that cannot capture it still streams video, so the two must be
+/// able to disagree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioCaptureCapability {
+    pub supported: bool,
+    pub backend: String,
+    pub codec: Option<String>,
+    pub sample_rate: u32,
+    pub channels: u16,
+    /// Resolved at detection time only for diagnostics; the stream re-resolves
+    /// the default sink when it starts, so switching output devices is picked up.
+    pub default_sink: Option<String>,
+    pub monitor_source: Option<String>,
+    pub pactl_available: bool,
+    pub gstreamer_opus_available: bool,
+    pub missing_elements: Vec<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +316,7 @@ impl Capabilities {
                 h264_encoder: h264_encoder.map(ToOwned::to_owned),
                 hyprland_grim_available,
             },
+            audio_capture: detect_audio_capture(),
             system: SystemCapabilities {
                 volume: command_exists("wpctl") || command_exists("pactl"),
                 media: command_exists("playerctl"),
@@ -302,6 +326,32 @@ impl Capabilities {
                 suspend: config.allow_suspend && command_exists("systemctl"),
             },
         }
+    }
+}
+
+fn detect_audio_capture() -> AudioCaptureCapability {
+    let probe = crate::audio::probe_desktop_audio();
+    let supported = probe.supported();
+    AudioCaptureCapability {
+        supported,
+        backend: if supported {
+            "pulse-monitor-opus".into()
+        } else {
+            "noop".into()
+        },
+        codec: supported.then(|| crate::audio::AUDIO_CODEC.to_string()),
+        sample_rate: crate::audio::AUDIO_SAMPLE_RATE,
+        channels: crate::audio::AUDIO_CHANNELS,
+        default_sink: probe.default_sink.clone(),
+        monitor_source: probe.monitor_source.clone(),
+        pactl_available: probe.pactl_available,
+        gstreamer_opus_available: probe.gstreamer_available,
+        missing_elements: probe
+            .missing_elements
+            .iter()
+            .map(|element| (*element).to_string())
+            .collect(),
+        reason: Some(probe.reason()),
     }
 }
 

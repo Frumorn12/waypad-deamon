@@ -150,8 +150,39 @@ pub enum Command {
         bitrate_kbps: Option<u32>,
         max_width: Option<u32>,
         max_height: Option<u32>,
+        /// Whether desktop audio rides along on the same stream socket. Absent
+        /// means yes: clients built before audio existed still get sound, and
+        /// one that wants a silent stream says so explicitly.
+        #[serde(default)]
+        audio: Option<bool>,
+        #[serde(default)]
+        audio_bitrate_kbps: Option<u32>,
+        #[serde(default)]
+        audio_frame_ms: Option<u32>,
     },
     StopScreenStream {
+        session_id: String,
+    },
+    /// Starts desktop audio on a session whose video is already running, for a
+    /// client that opened the stream muted or with `audio: false`.
+    StartDesktopAudio {
+        session_id: String,
+        #[serde(default)]
+        bitrate_kbps: Option<u32>,
+        #[serde(default)]
+        frame_ms: Option<u32>,
+    },
+    /// Tears the audio producer down. The video stream is untouched.
+    StopDesktopAudio {
+        session_id: String,
+    },
+    /// Mutes at the source: the encoder keeps running so unmuting is instant,
+    /// but no audio envelope is sent, so a muted stream costs no bandwidth.
+    SetDesktopAudioMute {
+        session_id: String,
+        muted: bool,
+    },
+    GetDesktopAudioStatus {
         session_id: String,
     },
     /// Forces an immediate H.264 keyframe on a running session. Android needs
@@ -329,6 +360,9 @@ mod tests {
             bitrate_kbps: Some(6000),
             max_width: Some(1280),
             max_height: Some(1280),
+            audio: Some(true),
+            audio_bitrate_kbps: Some(96),
+            audio_frame_ms: Some(20),
         };
         let raw = serde_json::to_string(&command).unwrap();
         assert!(raw.contains("start_screen_stream"));
@@ -354,9 +388,38 @@ mod tests {
             legacy,
             Command::StartScreenStream {
                 bitrate_kbps: None,
+                audio: None,
                 ..
             }
         ));
+
+        let mute = Command::SetDesktopAudioMute {
+            session_id: "abc".into(),
+            muted: true,
+        };
+        let raw = serde_json::to_string(&mute).unwrap();
+        assert!(raw.contains("set_desktop_audio_mute"));
+        let decoded: Command = serde_json::from_str(&raw).unwrap();
+        assert!(matches!(
+            decoded,
+            Command::SetDesktopAudioMute { muted: true, .. }
+        ));
+
+        // The audio commands carry only what they need; the encoder knobs are
+        // optional so a client can just say "start".
+        let start_audio: Command =
+            serde_json::from_str(r#"{"name":"start_desktop_audio","session_id":"abc"}"#).unwrap();
+        assert!(matches!(
+            start_audio,
+            Command::StartDesktopAudio {
+                bitrate_kbps: None,
+                frame_ms: None,
+                ..
+            }
+        ));
+        let stop_audio: Command =
+            serde_json::from_str(r#"{"name":"stop_desktop_audio","session_id":"abc"}"#).unwrap();
+        assert!(matches!(stop_audio, Command::StopDesktopAudio { .. }));
 
         let absolute = Command::PointerMoveAbsolute {
             source_id: Some("hyprland:monitor:DP-1".into()),

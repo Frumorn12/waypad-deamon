@@ -79,6 +79,51 @@ as `capture.h264_encoder`. Note that an installed plugin is not enough: NVENC
 also needs a usable CUDA context, so the daemon probes each candidate on a
 one-buffer pipeline at startup and logs `H.264 screen encoder selected`.
 
+## Picture Works But There Is No Sound
+
+Audio is optional and deliberately cannot take the video down with it, so a
+broken audio pipeline looks exactly like a normal stream with no sound. It is
+never silent about it, though: check the capability first, then the log.
+
+```bash
+waypad-daemon doctor | grep -A11 audio_capture
+journalctl --user -u waypad-daemon | grep -i 'desktop audio'
+```
+
+`audio_capture.reason` names what is missing — `pactl` absent, a GStreamer
+element missing (the list is in `missing_elements`), or no monitor source exposed
+by any output device. If the capability is `supported: true` but there is still
+no sound, the failure happened at stream time and was logged at `error` level
+with the reason attached; it is never swallowed.
+
+`audio_capture.monitor_source` shows which device the daemon *would* capture. It
+must be the `.monitor` of your current output. The daemon re-resolves it every
+time a stream starts, so if you switched output device, restart the stream rather
+than the daemon.
+
+To confirm the capture path independently of Waypad:
+
+```bash
+pactl get-default-sink
+pactl list short sources | grep monitor
+```
+
+On the phone, the audio path logs under the `WaypadAudioPlayer` tag:
+
+```bash
+adb logcat -s WaypadAudioPlayer
+```
+
+`codec_started` and `track_started` mean the decoder and the output track came
+up. `bufferedMs` is the audio latency actually queued for the speaker and should
+sit near 100 ms; `driftMs` is the transit delay above the fastest packet of the
+session and should stay near zero. A `dropped` counter that keeps climbing means
+the link cannot keep up and the latency guard is cutting the backlog.
+
+Sound stops but the picture continues after a phone call or another app playing
+audio: that is audio focus working as intended. It resumes when the other app
+gives the focus back.
+
 ## Stream Starts But Input Fails
 
 This is a normal partial-support case. Capture and control are separate capabilities. The app can show the screen while the daemon reports that RemoteDesktop input is blocked or unsupported.

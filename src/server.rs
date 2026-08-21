@@ -1,4 +1,5 @@
 use crate::{
+    audio::AudioStreamOptions,
     capability::Capabilities,
     config::Config,
     crypto::{HostIdentity, SecureChannel},
@@ -518,6 +519,9 @@ async fn handle_command(
                 bitrate_kbps,
                 max_width,
                 max_height,
+                audio,
+                audio_bitrate_kbps,
+                audio_frame_ms,
             } => Ok(Some(json!(
                 state
                     .screen
@@ -528,12 +532,37 @@ async fn handle_command(
                         bitrate_kbps,
                         max_width,
                         max_height,
+                        audio,
+                        audio_bitrate_kbps,
+                        audio_frame_ms,
                     })
                     .await?
             ))),
             Command::StopScreenStream { session_id } => {
                 state.screen.stop_stream(&session_id).await?;
                 Ok(None)
+            }
+            Command::StartDesktopAudio {
+                session_id,
+                bitrate_kbps,
+                frame_ms,
+            } => Ok(Some(json!(
+                state
+                    .screen
+                    .start_audio(
+                        &session_id,
+                        Some(AudioStreamOptions::new(bitrate_kbps, frame_ms)),
+                    )
+                    .await?
+            ))),
+            Command::StopDesktopAudio { session_id } => {
+                Ok(Some(json!(state.screen.stop_audio(&session_id).await?)))
+            }
+            Command::SetDesktopAudioMute { session_id, muted } => Ok(Some(json!(
+                state.screen.set_audio_mute(&session_id, muted).await?
+            ))),
+            Command::GetDesktopAudioStatus { session_id } => {
+                Ok(Some(json!(state.screen.audio_status(&session_id).await?)))
             }
             Command::RequestKeyFrame { session_id } => {
                 state.screen.request_key_frame(&session_id).await?;

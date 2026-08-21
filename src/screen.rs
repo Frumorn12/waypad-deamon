@@ -1,4 +1,5 @@
 use crate::{
+    audio::{AudioStreamOptions, AudioStreamStatus, DesktopAudioStream},
     capability::Capabilities,
     input::InputManager,
     platform::{command_exists, command_output},
@@ -10,7 +11,10 @@ use serde_json::json;
 use std::{
     collections::HashMap,
     os::fd::AsRawFd,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -27,6 +31,79 @@ use zbus::zvariant::{OwnedFd, OwnedObjectPath, OwnedValue, Value};
 
 const STREAM_MAGIC_V1: &[u8] = b"WAYPAD_STREAM_V1\n";
 const STREAM_MAGIC_V2: &[u8] = b"WAYPAD_STREAM_V2\n";
+
+/// The stream socket, shared by the video producer and the optional desktop
+/// audio producer.
+///
+/// Both write whole envelopes under the same lock, so the two producers
+/// interleave on the wire without ever cutting each other's frames — which is
+/// what lets audio ride the existing connection instead of opening a second one.
+/// Audio waits only briefly for the lock and drops its packet otherwise, so it
+/// can never delay a video frame.
+#[derive(Debug)]
+pub struct StreamSocket {
+    socket: Mutex<TcpStream>,
+    magic_sent: AtomicBool,
+}
+
+impl StreamSocket {
+    pub fn new(socket: TcpStream) -> Self {
+        Self {
+            socket: Mutex::new(socket),
+            magic_sent: AtomicBool::new(false),
+        }
+    }
+
+    /// True once the handshake line naming the payload codec has been written.
+    /// Nothing may be sent before it: a client cannot frame what it cannot
+    /// identify.
+    pub fn handshake_sent(&self) -> bool {
+        self.magic_sent.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn send_magic(&self, magic: &[u8]) -> anyhow::Result<()> {
+        if self.handshake_sent() {
+            return Ok(());
+        }
+        let mut socket = self.socket.lock().await;
+        if self.handshake_sent() {
+            return Ok(());
+        }
+        socket.write_all(magic).await?;
+        self.magic_sent.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn write_all(&self, buf: &[u8], deadline: Duration) -> anyhow::Result<()> {
+        let mut socket = self.socket.lock().await;
+        timeout(deadline, socket.write_all(buf))
+            .await
+            .context("screen stream client stalled while receiving a frame")??;
+        Ok(())
+    }
+
+    /// Writes an envelope only if the socket is free, reporting `false` when the
+    /// other producer held it for longer than `lock_timeout`.
+    ///
+    /// Once the lock is taken the envelope is written whole: a partial write
+    /// would desynchronise the framing for the rest of the session.
+    pub async fn try_write_envelope(
+        &self,
+        header: &str,
+        payload: &[u8],
+        lock_timeout: Duration,
+        write_timeout: Duration,
+    ) -> anyhow::Result<bool> {
+        let Ok(mut socket) = timeout(lock_timeout, self.socket.lock()).await else {
+            return Ok(false);
+        };
+        let buf = frame_envelope(header, payload);
+        timeout(write_timeout, socket.write_all(&buf))
+            .await
+            .context("screen stream client stalled while receiving an audio packet")??;
+        Ok(true)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScreenSource {
@@ -50,6 +127,11 @@ pub struct StreamStartOptions {
     pub bitrate_kbps: Option<u32>,
     pub max_width: Option<u32>,
     pub max_height: Option<u32>,
+    /// Whether desktop audio rides along on the same socket. Absent means yes,
+    /// so a client that never learned about audio still gets it.
+    pub audio: Option<bool>,
+    pub audio_bitrate_kbps: Option<u32>,
+    pub audio_frame_ms: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,6 +149,10 @@ pub struct StreamStartResponse {
     /// screenshot backend. Surfaced so a broken fast path cannot sit unnoticed
     /// behind a fallback that merely looks slow.
     pub portal_last_error: Option<String>,
+    /// What the session will do about desktop audio. `running` only turns true
+    /// once a client attaches, because the audio producer is bound to the
+    /// stream socket.
+    pub audio: AudioStreamStatus,
 }
 
 /// Encoder knobs the Android client negotiates per session.
@@ -99,6 +185,8 @@ struct PendingStream {
     token: String,
     source: ScreenSource,
     tuning: StreamTuning,
+    audio: bool,
+    audio_options: AudioStreamOptions,
 }
 
 #[derive(Debug)]
@@ -106,6 +194,11 @@ struct RunningStream {
     stop: oneshot::Sender<()>,
     keyframe: mpsc::Sender<()>,
     task: JoinHandle<()>,
+    /// Kept so audio can be started, stopped, or muted after the fact without
+    /// disturbing the video producer that is already writing to it.
+    socket: Arc<StreamSocket>,
+    audio: Option<DesktopAudioStream>,
+    audio_options: AudioStreamOptions,
 }
 
 impl ScreenManager {
@@ -210,6 +303,17 @@ impl ScreenManager {
         };
         let session_id = Uuid::new_v4().to_string();
         let token = Uuid::new_v4().to_string();
+        let audio_options =
+            AudioStreamOptions::new(options.audio_bitrate_kbps, options.audio_frame_ms);
+        let audio_capability = self.capabilities.read().await.audio_capture.clone();
+        // Audio is opt-out rather than opt-in: it costs a fraction of the video
+        // bandwidth and a client that never heard of it still gets sound.
+        let audio_requested = options.audio.unwrap_or(true) && audio_capability.supported;
+        let audio_reason = if options.audio == Some(false) {
+            Some("Desktop audio was disabled by the client for this session".into())
+        } else {
+            audio_capability.reason.clone()
+        };
         // Hardware H.264 only rides on the PipeWire pipeline; the grim and X11
         // fallbacks stay on JPEG, so the announced codec follows the backend.
         let h264 = source.backend == "wayland-screencast-portal" && detect_h264_encoder().is_some();
@@ -236,6 +340,8 @@ impl ScreenManager {
                 token: token.clone(),
                 source: source.clone(),
                 tuning,
+                audio: audio_requested,
+                audio_options,
             }),
         );
         info!(
@@ -250,6 +356,7 @@ impl ScreenManager {
             codec = if h264 { "h264" } else { "jpeg" },
             max_width = ?tuning.max_width,
             max_height = ?tuning.max_height,
+            audio = audio_requested,
             "screen stream session pending client attach"
         );
         Ok(StreamStartResponse {
@@ -263,6 +370,7 @@ impl ScreenManager {
             actual_quality: tuning.quality,
             actual_bitrate_kbps: bitrate_kbps,
             portal_last_error: self.last_portal_error.lock().await.clone(),
+            audio: crate::audio::idle_status(audio_options, audio_reason),
         })
     }
 
@@ -294,11 +402,7 @@ impl ScreenManager {
         Ok(())
     }
 
-    pub async fn attach_stream_client(
-        &self,
-        token: &str,
-        mut socket: TcpStream,
-    ) -> anyhow::Result<()> {
+    pub async fn attach_stream_client(&self, token: &str, socket: TcpStream) -> anyhow::Result<()> {
         let (session_id, pending) = {
             let mut sessions = self.sessions.lock().await;
             let session_id = sessions
@@ -333,16 +437,24 @@ impl ScreenManager {
         let source = pending.source.clone();
         let task_paths = self.paths.clone();
         let task_last_error = self.last_portal_error.clone();
+        // The handshake line names the codec, and the codec is only known once a
+        // producer actually emits a frame, so it is written lazily. That also
+        // keeps the grim fallback usable: it may only take over while the socket
+        // is still untouched.
+        let socket = Arc::new(StreamSocket::new(socket));
+        let video_socket = socket.clone();
+        // The registry lock is taken before the producer is spawned and held until the
+        // session is registered. A pipeline that fails instantly would otherwise
+        // deregister a session that has not been registered yet, and the entry
+        // inserted afterwards would never be cleaned up: it owns the audio
+        // producer and the socket, so the encoder would keep capturing for a
+        // stream that no longer exists.
+        let mut sessions = self.sessions.lock().await;
         let task = tokio::spawn(async move {
-            // The handshake line names the codec, and the codec is only known
-            // once a producer actually emits a frame, so it is written lazily.
-            // That also keeps the grim fallback usable: it may only take over
-            // while the socket is still untouched.
-            let mut magic_sent = false;
+            let socket = video_socket;
             let result = if source.backend == "wayland-screencast-portal" {
                 let portal_result = run_portal_stream(
-                    &mut socket,
-                    &mut magic_sent,
+                    &socket,
                     task_session.clone(),
                     source.clone(),
                     pending.tuning,
@@ -359,7 +471,7 @@ impl ScreenManager {
                     Err(portal_err) => {
                         let detail = format!("{portal_err:#}");
                         *task_last_error.lock().await = Some(detail.clone());
-                        if is_client_disconnect(&portal_err) || magic_sent {
+                        if is_client_disconnect(&portal_err) || socket.handshake_sent() {
                             Err(portal_err)
                         } else {
                             // Loud on purpose: the grim fallback still produces
@@ -372,8 +484,7 @@ impl ScreenManager {
                             );
                             // Use grim with the same connection
                             run_grim_stream_on_open(
-                                &mut socket,
-                                &mut magic_sent,
+                                &socket,
                                 task_session.clone(),
                                 source,
                                 pending.tuning,
@@ -385,8 +496,7 @@ impl ScreenManager {
                 }
             } else if source.backend == "x11-ffmpeg" {
                 run_x11_stream(
-                    &mut socket,
-                    &mut magic_sent,
+                    &socket,
                     task_session.clone(),
                     source,
                     pending.tuning,
@@ -395,8 +505,7 @@ impl ScreenManager {
                 .await
             } else {
                 run_grim_stream_on_open(
-                    &mut socket,
-                    &mut magic_sent,
+                    &socket,
                     task_session.clone(),
                     source,
                     pending.tuning,
@@ -411,18 +520,145 @@ impl ScreenManager {
                     warn!(session_id = %task_session, %err, "screen stream stopped with error");
                 }
             }
+            // Dropping the registry entry also drops the audio handle, which
+            // signals its task to stop and reaps the encoder child.
             task_sessions.lock().await.remove(&task_session);
             debug!(session_id = %task_session, "screen stream session removed from registry");
         });
-        self.sessions.lock().await.insert(
+        // Audio is spawned in its own task so a failing pipeline can only ever
+        // silence itself: the video producer above never observes an audio
+        // error.
+        let audio = pending.audio.then(|| {
+            DesktopAudioStream::spawn(session_id.clone(), socket.clone(), pending.audio_options)
+        });
+        sessions.insert(
             session_id,
             StreamSession::Running(RunningStream {
                 stop: stop_tx,
                 keyframe: keyframe_tx,
                 task,
+                socket,
+                audio,
+                audio_options: pending.audio_options,
             }),
         );
+        drop(sessions);
         Ok(())
+    }
+
+    /// Starts desktop audio on a session that is already streaming video, or
+    /// reports the status of the producer that is already running.
+    pub async fn start_audio(
+        &self,
+        session_id: &str,
+        options: Option<AudioStreamOptions>,
+    ) -> anyhow::Result<AudioStreamStatus> {
+        let supported = self.capabilities.read().await.audio_capture.clone();
+        if !supported.supported {
+            bail!(
+                "{}",
+                supported
+                    .reason
+                    .unwrap_or_else(|| "Desktop audio capture is unavailable on this host".into())
+            );
+        }
+        let mut sessions = self.sessions.lock().await;
+        match sessions.get_mut(session_id) {
+            Some(StreamSession::Running(running)) => {
+                if let Some(audio) = running.audio.as_ref()
+                    && audio.is_running()
+                {
+                    audio.set_muted(false);
+                    return Ok(audio.status());
+                }
+                let options = options.unwrap_or(running.audio_options);
+                running.audio_options = options;
+                let audio = DesktopAudioStream::spawn(
+                    session_id.to_string(),
+                    running.socket.clone(),
+                    options,
+                );
+                let status = audio.status();
+                running.audio = Some(audio);
+                info!(%session_id, "desktop audio started for screen stream session");
+                Ok(status)
+            }
+            // The producer is bound to the socket, so it can only start once a
+            // client attaches; remember the request until then.
+            Some(StreamSession::Pending(pending)) => {
+                pending.audio = true;
+                if let Some(options) = options {
+                    pending.audio_options = options;
+                }
+                Ok(crate::audio::idle_status(
+                    pending.audio_options,
+                    Some("Desktop audio starts as soon as the stream client attaches".into()),
+                ))
+            }
+            None => bail!("Unknown or expired screen stream session"),
+        }
+    }
+
+    pub async fn stop_audio(&self, session_id: &str) -> anyhow::Result<AudioStreamStatus> {
+        let mut sessions = self.sessions.lock().await;
+        match sessions.get_mut(session_id) {
+            Some(StreamSession::Running(running)) => {
+                let options = running.audio_options;
+                match running.audio.take() {
+                    Some(audio) => {
+                        audio.stop().await;
+                        info!(%session_id, "desktop audio stopped for screen stream session");
+                    }
+                    None => debug!(%session_id, "desktop audio stop ignored; no producer running"),
+                }
+                Ok(crate::audio::idle_status(options, None))
+            }
+            Some(StreamSession::Pending(pending)) => {
+                pending.audio = false;
+                Ok(crate::audio::idle_status(pending.audio_options, None))
+            }
+            None => bail!("Unknown or expired screen stream session"),
+        }
+    }
+
+    /// Mutes at the source: the encoder keeps running so unmuting is instant,
+    /// but no envelope leaves the host, so a muted stream costs no bandwidth.
+    pub async fn set_audio_mute(
+        &self,
+        session_id: &str,
+        muted: bool,
+    ) -> anyhow::Result<AudioStreamStatus> {
+        let sessions = self.sessions.lock().await;
+        match sessions.get(session_id) {
+            Some(StreamSession::Running(running)) => match running.audio.as_ref() {
+                Some(audio) => {
+                    audio.set_muted(muted);
+                    debug!(%session_id, muted, "desktop audio mute changed");
+                    Ok(audio.status())
+                }
+                None => bail!("Desktop audio is not running for this session"),
+            },
+            Some(StreamSession::Pending(pending)) => Ok(crate::audio::idle_status(
+                pending.audio_options,
+                Some("Desktop audio has not started yet for this session".into()),
+            )),
+            None => bail!("Unknown or expired screen stream session"),
+        }
+    }
+
+    pub async fn audio_status(&self, session_id: &str) -> anyhow::Result<AudioStreamStatus> {
+        let sessions = self.sessions.lock().await;
+        match sessions.get(session_id) {
+            Some(StreamSession::Running(running)) => Ok(running
+                .audio
+                .as_ref()
+                .map(DesktopAudioStream::status)
+                .unwrap_or_else(|| crate::audio::idle_status(running.audio_options, None))),
+            Some(StreamSession::Pending(pending)) => {
+                Ok(crate::audio::idle_status(pending.audio_options, None))
+            }
+            None => bail!("Unknown or expired screen stream session"),
+        }
     }
 
     /// Forces an immediate IDR on a running session. Android recreates its
@@ -503,19 +739,17 @@ pub async fn pointer_move_absolute(
 }
 
 async fn run_grim_stream_on_open(
-    socket: &mut TcpStream,
-    magic_sent: &mut bool,
+    socket: &StreamSocket,
     session_id: String,
     source: ScreenSource,
     tuning: StreamTuning,
     stop_rx: &mut oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    run_grim_stream_impl(socket, magic_sent, session_id, source, tuning, stop_rx).await
+    run_grim_stream_impl(socket, session_id, source, tuning, stop_rx).await
 }
 
 async fn run_grim_stream_impl(
-    socket: &mut TcpStream,
-    magic_sent: &mut bool,
+    socket: &StreamSocket,
     session_id: String,
     source: ScreenSource,
     tuning: StreamTuning,
@@ -542,8 +776,8 @@ async fn run_grim_stream_impl(
             _ = &mut *stop_rx => break,
             jpeg = capture_grim_frame(&source, quality, scale) => {
                 let jpeg = jpeg?;
-                send_stream_magic(&mut *socket, magic_sent, STREAM_MAGIC_V1).await?;
-                send_frame_grim(&mut *socket, seq, source.width, source.height, &jpeg).await?;
+                socket.send_magic(STREAM_MAGIC_V1).await?;
+                send_frame_grim(socket, seq, source.width, source.height, &jpeg).await?;
                 seq += 1;
                 frame_count += 1;
                 let elapsed = throughput_start.elapsed().as_secs_f64();
@@ -570,8 +804,7 @@ async fn run_grim_stream_impl(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_portal_stream(
-    socket: &mut TcpStream,
-    magic_sent: &mut bool,
+    socket: &StreamSocket,
     session_id: String,
     _selected_source: ScreenSource,
     tuning: StreamTuning,
@@ -677,7 +910,6 @@ async fn run_portal_stream(
             PipelineEncoding::H264 { .. } => {
                 pump_h264_stream(
                     socket,
-                    magic_sent,
                     &mut stdout,
                     stop_rx,
                     keyframe_rx,
@@ -698,7 +930,6 @@ async fn run_portal_stream(
                 // the request channel and never restarts.
                 pump_jpeg_stream(
                     socket,
-                    magic_sent,
                     &mut stdout,
                     stop_rx,
                     &mut counters,
@@ -768,8 +999,7 @@ const KEYFRAME_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// `WAYPAD_STREAM_V2` frames.
 #[allow(clippy::too_many_arguments)]
 async fn pump_h264_stream(
-    socket: &mut TcpStream,
-    magic_sent: &mut bool,
+    socket: &StreamSocket,
     stdout: &mut ChildStdout,
     stop_rx: &mut oneshot::Receiver<()>,
     keyframe_rx: &mut mpsc::Receiver<()>,
@@ -827,22 +1057,15 @@ async fn pump_h264_stream(
                 }
                 waiting_for_keyframe = false;
             }
-            send_stream_magic(&mut *socket, magic_sent, STREAM_MAGIC_V2).await?;
+            socket.send_magic(STREAM_MAGIC_V2).await?;
             if let Some(parameter_sets) = unit.parameter_sets.as_deref() {
-                send_h264_frame(
-                    &mut *socket,
-                    counters.seq,
-                    geometry,
-                    parameter_sets,
-                    false,
-                    true,
-                )
-                .await?;
+                send_h264_frame(socket, counters.seq, geometry, parameter_sets, false, true)
+                    .await?;
                 counters.seq += 1;
                 counters.frames += 1;
             }
             send_h264_frame(
-                &mut *socket,
+                socket,
                 counters.seq,
                 geometry,
                 &unit.data,
@@ -869,8 +1092,7 @@ async fn pump_h264_stream(
 /// `WAYPAD_STREAM_V1` frames.
 #[allow(clippy::too_many_arguments)]
 async fn pump_jpeg_stream(
-    socket: &mut TcpStream,
-    magic_sent: &mut bool,
+    socket: &StreamSocket,
     stdout: &mut ChildStdout,
     stop_rx: &mut oneshot::Receiver<()>,
     counters: &mut StreamCounters,
@@ -894,8 +1116,8 @@ async fn pump_jpeg_stream(
                     break;
                 }
                 for frame in reader.push(&buffer[..n]) {
-                    send_stream_magic(&mut *socket, magic_sent, STREAM_MAGIC_V1).await?;
-                    send_frame(&mut *socket, counters.seq, width, height, &frame).await?;
+                    socket.send_magic(STREAM_MAGIC_V1).await?;
+                    send_frame(socket, counters.seq, width, height, &frame).await?;
                     counters.seq += 1;
                     counters.frames += 1;
                     frame_count += 1;
@@ -959,19 +1181,9 @@ fn slot_has_error(slot: &Option<String>) -> bool {
 
 const SEND_FRAME_DEADLINE_MS: u64 = 12;
 const H264_SEND_TIMEOUT_SECS: u64 = 10;
-
-async fn send_stream_magic(
-    socket: &mut TcpStream,
-    magic_sent: &mut bool,
-    magic: &[u8],
-) -> anyhow::Result<()> {
-    if *magic_sent {
-        return Ok(());
-    }
-    socket.write_all(magic).await?;
-    *magic_sent = true;
-    Ok(())
-}
+/// Grim frames are sent at TCP speed; the bound only exists so a wedged client
+/// cannot hold the shared socket lock forever.
+const GRIM_SEND_TIMEOUT_SECS: u64 = 30;
 
 fn frame_envelope(header: &str, payload: &[u8]) -> Vec<u8> {
     let header = header.as_bytes();
@@ -1009,7 +1221,7 @@ impl FrameGeometry {
 }
 
 async fn send_h264_frame(
-    socket: &mut TcpStream,
+    socket: &StreamSocket,
     seq: u64,
     geometry: FrameGeometry,
     payload: &[u8],
@@ -1027,17 +1239,15 @@ async fn send_h264_frame(
     // Unlike JPEG, an H.264 frame is referenced by everything that follows it,
     // so partial or dropped writes would corrupt the rest of the session:
     // frames are always written whole and only a wedged client aborts.
-    timeout(
-        Duration::from_secs(H264_SEND_TIMEOUT_SECS),
-        socket.write_all(&buf),
-    )
-    .await
-    .context("screen stream client stalled while receiving an H.264 frame")??;
+    socket
+        .write_all(&buf, Duration::from_secs(H264_SEND_TIMEOUT_SECS))
+        .await
+        .context("screen stream client stalled while receiving an H.264 frame")?;
     Ok(())
 }
 
 async fn send_frame(
-    socket: &mut TcpStream,
+    socket: &StreamSocket,
     seq: u64,
     width: u32,
     height: u32,
@@ -1047,7 +1257,7 @@ async fn send_frame(
 }
 
 async fn send_frame_grim(
-    socket: &mut TcpStream,
+    socket: &StreamSocket,
     seq: u64,
     width: u32,
     height: u32,
@@ -1055,7 +1265,9 @@ async fn send_frame_grim(
 ) -> anyhow::Result<()> {
     // Grim frames are large JPEG screenshots — no deadline, send at TCP speed
     let buf = frame_envelope(&jpeg_frame_header(seq, width, height), jpeg);
-    socket.write_all(&buf).await?;
+    socket
+        .write_all(&buf, Duration::from_secs(GRIM_SEND_TIMEOUT_SECS))
+        .await?;
     Ok(())
 }
 
@@ -1075,7 +1287,7 @@ fn jpeg_frame_header(seq: u64, width: u32, height: u32) -> String {
 }
 
 async fn send_frame_deadline(
-    socket: &mut TcpStream,
+    socket: &StreamSocket,
     seq: u64,
     width: u32,
     height: u32,
@@ -1084,18 +1296,12 @@ async fn send_frame_deadline(
 ) -> anyhow::Result<()> {
     let buf = frame_envelope(&jpeg_frame_header(seq, width, height), jpeg);
 
-    let result = timeout(Duration::from_millis(deadline_ms), async {
-        let mut offset = 0;
-        while offset < buf.len() {
-            offset += socket.write(&buf[offset..]).await?;
-        }
-        Ok::<_, std::io::Error>(())
-    })
-    .await;
-
-    match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(io_err)) => Err(anyhow::Error::new(io_err)),
+    match socket
+        .write_all(&buf, Duration::from_millis(deadline_ms))
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(err) if err.downcast_ref::<std::io::Error>().is_some() => Err(err),
         Err(_elapsed) => {
             debug!(seq, "dropping frame: send deadline exceeded");
             Err(anyhow::anyhow!("frame send deadline exceeded (dropped)"))
@@ -1253,10 +1459,6 @@ impl PortalScreenCastSession {
             Value::from(session_token).try_into()?,
         );
 
-        if let Some(ref token) = restore_token {
-            create_options.insert("restore_token", Value::from(token.as_str()).try_into()?);
-            info!("portal restore_token provided, attempting session restoration");
-        }
         let _: OwnedObjectPath = proxy.call("CreateSession", &(create_options)).await?;
         let create_response = await_portal_response(&mut create_stream).await?;
         if create_response.response != 0 {
@@ -1269,27 +1471,29 @@ impl PortalScreenCastSession {
             .context("ScreenCast portal did not return a session handle")?;
         let session_handle = OwnedObjectPath::try_from(session_handle_string.as_str())?;
 
-        let new_restore_token = if restore_token.is_some() {
-            info!("portal session restored from token; reusing previous source selection");
-            None
-        } else {
-            let mut select_options = HashMap::<&str, OwnedValue>::new();
-            select_options.insert("types", Value::from(1u32 | 2u32).try_into()?);
-            select_options.insert("multiple", Value::from(false).try_into()?);
-            select_options.insert("cursor_mode", Value::from(2u32).try_into()?);
-            select_options.insert("persist_mode", Value::from(2u32).try_into()?);
-            let select_token = format!("waypad_select_{}", portal_token());
-            let mut select_stream = subscribe_portal_request(&connection, &select_token).await?;
-            select_options.insert("handle_token", Value::from(select_token).try_into()?);
-            let _: OwnedObjectPath = proxy
-                .call("SelectSources", &(&session_handle, select_options))
-                .await?;
-            let select_response = await_portal_response(&mut select_stream).await?;
-            if select_response.response != 0 {
-                bail!("ScreenCast source selection was denied by the portal");
-            }
-            None
-        };
+        // SelectSources is not optional, ever. The restore token belongs in *its* options, not
+        // in CreateSession's, and skipping the call because a token exists is what made every
+        // restore fail with "Sources not selected" and fall back to showing the picker again.
+        let mut select_options = HashMap::<&str, OwnedValue>::new();
+        select_options.insert("types", Value::from(1u32 | 2u32).try_into()?);
+        select_options.insert("multiple", Value::from(false).try_into()?);
+        select_options.insert("cursor_mode", Value::from(2u32).try_into()?);
+        select_options.insert("persist_mode", Value::from(2u32).try_into()?);
+        if let Some(ref token) = restore_token {
+            select_options.insert("restore_token", Value::from(token.as_str()).try_into()?);
+            info!("portal restore_token provided; the picker should stay closed");
+        }
+        let select_token = format!("waypad_select_{}", portal_token());
+        let mut select_stream = subscribe_portal_request(&connection, &select_token).await?;
+        select_options.insert("handle_token", Value::from(select_token).try_into()?);
+        let _: OwnedObjectPath = proxy
+            .call("SelectSources", &(&session_handle, select_options))
+            .await?;
+        let select_response = await_portal_response(&mut select_stream).await?;
+        if select_response.response != 0 {
+            bail!("ScreenCast source selection was denied by the portal");
+        }
+        let new_restore_token: Option<String> = None;
 
         let start_token = format!("waypad_start_{}", portal_token());
         let mut start_stream = subscribe_portal_request(&connection, &start_token).await?;
@@ -1587,7 +1791,12 @@ fn spawn_gstreamer_pipewire(
         .env("PIPEWIRE_VIDEO_BUFFER_TYPE", "mem")
         .args(args)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        // The producer is normally killed explicitly after the pump returns. This
+        // covers the path that cannot run that code: a cancelled task drops the
+        // handle without awaiting, which used to leave an encoder capturing the
+        // screen for a session nobody owns any more.
+        .kill_on_drop(true);
     unsafe {
         command.pre_exec(move || {
             if libc_dup2(fd, 3) == -1 {
@@ -2071,8 +2280,7 @@ async fn list_x11_monitors() -> anyhow::Result<Vec<ScreenSource>> {
 }
 
 async fn run_x11_stream(
-    socket: &mut TcpStream,
-    magic_sent: &mut bool,
+    socket: &StreamSocket,
     session_id: String,
     source: ScreenSource,
     tuning: StreamTuning,
@@ -2142,7 +2350,6 @@ async fn run_x11_stream(
     let mut counters = StreamCounters::default();
     let pumped = pump_jpeg_stream(
         socket,
-        magic_sent,
         &mut stdout,
         stop_rx,
         &mut counters,

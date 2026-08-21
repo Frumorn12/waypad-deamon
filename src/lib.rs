@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod capability;
 pub mod config;
 pub mod crypto;
@@ -8,6 +9,7 @@ pub mod platform;
 pub mod protocol;
 pub mod screen;
 pub mod server;
+pub mod signal;
 pub mod state;
 pub mod system_control;
 pub mod uinput;

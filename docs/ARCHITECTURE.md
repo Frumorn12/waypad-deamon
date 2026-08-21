@@ -82,6 +82,41 @@ per second so a client cannot make the pipeline thrash. This is why the portal
 session and its PipeWire fd are held for the whole stream rather than dropped
 right after the first spawn.
 
+## Desktop Audio
+
+Audio rides the screen stream socket rather than a connection of its own. The
+Android client already routes each envelope by the `codec` field in its header,
+so interleaving Opus packets with the video ones needs no second port, no second
+handshake and no change to how a client attaches. The socket is shared through a
+lock that is held for exactly one whole envelope, which is what keeps the two
+producers from cutting each other's frames; audio waits only briefly for it and
+drops its packet otherwise, so a slow audio writer can never delay a video frame.
+
+The source is the monitor of the current default sink, resolved from `pactl` when
+the stream starts instead of being pinned at build or detection time, because the
+user can switch output device mid-session and a stale monitor would capture
+silence with no error anywhere. Encoding is `pulsesrc ! audioconvert !
+audioresample ! opusenc`, with a short device buffer, 10 or 20 ms frames, and
+`bitrate-type=constrained-vbr dtx=true`. That last pair is not a micro
+optimisation: a sink monitor never goes quiet, it produces digital silence, and
+under hard CBR the encoder spends the full bitrate encoding it — 127 kB per 10 s
+measured, against 7.5 kB with constrained VBR, for identical quality on real
+content. DTX is set alongside it rather than alone because libopus ignores DTX
+under CBR, where the flag changes the output by exactly zero bytes.
+
+Raw Opus packets are not self-delimiting, so a bare `opusenc ! fdsink` would emit
+a byte stream no reader could split back into packets. The pipeline therefore
+ends in `rtpopuspay ! rtpstreampay`, whose RFC 4571 framing prefixes every packet
+with its length; the daemon strips that framing and the RTP header again before
+building the envelope. RTP is a framing device here, not a transport.
+
+Audio is optional and is structurally unable to break video: it runs in its own
+task, and every failure ends that task alone with an `error` log naming the
+cause. It restarts up to three times, re-resolving the default sink each time,
+before giving up loudly. Muting acts on the host — the encoder keeps running so
+unmuting is instant, but no envelope is sent — so a muted stream costs no
+bandwidth rather than merely being inaudible.
+
 ## Pipeline Negotiation
 
 A GStreamer capsfilter constrains, it never converts. Anything it pins that the

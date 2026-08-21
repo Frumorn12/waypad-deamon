@@ -1,0 +1,1101 @@
+//! Desktop audio capture for the screen stream.
+//!
+//! Captures the monitor of the *current* default sink — what the speakers play,
+//! not what the microphone hears — encodes it to Opus and interleaves the
+//! packets with the video envelopes on the same stream socket.
+//!
+//! Audio is strictly optional: every failure in here is logged at `error` and
+//! ends the audio task alone. The video producer runs in its own task and never
+//! observes an audio error, which is a hard requirement of this module.
+
+use crate::{
+    platform::{command_exists, command_output},
+    screen::StreamSocket,
+};
+use anyhow::{Context, bail};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    io::AsyncReadExt,
+    process::{ChildStdout, Command},
+    sync::oneshot,
+    task::JoinHandle,
+    time::timeout,
+};
+use tracing::{debug, error, info, warn};
+
+/// Codec name written into every audio envelope header.
+pub const AUDIO_CODEC: &str = "opus";
+/// Opus only ever runs at 48 kHz internally, so the wire format is fixed.
+pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
+pub const AUDIO_CHANNELS: u16 = 2;
+/// libopus reports a 6.5 ms encoder lookahead at 48 kHz (312 samples). Raw Opus
+/// packets carry no pre-skip of their own, so the value travels in the header
+/// and the phone folds it into the `csd-1` buffer `MediaCodec` insists on.
+pub const OPUS_PRE_SKIP_SAMPLES: u16 = 312;
+
+const DEFAULT_BITRATE_KBPS: u32 = 96;
+const DEFAULT_FRAME_MS: u32 = 20;
+const MIN_BITRATE_KBPS: u32 = 32;
+const MAX_BITRATE_KBPS: u32 = 256;
+
+/// GStreamer elements the capture pipeline needs. Probed up front so a missing
+/// plugin is reported as a capability instead of failing at stream time.
+const REQUIRED_ELEMENTS: &[&str] = &[
+    "pulsesrc",
+    "audioconvert",
+    "audioresample",
+    "opusenc",
+    "rtpopuspay",
+    "rtpstreampay",
+];
+
+/// How long an audio envelope waits for the socket before it is discarded. The
+/// video producer holds the same lock for the length of one frame write, so
+/// audio yields instead of queueing: a late packet is worth less than the video
+/// frame it would delay.
+const AUDIO_LOCK_TIMEOUT: Duration = Duration::from_millis(150);
+/// Once the lock is held the envelope is written whole — a partial write would
+/// desynchronise the framing for the rest of the session.
+const AUDIO_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Packets accepted from a single read of the encoder pipe. More than this means
+/// the socket is draining slower than real time, so only the freshest survive.
+const MAX_PACKETS_PER_BATCH: usize = 8;
+/// Largest RFC 4571 frame accepted before the reader assumes it lost sync.
+const MAX_RTP_FRAME_BYTES: usize = 8 * 1024;
+const RESTART_ATTEMPTS: u32 = 3;
+const RESTART_BACKOFF: Duration = Duration::from_millis(750);
+
+/// Encoder knobs a client may negotiate per session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioStreamOptions {
+    pub bitrate_kbps: u32,
+    pub frame_ms: u32,
+}
+
+impl Default for AudioStreamOptions {
+    fn default() -> Self {
+        Self {
+            bitrate_kbps: DEFAULT_BITRATE_KBPS,
+            frame_ms: DEFAULT_FRAME_MS,
+        }
+    }
+}
+
+impl AudioStreamOptions {
+    /// Clamps client input. `frame_ms` snaps to the two short Opus frame sizes:
+    /// anything longer trades latency for a bitrate saving this stream does not
+    /// need.
+    pub fn new(bitrate_kbps: Option<u32>, frame_ms: Option<u32>) -> Self {
+        Self {
+            bitrate_kbps: bitrate_kbps
+                .unwrap_or(DEFAULT_BITRATE_KBPS)
+                .clamp(MIN_BITRATE_KBPS, MAX_BITRATE_KBPS),
+            frame_ms: match frame_ms.unwrap_or(DEFAULT_FRAME_MS) {
+                value if value <= 15 => 10,
+                _ => 20,
+            },
+        }
+    }
+
+    fn format(self) -> AudioFormat {
+        AudioFormat {
+            sample_rate: AUDIO_SAMPLE_RATE,
+            channels: AUDIO_CHANNELS,
+            frame_ms: self.frame_ms,
+            pre_skip: OPUS_PRE_SKIP_SAMPLES,
+        }
+    }
+}
+
+/// Everything the phone needs to build its Opus decoder, carried on every
+/// envelope so a client that joins late never waits for an init packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioFormat {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub frame_ms: u32,
+    pub pre_skip: u16,
+}
+
+/// What the control channel reports back about a session's audio.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AudioStreamStatus {
+    pub running: bool,
+    pub muted: bool,
+    pub codec: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub frame_ms: u32,
+    pub bitrate_kbps: u32,
+    pub monitor_source: Option<String>,
+    pub packets_sent: u64,
+    pub packets_dropped: u64,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AudioMetrics {
+    sent: AtomicU64,
+    dropped: AtomicU64,
+}
+
+/// A running desktop-audio producer bound to one screen stream socket.
+///
+/// Dropping the handle stops the capture: the encoder child is spawned with
+/// `kill_on_drop`, and the stop signal is sent from [`Drop`], so a session that
+/// disappears from the registry never leaves a `gst-launch` behind.
+#[derive(Debug)]
+pub struct DesktopAudioStream {
+    options: AudioStreamOptions,
+    monitor: Arc<std::sync::Mutex<Option<String>>>,
+    muted: Arc<AtomicBool>,
+    metrics: Arc<AudioMetrics>,
+    failure: Arc<std::sync::Mutex<Option<String>>>,
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl DesktopAudioStream {
+    pub fn spawn(
+        session_id: String,
+        socket: Arc<StreamSocket>,
+        options: AudioStreamOptions,
+    ) -> Self {
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let muted = Arc::new(AtomicBool::new(false));
+        let metrics = Arc::new(AudioMetrics::default());
+        let monitor = Arc::new(std::sync::Mutex::new(None));
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        let task = tokio::spawn(run_audio_stream(
+            session_id,
+            socket,
+            options,
+            muted.clone(),
+            metrics.clone(),
+            monitor.clone(),
+            failure.clone(),
+            stop_rx,
+        ));
+        Self {
+            options,
+            monitor,
+            muted,
+            metrics,
+            failure,
+            stop: Some(stop_tx),
+            task: Some(task),
+        }
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    /// True while the capture task is still alive.
+    pub fn is_running(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+
+    pub fn status(&self) -> AudioStreamStatus {
+        AudioStreamStatus {
+            running: self.is_running(),
+            muted: self.is_muted(),
+            codec: AUDIO_CODEC.into(),
+            sample_rate: AUDIO_SAMPLE_RATE,
+            channels: AUDIO_CHANNELS,
+            frame_ms: self.options.frame_ms,
+            bitrate_kbps: self.options.bitrate_kbps,
+            monitor_source: self.monitor.lock().ok().and_then(|slot| slot.clone()),
+            packets_sent: self.metrics.sent.load(Ordering::Relaxed),
+            packets_dropped: self.metrics.dropped.load(Ordering::Relaxed),
+            reason: self.failure.lock().ok().and_then(|slot| slot.clone()),
+        }
+    }
+
+    pub async fn stop(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take()
+            && timeout(Duration::from_secs(2), task).await.is_err()
+        {
+            warn!("desktop audio task did not stop within two seconds");
+        }
+    }
+}
+
+impl Drop for DesktopAudioStream {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+/// Status reported for a session that has no audio producer attached.
+pub fn idle_status(options: AudioStreamOptions, reason: Option<String>) -> AudioStreamStatus {
+    AudioStreamStatus {
+        running: false,
+        muted: false,
+        codec: AUDIO_CODEC.into(),
+        sample_rate: AUDIO_SAMPLE_RATE,
+        channels: AUDIO_CHANNELS,
+        frame_ms: options.frame_ms,
+        bitrate_kbps: options.bitrate_kbps,
+        monitor_source: None,
+        packets_sent: 0,
+        packets_dropped: 0,
+        reason,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_audio_stream(
+    session_id: String,
+    socket: Arc<StreamSocket>,
+    options: AudioStreamOptions,
+    muted: Arc<AtomicBool>,
+    metrics: Arc<AudioMetrics>,
+    monitor_slot: Arc<std::sync::Mutex<Option<String>>>,
+    failure: Arc<std::sync::Mutex<Option<String>>>,
+    mut stop_rx: oneshot::Receiver<()>,
+) {
+    // The capture is not started until the video producer has opened the stream.
+    // Portal approval can take a minute, and an encoder spun up before it would
+    // hold the monitor source the whole time producing packets nobody may
+    // receive — and would keep holding it if the approval never arrives.
+    if !wait_for_stream_open(&socket, &mut stop_rx).await {
+        debug!(%session_id, "desktop audio cancelled before the video stream opened");
+        return;
+    }
+
+    let mut seq = 0u64;
+    for attempt in 1..=RESTART_ATTEMPTS {
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+        // The default sink is re-resolved on every attempt: the user may switch
+        // output between attempts, and a stale monitor would capture silence.
+        let device = match resolve_monitor_device() {
+            Ok(device) => device,
+            Err(err) => {
+                record_failure(&failure, format!("{err:#}"));
+                error!(
+                    %session_id,
+                    error = %format!("{err:#}"),
+                    "desktop audio capture unavailable; the screen stream keeps running without sound"
+                );
+                return;
+            }
+        };
+        if let Ok(mut slot) = monitor_slot.lock() {
+            *slot = Some(device.monitor.clone());
+        }
+        info!(
+            %session_id,
+            attempt,
+            monitor = %device.monitor,
+            sink = device.sink.as_deref().unwrap_or("unknown"),
+            bitrate_kbps = options.bitrate_kbps,
+            frame_ms = options.frame_ms,
+            "desktop audio capture starting"
+        );
+
+        match pump_audio_stream(
+            &session_id,
+            &socket,
+            &device.monitor,
+            options,
+            &muted,
+            &metrics,
+            &mut seq,
+            &mut stop_rx,
+        )
+        .await
+        {
+            Ok(AudioOutcome::Stopped) => {
+                debug!(%session_id, "desktop audio capture stopped on request");
+                return;
+            }
+            Ok(AudioOutcome::SocketClosed) => {
+                debug!(%session_id, "desktop audio capture stopped because the stream socket closed");
+                return;
+            }
+            Ok(AudioOutcome::ProducerEnded) | Err(_) if attempt >= RESTART_ATTEMPTS => {
+                let detail = failure
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone())
+                    .unwrap_or_else(|| "the encoder pipeline stopped producing packets".into());
+                error!(
+                    %session_id,
+                    attempts = attempt,
+                    error = %detail,
+                    "desktop audio capture gave up; the screen stream keeps running without sound"
+                );
+                return;
+            }
+            Ok(AudioOutcome::ProducerEnded) => {
+                warn!(%session_id, attempt, "desktop audio producer ended; restarting");
+            }
+            Err(err) => {
+                let detail = format!("{err:#}");
+                record_failure(&failure, detail.clone());
+                warn!(%session_id, attempt, error = %detail, "desktop audio capture failed; restarting");
+            }
+        }
+
+        tokio::select! {
+            _ = &mut stop_rx => return,
+            _ = tokio::time::sleep(RESTART_BACKOFF) => {}
+        }
+    }
+}
+
+/// Blocks until the video producer has written the handshake line, or the stream
+/// is torn down. There is no timeout on purpose: the video task owns the
+/// session's lifetime, and when it gives up it drops this task's handle, which
+/// fires the stop signal below.
+async fn wait_for_stream_open(socket: &StreamSocket, stop_rx: &mut oneshot::Receiver<()>) -> bool {
+    while !socket.handshake_sent() {
+        tokio::select! {
+            _ = &mut *stop_rx => return false,
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+    }
+    true
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AudioOutcome {
+    Stopped,
+    SocketClosed,
+    ProducerEnded,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pump_audio_stream(
+    session_id: &str,
+    socket: &StreamSocket,
+    monitor: &str,
+    options: AudioStreamOptions,
+    muted: &AtomicBool,
+    metrics: &AudioMetrics,
+    seq: &mut u64,
+    stop_rx: &mut oneshot::Receiver<()>,
+) -> anyhow::Result<AudioOutcome> {
+    let mut child = spawn_audio_pipeline(monitor, options)?;
+    let stderr_task = child.stderr.take().map(|stderr| {
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let mut stderr = stderr;
+            let mut buffer = [0u8; 2048];
+            while let Ok(n) = stderr.read(&mut buffer).await {
+                if n == 0 {
+                    break;
+                }
+                let text = String::from_utf8_lossy(&buffer[..n]).trim().to_string();
+                if !text.is_empty() {
+                    warn!(%session_id, producer = "gstreamer-audio", stderr = %text, "desktop audio producer stderr");
+                }
+            }
+        })
+    });
+    let mut stdout: ChildStdout = child
+        .stdout
+        .take()
+        .context("GStreamer audio stdout unavailable")?;
+
+    let format = options.format();
+    let mut reader = RtpStreamReader::new();
+    let mut buffer = vec![0u8; 16 * 1024];
+    let mut packets_this_second = 0u64;
+    let mut bytes_this_second = 0u64;
+    let mut window_start = tokio::time::Instant::now();
+    let outcome = loop {
+        let read = tokio::select! {
+            _ = &mut *stop_rx => break AudioOutcome::Stopped,
+            read = stdout.read(&mut buffer) => read,
+        };
+        let n = read.context("failed to read the desktop audio encoder pipe")?;
+        if n == 0 {
+            break AudioOutcome::ProducerEnded;
+        }
+        let mut packets = reader.push(&buffer[..n])?;
+        let stale = stale_packet_count(packets.len(), MAX_PACKETS_PER_BATCH);
+        if stale > 0 {
+            packets.drain(..stale);
+            metrics.dropped.fetch_add(stale as u64, Ordering::Relaxed);
+            debug!(%session_id, dropped = stale, "desktop audio backlog trimmed to the freshest packets");
+        }
+        for packet in packets {
+            // The handshake line belongs to the video producer, and a client
+            // that has not read it yet cannot frame anything: audio silently
+            // waits instead of writing into a stream that has not opened.
+            if muted.load(Ordering::Relaxed) || !socket.handshake_sent() {
+                metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let header = audio_frame_header(*seq, now_millis(), format);
+            let written = socket
+                .try_write_envelope(&header, &packet, AUDIO_LOCK_TIMEOUT, AUDIO_WRITE_TIMEOUT)
+                .await;
+            match written {
+                Ok(true) => {
+                    *seq += 1;
+                    metrics.sent.fetch_add(1, Ordering::Relaxed);
+                    packets_this_second += 1;
+                    bytes_this_second += packet.len() as u64;
+                }
+                Ok(false) => {
+                    metrics.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    debug!(%session_id, error = %format!("{err:#}"), "desktop audio socket write failed");
+                    let _ = child.kill().await;
+                    if let Some(task) = stderr_task {
+                        task.abort();
+                    }
+                    return Ok(AudioOutcome::SocketClosed);
+                }
+            }
+        }
+        let elapsed = window_start.elapsed().as_secs_f64();
+        if elapsed >= 5.0 {
+            debug!(
+                %session_id,
+                packets = packets_this_second,
+                kbps = (bytes_this_second as f64 * 8.0 / elapsed / 1000.0).round(),
+                "desktop audio throughput"
+            );
+            packets_this_second = 0;
+            bytes_this_second = 0;
+            window_start = tokio::time::Instant::now();
+        }
+    };
+
+    let _ = child.kill().await;
+    if let Some(task) = stderr_task {
+        let _ = timeout(Duration::from_millis(300), task).await;
+    }
+    Ok(outcome)
+}
+
+fn record_failure(slot: &Arc<std::sync::Mutex<Option<String>>>, detail: String) {
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(detail);
+    }
+}
+
+fn spawn_audio_pipeline(
+    monitor: &str,
+    options: AudioStreamOptions,
+) -> anyhow::Result<tokio::process::Child> {
+    let args = gstreamer_audio_pipeline_args(monitor, options);
+    debug!(pipeline = %args.join(" "), "launching GStreamer desktop audio pipeline");
+    Command::new("gst-launch-1.0")
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // A cancelled task must not leave an encoder holding the monitor source.
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to launch the GStreamer desktop audio pipeline")
+}
+
+/// Builds the capture pipeline.
+///
+/// `rtpopuspay ! rtpstreampay` is not about RTP as a transport: it is the only
+/// stock way to get *framed* Opus off `fdsink`. Raw Opus packets are not
+/// self-delimiting, so a bare `opusenc ! fdsink` would emit a byte soup no
+/// reader can split back into packets. RFC 4571 prefixes every RTP packet with
+/// its length, which the daemon strips again before the envelope is sent.
+fn gstreamer_audio_pipeline_args(monitor: &str, options: AudioStreamOptions) -> Vec<String> {
+    vec![
+        "-q".into(),
+        "pulsesrc".into(),
+        format!("device={monitor}"),
+        "do-timestamp=true".into(),
+        // Defaults are 200 ms of device buffering; that alone would dominate the
+        // latency budget of a 20 ms frame.
+        "buffer-time=40000".into(),
+        "latency-time=10000".into(),
+        "!".into(),
+        // Backpressure may only cost freshness, never unbounded delay: raw audio
+        // is disposable, an encoded packet still on the wire is not.
+        "queue".into(),
+        "max-size-buffers=8".into(),
+        "max-size-time=0".into(),
+        "max-size-bytes=0".into(),
+        "leaky=downstream".into(),
+        "!".into(),
+        "audioconvert".into(),
+        "!".into(),
+        "audioresample".into(),
+        "!".into(),
+        format!(
+            "audio/x-raw,format=S16LE,rate={},channels={},layout=interleaved",
+            AUDIO_SAMPLE_RATE, AUDIO_CHANNELS
+        ),
+        "!".into(),
+        "opusenc".into(),
+        format!("bitrate={}", options.bitrate_kbps * 1000),
+        // Constrained VBR, not CBR. A sink monitor never stops producing samples, so a silent
+        // desktop is still a full stream of digital silence; measured on this host, 10 s of it
+        // costs 127 kB at `bitrate-type=cbr` and 7.5 kB at `constrained-vbr`, while real content
+        // costs the same 102 kbps either way. CBR would spend the full bitrate on nothing.
+        "bitrate-type=constrained-vbr".into(),
+        // Discontinuous transmission trims a further ~11 % off silence. It is deliberately paired
+        // with the line above and not used alone: libopus ignores DTX under hard CBR, which is
+        // measurable — with `bitrate-type=cbr` this flag changes the output by exactly zero bytes.
+        "dtx=true".into(),
+        format!("frame-size={}", options.frame_ms),
+        // "generic" is opusenc's name for OPUS_APPLICATION_AUDIO; "voice" would
+        // apply speech shaping to desktop audio, "restricted-lowdelay" drops the
+        // SILK layer entirely.
+        "audio-type=generic".into(),
+        // Full complexity costs measurable CPU per frame for an inaudible gain
+        // at this bitrate.
+        "complexity=5".into(),
+        "!".into(),
+        "rtpopuspay".into(),
+        "!".into(),
+        "rtpstreampay".into(),
+        "!".into(),
+        "fdsink".into(),
+        "fd=1".into(),
+        "sync=false".into(),
+    ]
+}
+
+/// Header of one audio envelope.
+///
+/// `key_frame` and `config` are pinned to `false` on purpose. The Android client
+/// prunes a congested batch by keeping everything from the last `key_frame`
+/// onwards plus the last `config` before it, and that pruning does not look at
+/// the codec: an audio envelope claiming either flag would make the phone throw
+/// away video frames, or worse, evict the H.264 parameter sets. Audio therefore
+/// stays invisible to the video drop policy, and everything the decoder needs to
+/// be configured travels as plain header fields instead of a config payload.
+fn audio_frame_header(seq: u64, timestamp_ms: u128, format: AudioFormat) -> String {
+    json!({
+        "seq": seq,
+        "timestamp_ms": timestamp_ms,
+        "codec": AUDIO_CODEC,
+        "sample_rate": format.sample_rate,
+        "channels": format.channels,
+        "frame_ms": format.frame_ms,
+        "pre_skip": format.pre_skip,
+        "key_frame": false,
+        "config": false
+    })
+    .to_string()
+}
+
+/// How many leading packets of a batch are stale enough to discard.
+///
+/// Reading more than one packet per wakeup means the socket is draining slower
+/// than the encoder produces. Audio cannot "catch up" by playing faster, so the
+/// backlog is cut from the front and only the freshest packets are sent.
+fn stale_packet_count(available: usize, max_batch: usize) -> usize {
+    available.saturating_sub(max_batch.max(1))
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+/// The monitor source that carries what the default sink is playing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioDevice {
+    pub sink: Option<String>,
+    pub monitor: String,
+}
+
+/// Resolves the capture device at *runtime*, never at build or start time: the
+/// user can switch output devices while a stream is running, and a hardcoded
+/// monitor would then record silence with no error anywhere.
+pub fn resolve_monitor_device() -> anyhow::Result<AudioDevice> {
+    if !command_exists("pactl") {
+        bail!("pactl is not installed, so the default sink cannot be resolved");
+    }
+    let sources = command_output("pactl", &["list", "short", "sources"])
+        .context("pactl listed no PipeWire/PulseAudio sources")?;
+    let default_sink = command_output("pactl", &["get-default-sink"]);
+    let monitor = pick_monitor_source(default_sink.as_deref(), &sources).with_context(|| {
+        format!(
+            "no monitor source found for the default sink {}",
+            default_sink.as_deref().unwrap_or("(unknown)")
+        )
+    })?;
+    Ok(AudioDevice {
+        sink: default_sink,
+        monitor,
+    })
+}
+
+/// Picks the monitor of `default_sink` out of `pactl list short sources`.
+///
+/// Falls back to the first monitor source in the list: a host whose default sink
+/// has no monitor (a null sink, a filtered chain) can still stream *some*
+/// desktop audio, which beats streaming none.
+pub fn pick_monitor_source(default_sink: Option<&str>, sources: &str) -> Option<String> {
+    let names: Vec<&str> = sources
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1).map(str::trim))
+        .filter(|name| !name.is_empty())
+        .collect();
+    if let Some(sink) = default_sink.map(str::trim).filter(|sink| !sink.is_empty()) {
+        let expected = format!("{sink}.monitor");
+        if let Some(name) = names.iter().find(|name| **name == expected) {
+            return Some((*name).to_string());
+        }
+        // Some setups make the monitor itself the default "sink" name.
+        if sink.ends_with(".monitor") && names.contains(&sink) {
+            return Some(sink.to_string());
+        }
+    }
+    names
+        .into_iter()
+        .find(|name| name.ends_with(".monitor"))
+        .map(ToOwned::to_owned)
+}
+
+/// What [`crate::capability`] needs to decide whether desktop audio is offered.
+#[derive(Clone, Debug)]
+pub struct DesktopAudioProbe {
+    pub pactl_available: bool,
+    pub gstreamer_available: bool,
+    pub missing_elements: Vec<&'static str>,
+    pub default_sink: Option<String>,
+    pub monitor_source: Option<String>,
+}
+
+impl DesktopAudioProbe {
+    pub fn supported(&self) -> bool {
+        self.gstreamer_available && self.monitor_source.is_some()
+    }
+
+    /// Why audio is unavailable, in the same "what is missing and why" style the
+    /// other capabilities use.
+    pub fn reason(&self) -> String {
+        if self.supported() {
+            return format!(
+                "Desktop audio is captured from the monitor of the current default sink ({}) and encoded to Opus",
+                self.monitor_source.as_deref().unwrap_or("unknown")
+            );
+        }
+        if !self.gstreamer_available {
+            return format!(
+                "Desktop audio unavailable: GStreamer is missing {}",
+                if self.missing_elements.is_empty() {
+                    "gst-launch-1.0".to_string()
+                } else {
+                    self.missing_elements.join(", ")
+                }
+            );
+        }
+        if !self.pactl_available {
+            return "Desktop audio unavailable: pactl is not installed, so the default sink cannot be resolved".into();
+        }
+        "Desktop audio unavailable: no monitor source is exposed for any output device".into()
+    }
+}
+
+pub fn probe_desktop_audio() -> DesktopAudioProbe {
+    let pactl_available = command_exists("pactl");
+    let missing_elements: Vec<&'static str> = if command_exists("gst-launch-1.0") {
+        REQUIRED_ELEMENTS
+            .iter()
+            .copied()
+            .filter(|element| command_output("gst-inspect-1.0", &[element]).is_none())
+            .collect()
+    } else {
+        REQUIRED_ELEMENTS.to_vec()
+    };
+    let gstreamer_available = command_exists("gst-launch-1.0") && missing_elements.is_empty();
+    let device = pactl_available
+        .then(resolve_monitor_device)
+        .and_then(Result::ok);
+    DesktopAudioProbe {
+        pactl_available,
+        gstreamer_available,
+        missing_elements,
+        default_sink: device.as_ref().and_then(|device| device.sink.clone()),
+        monitor_source: device.map(|device| device.monitor),
+    }
+}
+
+/// Splits the RFC 4571 stream `rtpstreampay` writes into bare Opus packets.
+///
+/// Reads off the pipe land on arbitrary boundaries, so a frame is only released
+/// once all of its bytes have arrived.
+#[derive(Debug, Default)]
+struct RtpStreamReader {
+    buffer: Vec<u8>,
+}
+
+impl RtpStreamReader {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> anyhow::Result<Vec<Vec<u8>>> {
+        self.buffer.extend_from_slice(chunk);
+        let mut packets = Vec::new();
+        loop {
+            if self.buffer.len() < 2 {
+                break;
+            }
+            let length = u16::from_be_bytes([self.buffer[0], self.buffer[1]]) as usize;
+            if length == 0 || length > MAX_RTP_FRAME_BYTES {
+                bail!("desktop audio producer emitted an invalid RTP frame length: {length}");
+            }
+            if self.buffer.len() < 2 + length {
+                break;
+            }
+            let frame = self.buffer[2..2 + length].to_vec();
+            self.buffer.drain(..2 + length);
+            match rtp_payload(&frame) {
+                Some(payload) if !payload.is_empty() => packets.push(payload.to_vec()),
+                // An RTP packet without an Opus payload is not a stream error:
+                // it is skipped so a stray control packet cannot kill the audio.
+                _ => debug!(bytes = frame.len(), "skipping an RTP frame with no payload"),
+            }
+        }
+        Ok(packets)
+    }
+}
+
+/// Extracts the payload of an RTP packet, honouring CSRC list, header extension
+/// and padding so a payloader that ever starts using them cannot corrupt a
+/// packet silently.
+fn rtp_payload(packet: &[u8]) -> Option<&[u8]> {
+    if packet.len() < 12 || packet[0] >> 6 != 2 {
+        return None;
+    }
+    let csrc_count = (packet[0] & 0x0f) as usize;
+    let has_extension = packet[0] & 0x10 != 0;
+    let has_padding = packet[0] & 0x20 != 0;
+    let mut offset = 12 + csrc_count * 4;
+    if has_extension {
+        if packet.len() < offset + 4 {
+            return None;
+        }
+        let words = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]) as usize;
+        offset += 4 + words * 4;
+    }
+    let mut end = packet.len();
+    if has_padding {
+        let padding = *packet.last()? as usize;
+        end = end.checked_sub(padding)?;
+    }
+    if offset > end {
+        return None;
+    }
+    Some(&packet[offset..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCES: &str = "63\talsa_input.usb-Razer.mono-fallback\tPipeWire\ts16le 1ch 48000Hz\tSUSPENDED\n\
+64\talsa_output.pci-0000_00_1f.3.analog-stereo.monitor\tPipeWire\ts32le 2ch 48000Hz\tRUNNING\n\
+65\talsa_input.pci-0000_00_1f.3.analog-stereo\tPipeWire\ts32le 2ch 48000Hz\tSUSPENDED\n\
+913\talsa_output.pci-0000_01_00.1.hdmi-stereo.monitor\tPipeWire\ts32le 2ch 48000Hz\tSUSPENDED";
+
+    #[test]
+    fn resolves_the_monitor_of_the_current_default_sink() {
+        assert_eq!(
+            pick_monitor_source(Some("alsa_output.pci-0000_00_1f.3.analog-stereo"), SOURCES)
+                .as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo.monitor")
+        );
+        // Switching the default output has to follow, not stay pinned to the
+        // first monitor in the list.
+        assert_eq!(
+            pick_monitor_source(Some("alsa_output.pci-0000_01_00.1.hdmi-stereo"), SOURCES)
+                .as_deref(),
+            Some("alsa_output.pci-0000_01_00.1.hdmi-stereo.monitor")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_any_monitor_when_the_default_sink_has_none() {
+        assert_eq!(
+            pick_monitor_source(Some("some_null_sink"), SOURCES).as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo.monitor")
+        );
+        assert_eq!(
+            pick_monitor_source(None, SOURCES).as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo.monitor")
+        );
+    }
+
+    #[test]
+    fn reports_no_device_when_no_source_is_a_monitor() {
+        let inputs = "63\talsa_input.usb-Razer.mono-fallback\tPipeWire\ts16le\tSUSPENDED";
+        assert_eq!(pick_monitor_source(Some("sink"), inputs), None);
+        assert_eq!(pick_monitor_source(None, ""), None);
+    }
+
+    #[test]
+    fn audio_header_never_claims_a_key_frame_or_a_config_payload() {
+        // The phone prunes congested batches on these two flags without looking
+        // at the codec, so an audio envelope setting either would drop video.
+        let header = audio_frame_header(
+            7,
+            1_700_000_000_123,
+            AudioFormat {
+                sample_rate: 48_000,
+                channels: 2,
+                frame_ms: 20,
+                pre_skip: 312,
+            },
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&header).unwrap();
+        assert_eq!(parsed["seq"], 7);
+        assert_eq!(parsed["timestamp_ms"], 1_700_000_000_123u64);
+        assert_eq!(parsed["codec"], "opus");
+        assert_eq!(parsed["sample_rate"], 48_000);
+        assert_eq!(parsed["channels"], 2);
+        assert_eq!(parsed["frame_ms"], 20);
+        assert_eq!(parsed["pre_skip"], 312);
+        assert_eq!(parsed["key_frame"], false);
+        assert_eq!(parsed["config"], false);
+    }
+
+    #[test]
+    fn clamps_client_supplied_encoder_options() {
+        assert_eq!(
+            AudioStreamOptions::new(None, None),
+            AudioStreamOptions {
+                bitrate_kbps: 96,
+                frame_ms: 20
+            }
+        );
+        assert_eq!(AudioStreamOptions::new(Some(1), None).bitrate_kbps, 32);
+        assert_eq!(AudioStreamOptions::new(Some(999), None).bitrate_kbps, 256);
+        assert_eq!(AudioStreamOptions::new(None, Some(10)).frame_ms, 10);
+        assert_eq!(AudioStreamOptions::new(None, Some(2)).frame_ms, 10);
+        // Anything longer than the requested 10-20 ms window snaps back to 20.
+        assert_eq!(AudioStreamOptions::new(None, Some(60)).frame_ms, 20);
+    }
+
+    #[test]
+    fn pipeline_captures_the_monitor_and_encodes_low_latency_opus() {
+        let pipeline = gstreamer_audio_pipeline_args(
+            "alsa_output.analog-stereo.monitor",
+            AudioStreamOptions::new(Some(128), Some(10)),
+        )
+        .join(" ");
+
+        assert!(
+            pipeline.contains("device=alsa_output.analog-stereo.monitor"),
+            "{pipeline}"
+        );
+        assert!(pipeline.contains("bitrate=128000"), "{pipeline}");
+        assert!(pipeline.contains("frame-size=10"), "{pipeline}");
+        assert!(pipeline.contains("audio-type=generic"), "{pipeline}");
+        // A monitor source never goes quiet, it produces silence, so the encoder must be allowed
+        // to spend nothing on it. Hard CBR would send the full bitrate for an idle desktop and
+        // would additionally make the dtx flag a no-op.
+        assert!(
+            pipeline.contains("bitrate-type=constrained-vbr"),
+            "{pipeline}"
+        );
+        assert!(!pipeline.contains("bitrate-type=cbr"), "{pipeline}");
+        assert!(pipeline.contains("dtx=true"), "{pipeline}");
+        // Framing is what makes the packets recoverable from a byte pipe.
+        assert!(pipeline.contains("rtpstreampay"), "{pipeline}");
+        // The device buffer has to be short or it dominates the latency budget.
+        assert!(pipeline.contains("buffer-time=40000"), "{pipeline}");
+        let encoder = pipeline.find("opusenc").expect("encoder is present");
+        for converter in ["audioconvert", "audioresample"] {
+            assert!(
+                pipeline[..encoder].contains(converter),
+                "{converter} missing upstream of opusenc in: {pipeline}"
+            );
+        }
+    }
+
+    /// One RFC 4571 frame: `[u16_be length][RTP header][payload]`.
+    fn rtp_frame(sequence: u16, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0x80, 0xe0];
+        packet.extend_from_slice(&sequence.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 0]); // timestamp
+        packet.extend_from_slice(&[1, 2, 3, 4]); // ssrc
+        packet.extend_from_slice(payload);
+        let mut framed = (packet.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&packet);
+        framed
+    }
+
+    #[test]
+    fn splits_opus_packets_across_arbitrary_pipe_reads() {
+        let mut stream = rtp_frame(1, &[0xfc, 1, 2, 3]);
+        stream.extend_from_slice(&rtp_frame(2, &[0xfc, 4, 5]));
+        stream.extend_from_slice(&rtp_frame(3, &[0xfc, 6]));
+
+        for split in 1..stream.len() {
+            let mut reader = RtpStreamReader::new();
+            let mut packets = reader.push(&stream[..split]).unwrap();
+            packets.extend(reader.push(&stream[split..]).unwrap());
+            assert_eq!(
+                packets,
+                vec![vec![0xfc, 1, 2, 3], vec![0xfc, 4, 5], vec![0xfc, 6]],
+                "split at {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_csrc_extension_and_padding_from_rtp_packets() {
+        // Version 2, one CSRC, extension present, padding present.
+        let mut packet = vec![0xb1, 0xe0, 0, 1];
+        packet.extend_from_slice(&[0, 0, 0, 0]); // timestamp
+        packet.extend_from_slice(&[1, 2, 3, 4]); // ssrc
+        packet.extend_from_slice(&[9, 9, 9, 9]); // one CSRC
+        packet.extend_from_slice(&[0xbe, 0xde, 0, 1]); // extension, one word
+        packet.extend_from_slice(&[7, 7, 7, 7]);
+        packet.extend_from_slice(&[0xfc, 42]); // payload
+        packet.extend_from_slice(&[0, 0, 3]); // three padding bytes
+
+        assert_eq!(rtp_payload(&packet), Some(&[0xfc, 42][..]));
+        assert_eq!(rtp_payload(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn rejects_a_producer_that_lost_framing() {
+        let mut reader = RtpStreamReader::new();
+        assert!(reader.push(&[0xff, 0xff, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn trims_only_the_backlog_that_exceeds_one_batch() {
+        assert_eq!(stale_packet_count(1, 8), 0);
+        assert_eq!(stale_packet_count(8, 8), 0);
+        assert_eq!(stale_packet_count(20, 8), 12);
+        assert_eq!(stale_packet_count(3, 0), 2);
+    }
+
+    /// End-to-end over a loopback socket: capture, encode, frame, mute, resume.
+    ///
+    /// Ignored by default because it needs a live PipeWire/PulseAudio monitor and the GStreamer
+    /// Opus plugins, which a CI container has neither of. Run it on a desktop with
+    /// `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a live audio monitor source and the GStreamer opus plugins"]
+    async fn captures_frames_and_mutes_desktop_audio_over_the_stream_socket() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connecting = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server, _) = listener.accept().await.unwrap();
+        let mut client = connecting.await.unwrap();
+
+        let socket = Arc::new(StreamSocket::new(server));
+        let audio = DesktopAudioStream::spawn(
+            "integration".into(),
+            socket.clone(),
+            AudioStreamOptions::default(),
+        );
+
+        // Nothing may reach the wire before the video producer names the codec: a client cannot
+        // frame what it has not been told how to read.
+        let mut probe = [0u8; 1];
+        assert!(
+            timeout(Duration::from_millis(600), client.read(&mut probe))
+                .await
+                .is_err(),
+            "audio wrote before the handshake line"
+        );
+
+        // The encoder must not even have been started yet.
+        assert!(
+            audio.status().monitor_source.is_none(),
+            "audio captured before the stream was open"
+        );
+
+        socket.send_magic(b"WAYPAD_STREAM_V2\n").await.unwrap();
+        let mut magic = [0u8; 17];
+        client.read_exact(&mut magic).await.unwrap();
+        assert_eq!(&magic, b"WAYPAD_STREAM_V2\n");
+
+        let first = read_envelope(&mut client, Duration::from_secs(10))
+            .await
+            .expect("the encoder produced no packet");
+        let header: serde_json::Value = serde_json::from_slice(&first.0).unwrap();
+        assert_eq!(header["codec"], "opus");
+        assert_eq!(header["sample_rate"], 48_000);
+        assert_eq!(header["key_frame"], false);
+        assert!(!first.1.is_empty());
+
+        for _ in 0..5 {
+            read_envelope(&mut client, Duration::from_secs(2))
+                .await
+                .expect("the stream stalled");
+        }
+
+        audio.set_muted(true);
+        // Whatever was already in flight still arrives; after that the wire has to go quiet.
+        while read_envelope(&mut client, Duration::from_millis(400))
+            .await
+            .is_some()
+        {}
+        assert!(
+            read_envelope(&mut client, Duration::from_millis(800))
+                .await
+                .is_none(),
+            "muting did not stop the packets"
+        );
+
+        audio.set_muted(false);
+        assert!(
+            read_envelope(&mut client, Duration::from_secs(2))
+                .await
+                .is_some(),
+            "unmuting did not resume the packets"
+        );
+
+        audio.stop().await;
+    }
+
+    #[cfg(test)]
+    async fn read_envelope(
+        client: &mut tokio::net::TcpStream,
+        deadline: Duration,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        use tokio::io::AsyncReadExt;
+        let mut lengths = [0u8; 8];
+        timeout(deadline, client.read_exact(&mut lengths))
+            .await
+            .ok()?
+            .ok()?;
+        let header_len = u32::from_be_bytes(lengths[..4].try_into().unwrap()) as usize;
+        let payload_len = u32::from_be_bytes(lengths[4..].try_into().unwrap()) as usize;
+        let mut header = vec![0u8; header_len];
+        client.read_exact(&mut header).await.ok()?;
+        let mut payload = vec![0u8; payload_len];
+        client.read_exact(&mut payload).await.ok()?;
+        Some((header, payload))
+    }
+}

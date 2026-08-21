@@ -224,13 +224,21 @@ The Android app starts a stream with:
   "jpeg_quality": 58,
   "bitrate_kbps": 6000,
   "max_width": 1280,
-  "max_height": 1280
+  "max_height": 1280,
+  "audio": true,
+  "audio_bitrate_kbps": 96,
+  "audio_frame_ms": 20
 }
 ```
 
 `bitrate_kbps` is optional and only steers the H.264 encoder. Clients that omit
 it keep driving the stream through `jpeg_quality`, which the daemon maps onto a
 bitrate.
+
+`audio` is optional and defaults to **true**: desktop audio rides along on the
+same socket unless the client asks for a silent stream with `"audio": false`.
+`audio_bitrate_kbps` is clamped to `32..256` and `audio_frame_ms` snaps to `10`
+or `20`. See [Desktop audio](#desktop-audio) below.
 
 The daemon replies:
 
@@ -244,9 +252,26 @@ The daemon replies:
   "source": { "id": "hyprland:monitor:DP-1" },
   "actual_fps": 30,
   "actual_quality": 58,
-  "actual_bitrate_kbps": 6000
+  "actual_bitrate_kbps": 6000,
+  "audio": {
+    "running": false,
+    "muted": false,
+    "codec": "opus",
+    "sample_rate": 48000,
+    "channels": 2,
+    "frame_ms": 20,
+    "bitrate_kbps": 96,
+    "monitor_source": null,
+    "packets_sent": 0,
+    "packets_dropped": 0,
+    "reason": "Desktop audio is captured from the monitor of the current default sink (...)"
+  }
 }
 ```
+
+`audio.running` is still false here: the audio producer writes to the stream
+socket, so it only starts once a client attaches. `reason` explains why audio is
+unavailable when it is.
 
 `codec` is advisory: it is `h264` when the session will run on the PipeWire
 pipeline with a working H.264 encoder, and `jpeg` otherwise. The handshake line
@@ -331,6 +356,65 @@ push a force-key-unit event into a running pipeline: the keyframe is served by
 respawning the encoder, which costs a few hundred milliseconds of stream gap.
 JPEG sessions accept the command and ignore it, since every JPEG frame is
 already a keyframe.
+
+## Desktop audio
+
+Audio shares the screen stream socket. There is no second connection, no second
+port and no second handshake: audio envelopes are simply interleaved with the
+video ones and told apart by their `codec` field, which is what the Android
+client already routes on. Envelopes are written whole under one lock, so the two
+producers can never cut each other's frames.
+
+```json
+{"seq": 0, "timestamp_ms": 0, "codec": "opus", "sample_rate": 48000,
+ "channels": 2, "frame_ms": 20, "pre_skip": 312,
+ "key_frame": false, "config": false}
+```
+
+- The payload is **one bare Opus packet**, no container and no RTP header.
+- `seq` counts audio envelopes only; it is a separate sequence from the video one.
+- `key_frame` and `config` are **always false**, and that is load bearing. The
+  Android batch pruner keeps everything from the last `key_frame` onwards plus
+  the last `config` before it, without looking at the codec, so an audio
+  envelope claiming either flag would make the client drop video frames or evict
+  the H.264 parameter sets. Audio stays invisible to the video drop policy.
+- There is consequently **no audio config envelope**. Everything a decoder needs
+  is repeated on every packet as plain header fields, so a client that joins late
+  or loses a packet can always (re)build its decoder from the next one. Android
+  synthesises the `csd-0` *OpusHead*, `csd-1` pre-skip and `csd-2` seek pre-roll
+  buffers from `channels`, `sample_rate` and `pre_skip`.
+- Audio packets are droppable. Losing one costs a `frame_ms` gap and nothing else.
+
+Capture is the monitor of the **current default sink**, resolved at stream start
+from `pactl get-default-sink`, never hardcoded, so switching output device is
+picked up. Encoding is Opus at 48 kHz stereo, `audio-type=generic`
+(`OPUS_APPLICATION_AUDIO`), short frames, and `bitrate-type=constrained-vbr`
+with `dtx=true`: a sink monitor never stops producing samples, so a silent
+desktop is a full stream of digital silence, and constant bitrate would spend the
+whole budget on it. Measured, 10 s of silence costs 127 kB under `cbr` and 7.5 kB
+under `constrained-vbr`, while real content costs the same either way. DTX is
+paired with that setting rather than used alone because libopus ignores it under
+hard CBR.
+
+Audio never affects video. It runs in its own task, and a failing pipeline is
+logged at `error` and leaves the picture untouched.
+
+### Audio commands
+
+```json
+{"name": "start_desktop_audio", "session_id": "...", "bitrate_kbps": 96, "frame_ms": 20}
+{"name": "stop_desktop_audio", "session_id": "..."}
+{"name": "set_desktop_audio_mute", "session_id": "...", "muted": true}
+{"name": "get_desktop_audio_status", "session_id": "..."}
+```
+
+All four reply with the `audio` object shown above. `bitrate_kbps` and `frame_ms`
+are optional on `start_desktop_audio`.
+
+Muting acts on the **host**: the encoder keeps running so unmuting is instant,
+but no envelope is sent, so a muted stream costs no bandwidth. A client that also
+silences its own speaker gets an instant response locally and stops paying for
+the stream a moment later.
 
 `max_fps` is clamped to `1..60`, `jpeg_quality` to `35..92`, `bitrate_kbps` to
 `500..40000`, and maximum dimensions to `480..3840`. When a maximum dimension is
