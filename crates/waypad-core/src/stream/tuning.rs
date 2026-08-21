@@ -96,7 +96,9 @@ pub fn capture_scale(
         .filter(|_| height > 0)
         .map(|value| f64::from(value) / f64::from(height))
         .unwrap_or(1.0);
-    width_scale.min(height_scale).min(1.0).max(0.1)
+    // Safe to clamp rather than min/max: both scales come from a division that
+    // is guarded against a zero denominator above, so neither can be NaN.
+    width_scale.min(height_scale).clamp(0.1, 1.0)
 }
 
 /// The size to encode at, or `(None, None)` when the source already fits.

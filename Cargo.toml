@@ -2,14 +2,17 @@
 resolver = "3"
 members = [
     "crates/waypad-core",
+    "crates/waypad-linux",
+    "crates/waypad-windows",
     "crates/waypad-ui",
 ]
 
-# The platform backends are workspace members only where they can build. A
-# Linux checkout must not try to compile Win32 bindings, and a Windows checkout
-# must not try to compile zbus, so each is pulled in by the daemon through a
-# `[target.'cfg(target_os = ...)']` dependency instead of being listed here.
-exclude = []
+# Every crate is a member so one `cargo test --workspace` covers the tree on
+# either platform. What keeps a Linux checkout from resolving Win32 bindings —
+# and a Windows one from resolving zbus — is that each backend crate declares
+# its platform stack under `[target.'cfg(...)'.dependencies]` and gates its
+# module tree on the same cfg, so on the wrong host it simply compiles to
+# nothing instead of failing.
 
 [workspace.package]
 version = "0.2.0"

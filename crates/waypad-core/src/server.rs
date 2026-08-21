@@ -133,7 +133,10 @@ pub async fn run(
 
     let bind = format!("{}:{}", config.bind_address, config.control_port);
     let listener = TcpListener::bind(&bind).await?;
-    info!(platform = host.name(), "Waypad daemon listening on tcp://{bind}");
+    info!(
+        platform = host.name(),
+        "Waypad daemon listening on tcp://{bind}"
+    );
     loop {
         let (stream, peer) = listener.accept().await?;
         let state = state.clone();
@@ -794,8 +797,10 @@ mod tests {
 
     #[test]
     fn can_pair_publicly_with_allow_public_pairing_allows_public() {
-        let mut config = Config::default();
-        config.allow_public_pairing = true;
+        let config = Config {
+            allow_public_pairing: true,
+            ..Config::default()
+        };
         assert!(can_pair_publicly(&config, "8.8.8.8:10".parse().unwrap()));
         assert!(can_pair_publicly(
             &config,
@@ -805,8 +810,10 @@ mod tests {
 
     #[test]
     fn can_pair_publicly_with_require_private_lan_false_allows_all() {
-        let mut config = Config::default();
-        config.require_private_lan = false;
+        let config = Config {
+            require_private_lan: false,
+            ..Config::default()
+        };
         assert!(can_pair_publicly(&config, "8.8.8.8:10".parse().unwrap()));
         assert!(can_pair_publicly(
             &config,

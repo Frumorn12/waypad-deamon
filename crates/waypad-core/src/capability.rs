@@ -235,9 +235,13 @@ pub struct SystemCapabilities {
 /// the other and the reason has to say which.
 pub fn external_input_reason(input_supported: bool, controller_reason: &str) -> String {
     if input_supported {
-        format!("Pointer and keyboard forwarding follow the active input backend. {controller_reason}")
+        format!(
+            "Pointer and keyboard forwarding follow the active input backend. {controller_reason}"
+        )
     } else {
-        format!("Pointer and keyboard forwarding are unavailable because remote input is unavailable. {controller_reason}")
+        format!(
+            "Pointer and keyboard forwarding are unavailable because remote input is unavailable. {controller_reason}"
+        )
     }
 }
 
