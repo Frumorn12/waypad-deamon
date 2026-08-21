@@ -89,6 +89,12 @@ pub fn set_enabled(enabled: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Same as [`set_enabled`], named for the caller that has no `PlatformHost` to
+/// hand: the tray menu runs on its own Win32 thread and owns nothing.
+pub fn set_autostart_from_tray(enabled: bool) -> anyhow::Result<()> {
+    set_enabled(enabled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

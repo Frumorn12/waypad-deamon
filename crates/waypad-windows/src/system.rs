@@ -127,7 +127,7 @@ pub fn detect_system_capabilities(allow_suspend: bool) -> SystemCapabilities {
 /// The clipboard takes ownership of the moveable global on success, so the
 /// allocation is only freed on the failure paths — freeing it afterwards would
 /// hand the shell a dangling handle.
-fn set_clipboard_text(text: &str) -> anyhow::Result<()> {
+pub fn set_clipboard_text(text: &str) -> anyhow::Result<()> {
     let mut utf16: Vec<u16> = text.encode_utf16().collect();
     utf16.push(0);
     let bytes = std::mem::size_of_val(utf16.as_slice());

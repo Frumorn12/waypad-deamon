@@ -28,6 +28,21 @@ fn platform_host(_paths: &StatePaths) -> Arc<dyn PlatformHost> {
     Arc::new(waypad_windows::host::WindowsHost::new())
 }
 
+/// Puts an icon in the notification area, where there is one.
+///
+/// Windows only. A Linux desktop has a terminal and a systemd unit, and the
+/// tray crates that cover it drag GTK into the build for a convenience it does
+/// not need. Failure here is never fatal: the panel URL still works.
+#[cfg(target_os = "windows")]
+fn start_tray(url: &str) {
+    if let Err(err) = waypad_windows::tray::spawn(url.to_string()) {
+        tracing::warn!(%err, "the tray icon is unavailable");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_tray(_url: &str) {}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -49,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
             })
             .await?;
             println!("Waypad control panel: {}", panel.url());
+            start_tray(panel.url());
             // Only when a person is watching. Started from the login item there
             // is no console and no one asked for a browser window; the tray
             // icon is the way in then.

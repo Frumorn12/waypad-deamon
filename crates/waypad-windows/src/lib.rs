@@ -18,3 +18,4 @@ pub mod input;
 pub mod nv12;
 pub mod screen;
 pub mod system;
+pub mod tray;
