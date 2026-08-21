@@ -9,6 +9,8 @@
 
 #![cfg(windows)]
 
+pub mod capture;
 pub mod host;
 pub mod input;
+pub mod nv12;
 pub mod system;
