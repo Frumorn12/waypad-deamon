@@ -16,7 +16,6 @@
 //! - a relative pointer for pad mode and games,
 //! - an absolute pointer (`INPUT_PROP_POINTER`) for pixel-exact screen mirroring.
 
-use crate::protocol::{ButtonState, PointerButton};
 use anyhow::{Context, bail};
 use std::{
     collections::HashSet,
@@ -28,6 +27,7 @@ use std::{
     sync::Mutex,
 };
 use tracing::{debug, info, warn};
+use waypad_core::protocol::{ButtonState, PointerButton};
 
 pub(crate) const UINPUT_PATH: &str = "/dev/uinput";
 pub(crate) const UINPUT_IOCTL_BASE: u8 = b'U';
@@ -292,8 +292,8 @@ impl VirtualInputBackend {
     }
 
     pub fn pointer_button(&self, button: PointerButton, state: ButtonState) -> anyhow::Result<()> {
-        let code = button.uinput_code();
-        let value = state.uinput_value();
+        let code = uinput_code(&button);
+        let value = uinput_value(&state);
         let mut devices = self.lock()?;
         let already_pressed = devices.pressed_buttons.contains(&code);
         if (value == 1) == already_pressed {
@@ -345,7 +345,7 @@ impl VirtualInputBackend {
     pub fn key(&self, keysym: u32, state: ButtonState) -> anyhow::Result<()> {
         let mapping = keysym_to_key(keysym)
             .with_context(|| format!("Unsupported keysym for uinput: 0x{keysym:x}"))?;
-        let value = state.uinput_value();
+        let value = uinput_value(&state);
         let mut devices = self.lock()?;
         if value == 1 {
             devices.pressed_keys.insert(mapping.code);
@@ -565,22 +565,21 @@ fn open_uinput() -> anyhow::Result<File> {
         .with_context(|| format!("opening {UINPUT_PATH}"))
 }
 
-impl PointerButton {
-    fn uinput_code(&self) -> u16 {
-        match self {
-            Self::Left => BTN_LEFT,
-            Self::Right => BTN_RIGHT,
-            Self::Middle => BTN_MIDDLE,
-        }
+/// Free functions rather than inherent methods: the protocol types belong to
+/// the core crate, so only a trait or a function can extend them here, and a
+/// one-line trait would not earn its keep.
+fn uinput_code(button: &PointerButton) -> u16 {
+    match button {
+        PointerButton::Left => BTN_LEFT,
+        PointerButton::Right => BTN_RIGHT,
+        PointerButton::Middle => BTN_MIDDLE,
     }
 }
 
-impl ButtonState {
-    fn uinput_value(&self) -> i32 {
-        match self {
-            Self::Pressed => 1,
-            Self::Released => 0,
-        }
+fn uinput_value(state: &ButtonState) -> i32 {
+    match state {
+        ButtonState::Pressed => 1,
+        ButtonState::Released => 0,
     }
 }
 

@@ -3,27 +3,22 @@
 //! This is the loop that used to exist twice — once for H.264 off a GStreamer
 //! pipe, once for JPEG off a screenshot pipe — and platform-specific in both
 //! cases. It is now written once against the producer trait, so the envelope
-//! sequence, the keyframe gate, and the reopen-on-keyframe dance behave
-//! identically no matter which operating system produced the pictures.
+//! sequence behaves identically no matter which operating system produced the
+//! pictures.
 
 use crate::{
-    backend::{CaptureBackend, FrameProducer, KeyFrameOutcome, StreamEncoding},
+    backend::{CaptureBackend, FrameProducer, StreamEncoding},
     stream::{
         ScreenSource,
         socket::{StreamSocket, send_h264_frame, send_jpeg_frame},
         tuning::StreamTuning,
     },
 };
-use std::time::Duration;
 use tokio::{
     sync::{mpsc, oneshot},
     time::Instant,
 };
 use tracing::{debug, info, warn};
-
-/// Encoder restarts are cheap but not free, so a client that asks repeatedly
-/// cannot make the pipeline thrash.
-const KEYFRAME_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Default)]
 pub struct StreamCounters {
@@ -32,19 +27,7 @@ pub struct StreamCounters {
     pub frames: u64,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum PumpOutcome {
-    Finished,
-    /// The producer could not force a keyframe, so it must be replaced by a
-    /// fresh one whose first picture is an IDR by construction.
-    ReopenForKeyFrame,
-}
-
 /// Streams `source` to `socket` until the client leaves or `stop_rx` fires.
-///
-/// Reopens the producer whenever a keyframe is requested and the platform
-/// cannot inject one in place. The counters survive a reopen so the client sees
-/// one continuous envelope sequence across the gap.
 pub async fn pump_stream(
     socket: &StreamSocket,
     capture: &dyn CaptureBackend,
@@ -54,34 +37,27 @@ pub async fn pump_stream(
     mut stop_rx: oneshot::Receiver<()>,
     mut keyframe_rx: mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let mut counters = StreamCounters::default();
-    loop {
-        let mut producer = capture.open(source, tuning).await?;
-        info!(
-            %session_id,
-            backend = capture.name(),
-            codec = producer.encoding().codec(),
-            fps = tuning.fps,
-            "screen stream producer open"
-        );
-        let outcome = pump_producer(
-            socket,
-            producer.as_mut(),
-            &mut stop_rx,
-            &mut keyframe_rx,
-            &mut counters,
-            session_id,
-            tuning.fps,
-        )
-        .await;
-        producer.shutdown().await;
-        match outcome? {
-            PumpOutcome::Finished => return Ok(()),
-            PumpOutcome::ReopenForKeyFrame => {
-                debug!(%session_id, "reopening encoder to serve a keyframe request");
-            }
-        }
-    }
+    let mut producer = capture.open(source, tuning).await?;
+    let encoding = producer.encoding();
+    info!(
+        %session_id,
+        backend = capture.name(),
+        codec = encoding.codec(),
+        fps = tuning.fps,
+        "screen stream producer open"
+    );
+    let result = pump_producer(
+        socket,
+        producer.as_mut(),
+        &mut stop_rx,
+        &mut keyframe_rx,
+        session_id,
+        encoding,
+        tuning.fps,
+    )
+    .await;
+    producer.shutdown().await;
+    result
 }
 
 async fn pump_producer(
@@ -89,16 +65,11 @@ async fn pump_producer(
     producer: &mut dyn FrameProducer,
     stop_rx: &mut oneshot::Receiver<()>,
     keyframe_rx: &mut mpsc::Receiver<()>,
-    counters: &mut StreamCounters,
     session_id: &str,
+    encoding: StreamEncoding,
     fps: u32,
-) -> anyhow::Result<PumpOutcome> {
-    let encoding = producer.encoding();
-    let started = Instant::now();
-    // A decoder that joins on a P-frame shows nothing until the next IDR, so
-    // nothing is forwarded before the first keyframe of the fresh producer.
-    // JPEG frames are all keyframes, so the gate opens on the first one.
-    let mut waiting_for_keyframe = encoding == StreamEncoding::H264;
+) -> anyhow::Result<()> {
+    let mut counters = StreamCounters::default();
     let mut keyframe_channel_open = true;
     let mut pending_keyframe = false;
     let mut frame_count = 0u64;
@@ -107,29 +78,21 @@ async fn pump_producer(
     loop {
         if pending_keyframe {
             pending_keyframe = false;
-            match producer.request_key_frame().await? {
-                KeyFrameOutcome::Delivered => {
-                    debug!(%session_id, "encoder forced a keyframe in place");
-                }
-                KeyFrameOutcome::RequiresReopen => {
-                    if started.elapsed() >= KEYFRAME_RESTART_MIN_INTERVAL {
-                        return Ok(PumpOutcome::ReopenForKeyFrame);
-                    }
-                    debug!(%session_id, "keyframe request ignored; the encoder just restarted");
-                }
-            }
+            // Whether this costs a flag or a pipeline respawn is the producer's
+            // problem, and so is rate limiting a client that asks repeatedly.
+            producer.request_key_frame().await?;
         }
 
         let unit = tokio::select! {
             // Draining the producer always wins over a keyframe request, so a
             // burst of requests can never starve the picture path.
             biased;
-            _ = &mut *stop_rx => return Ok(PumpOutcome::Finished),
+            _ = &mut *stop_rx => return Ok(()),
             next = producer.next_unit() => match next? {
-                Some(unit) => Some(unit),
+                Some(unit) => unit,
                 None => {
                     warn!(%session_id, "screen stream producer finished");
-                    return Ok(PumpOutcome::Finished);
+                    return Ok(());
                 }
             },
             request = keyframe_rx.recv(), if keyframe_channel_open => {
@@ -140,20 +103,9 @@ async fn pump_producer(
                 } else {
                     pending_keyframe = true;
                 }
-                None
-            }
-        };
-
-        let Some(unit) = unit else {
-            continue;
-        };
-
-        if waiting_for_keyframe {
-            if !unit.key_frame {
                 continue;
             }
-            waiting_for_keyframe = false;
-        }
+        };
 
         // Written lazily, once something has actually been encoded: a platform
         // may still fall back to another codec while the socket is untouched.

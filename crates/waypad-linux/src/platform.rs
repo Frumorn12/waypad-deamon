@@ -1,18 +1,8 @@
-use serde::{Deserialize, Serialize};
 use std::os::unix::fs::FileTypeExt;
 use std::{env, ffi::OsString, path::PathBuf, process::Command};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionInfo {
-    pub session_type: String,
-    pub wayland_display: Option<String>,
-    pub x11_display: Option<String>,
-    pub current_desktop: Option<String>,
-    pub desktop_session: Option<String>,
-    pub hyprland_instance_signature: Option<String>,
-    pub compositor_hint: String,
-    pub hyprctl_version: Option<String>,
-}
+// The session description is part of the capability wire format, so the struct
+// belongs to the core crate; only the detection is Linux specific.
+use waypad_core::capability::SessionInfo;
 
 pub fn detect_session() -> SessionInfo {
     let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| {

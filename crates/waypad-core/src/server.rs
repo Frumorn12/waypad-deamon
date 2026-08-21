@@ -94,7 +94,8 @@ pub async fn run(
     let detected = host.detect_capabilities(&config).await;
     let input = host.input_backend(&detected).await;
     let gamepad = host.controller_backend(&detected);
-    let capabilities = Arc::new(RwLock::new(detected));
+    // The host's own cell, not a copy: the capture backend reads from it.
+    let capabilities = host.capabilities();
     let screen = Arc::new(ScreenManager::new(
         capabilities.clone(),
         host.capture_backend(),

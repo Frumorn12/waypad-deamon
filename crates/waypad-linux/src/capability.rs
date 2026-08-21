@@ -1,158 +1,65 @@
+//! Working out what this Linux session can actually do.
+//!
+//! The structs live in `waypad_core::capability` because they are the wire
+//! format; only the probing is here, because "is there a RemoteDesktop portal"
+//! is a question no other platform asks.
+
 use crate::{
-    config::Config,
     gamepad::detect_virtual_gamepad_support,
-    platform::{
-        SessionInfo, command_exists, command_output, detect_session, hyprland_ipc_available,
-    },
+    platform::{command_exists, command_output, detect_session, hyprland_ipc_available},
     uinput::detect_virtual_pointer_support,
 };
-use serde::{Deserialize, Serialize};
+use waypad_core::{
+    capability::{
+        AudioCaptureCapability, Capabilities, CaptureCapability, ConnectivityCapability,
+        ExternalInputCapability, InputCapability, PortalCapability, SystemCapabilities,
+        external_input_reason,
+    },
+    config::Config,
+};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Capabilities {
-    pub session: SessionInfo,
-    pub portal: PortalCapability,
-    pub input: InputCapability,
-    pub external_input: ExternalInputCapability,
-    pub connectivity: ConnectivityCapability,
-    pub capture: CaptureCapability,
-    pub audio_capture: AudioCaptureCapability,
-    pub system: SystemCapabilities,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PortalCapability {
-    pub xdg_desktop_portal_available: bool,
-    pub remote_desktop_available: bool,
-    pub remote_desktop_version: Option<u32>,
-    pub available_device_types: Vec<String>,
-    pub libei_advertised_by_portal: bool,
-    pub libei_runtime_available: bool,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InputCapability {
-    pub supported: bool,
-    pub backend: String,
-    pub requires_user_approval: bool,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExternalInputCapability {
-    pub pointer: bool,
-    pub keyboard: bool,
-    pub controller: bool,
-    pub backend: String,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectivityCapability {
-    pub lan_direct: bool,
-    pub public_direct: bool,
-    pub public_pairing_allowed: bool,
-    pub relay: bool,
-    pub signaling: bool,
-    pub stun: bool,
-    pub turn: bool,
-    pub backend: String,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CaptureCapability {
-    pub supported: bool,
-    pub backend: String,
-    pub requires_user_approval: bool,
-    pub reason: Option<String>,
-    pub portal_screencast_available: bool,
-    pub screencast_version: Option<u32>,
-    pub available_source_types: Vec<String>,
-    pub available_cursor_modes: Vec<String>,
-    pub pipewire_runtime_available: bool,
-    pub gstreamer_pipewire_available: bool,
-    pub h264_encoder: Option<String>,
-    pub hyprland_grim_available: bool,
-}
-
-/// Whether the desktop's own output can be streamed alongside the picture.
-///
-/// Reported separately from [`CaptureCapability`] on purpose: audio is optional
-/// and a host that cannot capture it still streams video, so the two must be
-/// able to disagree.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioCaptureCapability {
-    pub supported: bool,
-    pub backend: String,
-    pub codec: Option<String>,
-    pub sample_rate: u32,
-    pub channels: u16,
-    /// Resolved at detection time only for diagnostics; the stream re-resolves
-    /// the default sink when it starts, so switching output devices is picked up.
-    pub default_sink: Option<String>,
-    pub monitor_source: Option<String>,
-    pub pactl_available: bool,
-    pub gstreamer_opus_available: bool,
-    pub missing_elements: Vec<String>,
-    pub reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemCapabilities {
-    pub volume: bool,
-    pub media: bool,
-    pub brightness: bool,
-    pub clipboard: bool,
-    pub lock: bool,
-    pub suspend: bool,
-}
-
-impl Capabilities {
-    pub async fn detect(config: &Config) -> Self {
-        let session = detect_session();
-        let portal = detect_portal().await;
-        let screencast = detect_screencast_portal().await;
-        let pointer = portal.available_device_types.iter().any(|d| d == "pointer");
-        let keyboard = portal
-            .available_device_types
-            .iter()
-            .any(|d| d == "keyboard");
-        let wayland = session.session_type == "wayland";
-        let portal_input_supported =
-            wayland && portal.remote_desktop_available && (pointer || keyboard);
-        let hyprland_ipc_fallback = wayland
-            && !portal.remote_desktop_available
-            && session.compositor_hint == "hyprland"
-            && hyprland_ipc_available();
-        let (uinput_supported, uinput_reason) = detect_virtual_pointer_support();
-        // uinput is preferred over both other backends: it creates real evdev
-        // devices, so implicit pointer grabs (drag, text selection) and relative
-        // motion for games work, which neither the portal nor Hyprland IPC can
-        // offer on this stack.
-        let uinput_input_available = wayland && uinput_supported;
-        let input_supported =
-            uinput_input_available || portal_input_supported || hyprland_ipc_fallback;
-        let (controller_supported, controller_reason) = detect_virtual_gamepad_support();
-        let (input_backend, requires_user_approval, input_reason) = if !wayland {
-            (
-                "noop",
-                false,
-                Some("Remote input is only enabled for Wayland sessions in this daemon".into()),
-            )
-        } else if uinput_input_available {
-            ("uinput", false, Some(uinput_reason))
-        } else if portal_input_supported {
-            (
-                "wayland-portal",
-                true,
-                Some(
-                    "Input injection requires RemoteDesktop portal approval on this session".into(),
-                ),
-            )
-        } else if hyprland_ipc_fallback {
-            (
+/// Probes the live session. Cheap enough to re-run whenever a client asks,
+/// which matters because portal approval can appear at any moment.
+pub async fn detect(config: &Config) -> Capabilities {
+    let session = detect_session();
+    let portal = detect_portal().await;
+    let screencast = detect_screencast_portal().await;
+    let pointer = portal.available_device_types.iter().any(|d| d == "pointer");
+    let keyboard = portal
+        .available_device_types
+        .iter()
+        .any(|d| d == "keyboard");
+    let wayland = session.session_type == "wayland";
+    let portal_input_supported =
+        wayland && portal.remote_desktop_available && (pointer || keyboard);
+    let hyprland_ipc_fallback = wayland
+        && !portal.remote_desktop_available
+        && session.compositor_hint == "hyprland"
+        && hyprland_ipc_available();
+    let (uinput_supported, uinput_reason) = detect_virtual_pointer_support();
+    // uinput is preferred over both other backends: it creates real evdev
+    // devices, so implicit pointer grabs (drag, text selection) and relative
+    // motion for games work, which neither the portal nor Hyprland IPC can
+    // offer on this stack.
+    let uinput_input_available = wayland && uinput_supported;
+    let input_supported = uinput_input_available || portal_input_supported || hyprland_ipc_fallback;
+    let (controller_supported, controller_reason) = detect_virtual_gamepad_support();
+    let (input_backend, requires_user_approval, input_reason) = if !wayland {
+        (
+            "noop",
+            false,
+            Some("Remote input is only enabled for Wayland sessions in this daemon".into()),
+        )
+    } else if uinput_input_available {
+        ("uinput", false, Some(uinput_reason))
+    } else if portal_input_supported {
+        (
+            "wayland-portal",
+            true,
+            Some("Input injection requires RemoteDesktop portal approval on this session".into()),
+        )
+    } else if hyprland_ipc_fallback {
+        (
                 "hyprland-ipc",
                 false,
                 Some(
@@ -160,68 +67,61 @@ impl Capabilities {
                         .into(),
                 ),
             )
-        } else if !portal.xdg_desktop_portal_available {
-            (
-                "noop",
-                false,
-                Some(format!(
-                    "Remote input unavailable: xdg-desktop-portal is not running and {uinput_reason}"
-                )),
-            )
-        } else if !portal.remote_desktop_available {
-            (
-                "noop",
-                false,
-                Some(
-                    "Remote input unavailable: org.freedesktop.portal.RemoteDesktop not available"
-                        .into(),
-                ),
-            )
-        } else {
-            (
-                "noop",
-                false,
-                Some(
-                    "Remote input unavailable: portal exposes no pointer or keyboard devices"
-                        .into(),
-                ),
-            )
-        };
+    } else if !portal.xdg_desktop_portal_available {
+        (
+            "noop",
+            false,
+            Some(format!(
+                "Remote input unavailable: xdg-desktop-portal is not running and {uinput_reason}"
+            )),
+        )
+    } else if !portal.remote_desktop_available {
+        (
+            "noop",
+            false,
+            Some(
+                "Remote input unavailable: org.freedesktop.portal.RemoteDesktop not available"
+                    .into(),
+            ),
+        )
+    } else {
+        (
+            "noop",
+            false,
+            Some("Remote input unavailable: portal exposes no pointer or keyboard devices".into()),
+        )
+    };
 
-        let pipewire_runtime_available = command_exists("pipewire") || command_exists("pw-cli");
-        // H.264 is the preferred encoding, but a host with only jpegenc still
-        // streams, so either encoder makes the PipeWire pipeline usable.
-        let h264_encoder = crate::screen::h264_encoder_name();
-        let gstreamer_pipewire_available = command_exists("gst-launch-1.0")
-            && command_output("gst-inspect-1.0", &["pipewiresrc"]).is_some()
-            && (h264_encoder.is_some()
-                || command_output("gst-inspect-1.0", &["jpegenc"]).is_some());
-        let hyprland_grim_available = wayland
-            && session.compositor_hint == "hyprland"
-            && command_exists("grim")
-            && command_output("hyprctl", &["monitors", "-j"]).is_some();
-        let portal_capture_supported = wayland
-            && screencast.available
-            && pipewire_runtime_available
-            && gstreamer_pipewire_available;
-        let capture_supported = portal_capture_supported || hyprland_grim_available;
-        let (capture_backend, capture_requires_approval, capture_reason) = if !wayland {
-            (
-                "noop",
-                false,
-                Some("Screen capture is only enabled for Wayland sessions in this daemon".into()),
-            )
-        } else if portal_capture_supported {
-            (
-                "wayland-screencast-portal",
-                true,
-                Some(
-                    "Screen capture uses XDG Desktop Portal ScreenCast and PipeWire approval"
-                        .into(),
-                ),
-            )
-        } else if hyprland_grim_available {
-            (
+    let pipewire_runtime_available = command_exists("pipewire") || command_exists("pw-cli");
+    // H.264 is the preferred encoding, but a host with only jpegenc still
+    // streams, so either encoder makes the PipeWire pipeline usable.
+    let h264_encoder = crate::screen::h264_encoder_name();
+    let gstreamer_pipewire_available = command_exists("gst-launch-1.0")
+        && command_output("gst-inspect-1.0", &["pipewiresrc"]).is_some()
+        && (h264_encoder.is_some() || command_output("gst-inspect-1.0", &["jpegenc"]).is_some());
+    let hyprland_grim_available = wayland
+        && session.compositor_hint == "hyprland"
+        && command_exists("grim")
+        && command_output("hyprctl", &["monitors", "-j"]).is_some();
+    let portal_capture_supported = wayland
+        && screencast.available
+        && pipewire_runtime_available
+        && gstreamer_pipewire_available;
+    let capture_supported = portal_capture_supported || hyprland_grim_available;
+    let (capture_backend, capture_requires_approval, capture_reason) = if !wayland {
+        (
+            "noop",
+            false,
+            Some("Screen capture is only enabled for Wayland sessions in this daemon".into()),
+        )
+    } else if portal_capture_supported {
+        (
+            "wayland-screencast-portal",
+            true,
+            Some("Screen capture uses XDG Desktop Portal ScreenCast and PipeWire approval".into()),
+        )
+    } else if hyprland_grim_available {
+        (
                 "hyprland-grim",
                 false,
                 Some(
@@ -229,26 +129,26 @@ impl Capabilities {
                         .into(),
                 ),
             )
-        } else if !screencast.xdg_desktop_portal_available {
-            (
-                "noop",
-                false,
-                Some("Screen capture unavailable: xdg-desktop-portal is not running".into()),
-            )
-        } else if !screencast.available {
-            (
-                "noop",
-                false,
-                Some("Screen capture unavailable: ScreenCast portal not available".into()),
-            )
-        } else if !pipewire_runtime_available {
-            (
-                "noop",
-                false,
-                Some("Screen capture unavailable: PipeWire runtime tools are missing".into()),
-            )
-        } else {
-            (
+    } else if !screencast.xdg_desktop_portal_available {
+        (
+            "noop",
+            false,
+            Some("Screen capture unavailable: xdg-desktop-portal is not running".into()),
+        )
+    } else if !screencast.available {
+        (
+            "noop",
+            false,
+            Some("Screen capture unavailable: ScreenCast portal not available".into()),
+        )
+    } else if !pipewire_runtime_available {
+        (
+            "noop",
+            false,
+            Some("Screen capture unavailable: PipeWire runtime tools are missing".into()),
+        )
+    } else {
+        (
                 "noop",
                 false,
                 Some(
@@ -256,9 +156,9 @@ impl Capabilities {
                         .into(),
                 ),
             )
-        };
+    };
 
-        Self {
+    Capabilities {
             session,
             portal,
             input: InputCapability {
@@ -325,7 +225,6 @@ impl Capabilities {
                 lock: command_exists("loginctl"),
                 suspend: config.allow_suspend && command_exists("systemctl"),
             },
-        }
     }
 }
 
@@ -339,9 +238,9 @@ fn detect_audio_capture() -> AudioCaptureCapability {
         } else {
             "noop".into()
         },
-        codec: supported.then(|| crate::audio::AUDIO_CODEC.to_string()),
-        sample_rate: crate::audio::AUDIO_SAMPLE_RATE,
-        channels: crate::audio::AUDIO_CHANNELS,
+        codec: supported.then(|| waypad_core::audio::AUDIO_CODEC.to_string()),
+        sample_rate: waypad_core::audio::AUDIO_SAMPLE_RATE,
+        channels: waypad_core::audio::AUDIO_CHANNELS,
         default_sink: probe.default_sink.clone(),
         monitor_source: probe.monitor_source.clone(),
         pactl_available: probe.pactl_available,
@@ -352,17 +251,6 @@ fn detect_audio_capture() -> AudioCaptureCapability {
             .map(|element| (*element).to_string())
             .collect(),
         reason: Some(probe.reason()),
-    }
-}
-
-fn external_input_reason(input_supported: bool, controller_reason: &str) -> String {
-    match input_supported {
-        true => format!(
-            "Android external mouse and keyboard events are forwarded through the active pointer/keyboard input backend. {controller_reason}"
-        ),
-        false => format!(
-            "External mouse/keyboard forwarding requires a supported pointer/keyboard input backend on the host. {controller_reason}"
-        ),
     }
 }
 

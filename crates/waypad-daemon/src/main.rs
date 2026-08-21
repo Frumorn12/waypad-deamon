@@ -1,17 +1,31 @@
+//! The Waypad host daemon.
+//!
+//! Platform-neutral from here down: the binary picks a [`PlatformHost`] at
+//! compile time and everything else is the same code on Linux and Windows.
+
 use anyhow::{Context, bail};
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc};
 use tracing_subscriber::EnvFilter;
-use waypad_daemon::{
-    capability::Capabilities,
+use waypad_core::{
+    backend::PlatformHost,
     config::Config,
-    platform::command_output,
-    screen::authorize_portal,
+    invite::{Invite, InviteRoute, qr_terminal},
     server,
     state::{
         StatePaths, create_pairing_code, load_or_create_identity, load_trusted_devices,
-        rotate_identity, save_portal_restore_token, save_trusted_devices,
+        rotate_identity, save_trusted_devices,
     },
 };
+
+#[cfg(target_os = "linux")]
+fn platform_host(paths: &StatePaths) -> Arc<dyn PlatformHost> {
+    Arc::new(waypad_linux::host::LinuxHost::new(paths.clone()))
+}
+
+#[cfg(target_os = "windows")]
+fn platform_host(_paths: &StatePaths) -> Arc<dyn PlatformHost> {
+    Arc::new(waypad_windows::host::WindowsHost::new())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -19,11 +33,12 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load(cli.config.as_deref())?;
     init_logging(&config.log_level);
     let paths = StatePaths::new(&config);
+    let host = platform_host(&paths);
 
     match cli.command.as_deref().unwrap_or("serve") {
         "serve" => {
             let identity = load_or_create_identity(&paths)?;
-            server::run(config, paths, identity).await
+            server::run(config, paths, identity, host).await
         }
         "pair-code" => {
             let identity = load_or_create_identity(&paths)?;
@@ -38,12 +53,14 @@ async fn main() -> anyhow::Result<()> {
         }
         "doctor" => {
             let identity = load_or_create_identity(&paths)?;
-            let capabilities = Capabilities::detect(&config).await;
+            let capabilities = host.detect_capabilities(&config).await;
+            println!("Platform: {}", host.name());
+            println!("Host name: {}", host.hostname());
             println!("Host fingerprint: {}", identity.fingerprint);
             println!("{}", serde_json::to_string_pretty(&capabilities)?);
             Ok(())
         }
-        "invite" => invite_command(&config, &paths, &cli.trailing),
+        "invite" => invite_command(&config, &paths, host.as_ref(), &cli.trailing).await,
         "devices" => devices_command(&paths, &cli.trailing),
         "rotate-host-key" => {
             let identity = rotate_identity(&paths)?;
@@ -58,50 +75,65 @@ async fn main() -> anyhow::Result<()> {
             println!("Wrote sample config to {}", path.display());
             Ok(())
         }
-        "authorize-portal" => {
-            println!("Opening ScreenCast portal authorization (60s timeout)...");
-            println!("A dialog should appear on your desktop. Approve screen sharing.");
-            println!("This needs to be done only ONCE.");
-            println!();
-            match tokio::time::timeout(Duration::from_secs(60), authorize_portal()).await {
-                Ok(Ok(token)) => {
-                    save_portal_restore_token(&paths, &token)?;
-                    println!("Portal authorized successfully!");
-                    println!("You can now stream at 60 FPS without any host approval.");
-                    Ok(())
-                }
-                Ok(Err(err)) => {
-                    eprintln!();
-                    eprintln!("Authorization failed: {err}");
-                    eprintln!();
-                    eprintln!("The portal dialog did not appear or was denied.");
-                    eprintln!("This is OK — the daemon will automatically use the grim");
-                    eprintln!(
-                        "screenshot backend instead. It's slower but works without approval."
-                    );
-                    eprintln!();
-                    eprintln!("To try again later, re-run this command.");
-                    // Don't return error — grim still works
-                    Ok(())
-                }
-                Err(_elapsed) => {
-                    eprintln!();
-                    eprintln!("Authorization timed out after 60 seconds.");
-                    eprintln!("The portal dialog did not appear on your desktop.");
-                    eprintln!();
-                    eprintln!("This is OK — the daemon will use the grim fallback automatically.");
-                    eprintln!("Streams will work at 20-25 fps without any approval.");
-                    eprintln!();
-                    eprintln!("To try portal again: waypad-daemon authorize-portal");
-                    Ok(())
-                }
-            }
-        }
+        #[cfg(target_os = "linux")]
+        "authorize-portal" => authorize_portal_command(&paths).await,
         other => bail!("unknown command: {other}"),
     }
 }
 
-fn invite_command(config: &Config, paths: &StatePaths, trailing: &[String]) -> anyhow::Result<()> {
+/// Pre-approves screen capture once, so later streams start without a dialog.
+#[cfg(target_os = "linux")]
+async fn authorize_portal_command(paths: &StatePaths) -> anyhow::Result<()> {
+    use std::time::Duration;
+    println!("Opening ScreenCast portal authorization (60s timeout)...");
+    println!("A dialog should appear on your desktop. Approve screen sharing.");
+    println!("This needs to be done only ONCE.");
+    println!();
+    match tokio::time::timeout(
+        Duration::from_secs(60),
+        waypad_linux::screen::authorize_portal(),
+    )
+    .await
+    {
+        Ok(Ok(token)) => {
+            waypad_core::state::save_portal_restore_token(paths, &token)?;
+            println!("Portal authorized successfully!");
+            println!("You can now stream at 60 FPS without any host approval.");
+            Ok(())
+        }
+        // Not an error: the grim fallback still produces a picture, so a denied
+        // or absent dialog leaves the daemon usable rather than broken.
+        Ok(Err(err)) => {
+            eprintln!();
+            eprintln!("Authorization failed: {err}");
+            eprintln!();
+            eprintln!("The portal dialog did not appear or was denied.");
+            eprintln!("This is OK — the daemon will automatically use the grim");
+            eprintln!("screenshot backend instead. It's slower but works without approval.");
+            eprintln!();
+            eprintln!("To try again later, re-run this command.");
+            Ok(())
+        }
+        Err(_elapsed) => {
+            eprintln!();
+            eprintln!("Authorization timed out after 60 seconds.");
+            eprintln!("The portal dialog did not appear on your desktop.");
+            eprintln!();
+            eprintln!("This is OK — the daemon will use the grim fallback automatically.");
+            eprintln!("Streams will work at 20-25 fps without any approval.");
+            eprintln!();
+            eprintln!("To try portal again: waypad-daemon authorize-portal");
+            Ok(())
+        }
+    }
+}
+
+async fn invite_command(
+    config: &Config,
+    paths: &StatePaths,
+    host: &dyn PlatformHost,
+    trailing: &[String],
+) -> anyhow::Result<()> {
     let identity = load_or_create_identity(paths)?;
     let mut qr = false;
     let mut address: Option<String> = None;
@@ -134,30 +166,36 @@ fn invite_command(config: &Config, paths: &StatePaths, trailing: &[String]) -> a
     let mut invite_config = config.clone();
     invite_config.pairing_code_ttl_seconds = ttl.clamp(30, 900);
     let code = create_pairing_code(&invite_config, paths)?;
-    let local_address = address.unwrap_or_else(default_invite_address);
-    let (route, policy) = if remote_address.is_some() {
-        let can_pair_publicly = !config.require_private_lan || allow_public_pairing;
-        let policy = if can_pair_publicly {
-            "public-pairing"
-        } else {
-            "public-reconnect"
-        };
-        ("direct-public", policy)
-    } else {
-        ("direct-lan", "lan-only")
+    let lan_address = match address {
+        Some(address) => address,
+        None => host
+            .primary_lan_address()
+            .await
+            .unwrap_or_else(|| "127.0.0.1".into()),
     };
-    let payload = invite_payload(
-        &discovery_hostname(),
-        &local_address,
-        remote_address.as_deref(),
+    let can_pair_publicly = !config.require_private_lan || allow_public_pairing;
+    let (route, policy) = match remote_address {
+        Some(_) if can_pair_publicly => (InviteRoute::DirectPublic, "public-pairing"),
+        Some(_) => (InviteRoute::DirectPublic, "public-reconnect"),
+        None => (InviteRoute::DirectLan, "lan-only"),
+    };
+    let invite = Invite {
+        host: host.hostname(),
+        address: remote_address
+            .clone()
+            .unwrap_or_else(|| lan_address.clone()),
+        lan_address,
+        remote_address: remote_address.clone(),
         port,
-        &identity.fingerprint,
-        &code.code,
-        code.expires_at,
+        fingerprint: identity.fingerprint.clone(),
+        code: code.code.clone(),
+        expires_at: code.expires_at,
         route,
         policy,
         allow_public_pairing,
-    );
+    };
+    let payload = invite.payload();
+
     println!(
         "Waypad invite expires at unix timestamp: {}",
         code.expires_at
@@ -165,13 +203,16 @@ fn invite_command(config: &Config, paths: &StatePaths, trailing: &[String]) -> a
     println!("Pairing code: {}", code.code);
     println!("Payload: {payload}");
     if qr {
-        print_qr(&payload)?;
+        print!("{}", qr_terminal(&payload)?);
     } else {
         println!("Run `waypad-daemon invite --qr` to print a terminal QR code.");
     }
     if remote_address.is_some() {
-        let can_pair_publicly = !config.require_private_lan || allow_public_pairing;
-        if !can_pair_publicly {
+        if can_pair_publicly {
+            println!();
+            println!("Remote pairing enabled for this invite. Ensure TCP/{port} is reachable");
+            println!("from the internet and that your firewall restricts it appropriately.");
+        } else {
             println!();
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             println!(" REMOTE PAIRING IS CURRENTLY BLOCKED");
@@ -181,125 +222,16 @@ fn invite_command(config: &Config, paths: &StatePaths, trailing: &[String]) -> a
             println!("allow_public_pairing=false).");
             println!();
             println!("Options to enable outside-LAN pairing:");
-            println!("  1) Edit ~/.config/waypad-daemon/config.json and set");
-            println!("     allow_public_pairing=true  (keeps LAN-only for reconnect).");
+            println!("  1) Set allow_public_pairing=true in the config");
+            println!("     (keeps LAN-only for reconnect).");
             println!("  2) Set require_private_lan=false to allow all public traffic.");
             println!();
-            println!(
-                "Only do this if TCP/{} is port-forwarded and protected by your",
-                port
-            );
+            println!("Only do this if TCP/{port} is port-forwarded and protected by your");
             println!("firewall. Pairing still requires the one-time 6-digit code.");
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        } else {
-            println!();
-            println!(
-                "Remote pairing enabled for this invite. Ensure TCP/{} is reachable",
-                port
-            );
-            println!("from the internet and that your firewall restricts it appropriately.");
         }
     }
     Ok(())
-}
-
-fn invite_payload(
-    host: &str,
-    address: &str,
-    remote_address: Option<&str>,
-    port: u16,
-    fingerprint: &str,
-    code: &str,
-    expires: u64,
-    route: &str,
-    policy: &str,
-    allow_public_pairing: bool,
-) -> String {
-    let primary_address = remote_address.unwrap_or(address);
-    let mut query = vec![
-        ("v", "1".to_string()),
-        ("host", host.to_string()),
-        ("address", primary_address.to_string()),
-        ("lan_address", address.to_string()),
-        ("port", port.to_string()),
-        ("fingerprint", fingerprint.to_string()),
-        ("code", code.to_string()),
-        ("expires", expires.to_string()),
-        ("route", route.to_string()),
-        ("policy", policy.to_string()),
-        ("public_pairing_allowed", allow_public_pairing.to_string()),
-    ];
-    if let Some(remote) = remote_address {
-        query.push(("remote_address", remote.to_string()));
-    }
-    format!(
-        "waypad://invite?{}",
-        query
-            .into_iter()
-            .map(|(key, value)| format!("{key}={}", url_encode(&value)))
-            .collect::<Vec<_>>()
-            .join("&")
-    )
-}
-
-fn print_qr(payload: &str) -> anyhow::Result<()> {
-    let output = std::process::Command::new("qrencode")
-        .args(["-t", "ANSIUTF8", "-m", "1", payload])
-        .output()
-        .context("qrencode is required for terminal QR output")?;
-    if !output.status.success() {
-        bail!(
-            "qrencode failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    print!("{}", String::from_utf8_lossy(&output.stdout));
-    Ok(())
-}
-
-fn default_invite_address() -> String {
-    command_output("ip", &["-4", "route", "get", "1.1.1.1"])
-        .and_then(|raw| parse_ip_route_src(&raw))
-        .or_else(|| {
-            command_output("hostname", &["-I"]).and_then(|raw| {
-                raw.split_whitespace()
-                    .find(|part| part.contains('.') && *part != "127.0.0.1")
-                    .map(str::to_string)
-            })
-        })
-        .unwrap_or_else(|| "127.0.0.1".into())
-}
-
-fn parse_ip_route_src(raw: &str) -> Option<String> {
-    let mut parts = raw.split_whitespace();
-    while let Some(part) = parts.next() {
-        if part == "src" {
-            return parts
-                .next()
-                .filter(|value| value.contains('.') && *value != "127.0.0.1")
-                .map(str::to_string);
-        }
-    }
-    None
-}
-
-fn discovery_hostname() -> String {
-    command_output("hostname", &[])
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "waypad-host".into())
-}
-
-fn url_encode(value: &str) -> String {
-    value
-        .bytes()
-        .flat_map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                vec![byte as char]
-            }
-            _ => format!("%{byte:02X}").chars().collect(),
-        })
-        .collect()
 }
 
 fn devices_command(paths: &StatePaths, trailing: &[String]) -> anyhow::Result<()> {
@@ -388,62 +320,20 @@ fn print_help() {
   invite [--qr]                 Create a waypad:// invite; add --remote-address host for mobile data
   invite [--qr --allow-public-pairing --remote-address <host>]
                                 Allow public-network pairing for this invite
-  doctor                        Print Wayland, portal, and backend diagnostics
-  authorize-portal              Pre-authorize screen capture (approve ONCE, then auto-approve forever)
+  doctor                        Print platform, input, capture, and audio diagnostics
   devices list                  List trusted Android devices
   devices revoke <device-id>    Revoke a trusted Android device
   rotate-host-key               Rotate host identity and require re-pairing
-  write-sample-config           Write the default JSON config
-
+  write-sample-config           Write the default JSON config"
+    );
+    #[cfg(target_os = "linux")]
+    println!(
+        "  authorize-portal              Pre-authorize screen capture (approve ONCE, then auto-approve forever)"
+    );
+    println!(
+        "
 Options:
   --config <path>               Use an explicit config file
   -h, --help                    Show this help"
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn invite_payload_contains_pairing_metadata_and_remote_address() {
-        let payload = invite_payload(
-            "pc",
-            "192.168.1.20",
-            Some("203.0.113.10"),
-            47771,
-            "aa:bb",
-            "123456",
-            99,
-            "direct-public",
-            "public-pairing",
-            true,
-        );
-
-        assert!(payload.starts_with("waypad://invite?"));
-        assert!(payload.contains("address=203.0.113.10"));
-        assert!(payload.contains("lan_address=192.168.1.20"));
-        assert!(payload.contains("remote_address=203.0.113.10"));
-        assert!(payload.contains("code=123456"));
-        assert!(payload.contains("fingerprint=aa%3Abb"));
-        assert!(payload.contains("policy=public-pairing"));
-        assert!(payload.contains("public_pairing_allowed=true"));
-    }
-
-    #[test]
-    fn url_encode_preserves_safe_chars_and_escapes_colons() {
-        assert_eq!(url_encode("abc-_.~09"), "abc-_.~09");
-        assert_eq!(url_encode("aa:bb"), "aa%3Abb");
-    }
-
-    #[test]
-    fn parses_route_source_address_for_invites() {
-        let raw = "1.1.1.1 via 192.168.1.1 dev wlan0 src 192.168.1.40 uid 1000";
-
-        assert_eq!(parse_ip_route_src(raw), Some("192.168.1.40".to_string()));
-        assert_eq!(
-            parse_ip_route_src("local 127.0.0.1 dev lo src 127.0.0.1"),
-            None
-        );
-    }
 }

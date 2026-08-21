@@ -15,6 +15,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 
 /// The single entry point a platform crate exports.
 ///
@@ -33,6 +34,15 @@ pub trait PlatformHost: Send + Sync + 'static {
     /// The address a QR invite should advertise on the local network.
     async fn primary_lan_address(&self) -> Option<String>;
 
+    /// The live capability cell.
+    ///
+    /// Backends handed out by this host read from this exact cell, so a
+    /// refresh has to be published here rather than into a copy the server
+    /// keeps privately: two cells would drift, and the capture backend would go
+    /// on listing sources for a portal that is no longer there.
+    fn capabilities(&self) -> Arc<RwLock<Capabilities>>;
+
+    /// Probes the host and publishes the result into [`Self::capabilities`].
     async fn detect_capabilities(&self, config: &Config) -> Capabilities;
 
     /// Builds the input backend matching `capabilities`.
@@ -136,8 +146,11 @@ pub trait CaptureBackend: Send + Sync {
 
     async fn list_sources(&self) -> anyhow::Result<Vec<ScreenSource>>;
 
-    /// Opens a producer for `source`. Called once per attached client, and
-    /// again whenever a keyframe request needs a fresh encoder.
+    /// Opens a producer for `source`, once per attached client.
+    ///
+    /// Setup failures — including falling back to a slower pipeline — belong
+    /// here rather than mid-stream, because nothing has been written to the
+    /// client yet at this point and the codec is still free to change.
     async fn open(
         &self,
         source: &ScreenSource,
@@ -204,17 +217,6 @@ pub struct EncodedUnit {
     pub geometry: FrameGeometry,
 }
 
-/// Whether a producer could satisfy a keyframe request on its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyFrameOutcome {
-    /// A keyframe was forced; the stream continues uninterrupted.
-    Delivered,
-    /// This producer cannot force one, so the pump must drop it and open a
-    /// fresh producer, whose first picture is an IDR by construction. Costs a
-    /// few hundred milliseconds of stream gap.
-    RequiresReopen,
-}
-
 /// A live encoder attached to one client.
 #[async_trait]
 pub trait FrameProducer: Send {
@@ -224,11 +226,26 @@ pub trait FrameProducer: Send {
 
     /// Yields the next unit, or `None` once the producer is finished.
     ///
+    /// Two guarantees the pump relies on, because it forwards units blindly:
+    ///
+    /// - The very first unit is decodable on its own — an IDR for H.264, and
+    ///   trivially so for JPEG. A decoder joining a stream on a P-frame shows
+    ///   nothing at all until the next IDR.
+    /// - The same holds after any internal restart. A producer that rebuilds
+    ///   its encoder must not emit the new pipeline's leading non-IDR frames.
+    ///
     /// Must be cancel safe: the pump races this against a stop signal and a
     /// keyframe request, so a dropped future must not lose buffered data.
     async fn next_unit(&mut self) -> anyhow::Result<Option<EncodedUnit>>;
 
-    async fn request_key_frame(&mut self) -> anyhow::Result<KeyFrameOutcome>;
+    /// Makes the next unit a keyframe, however this platform manages that.
+    ///
+    /// Some encoders take a force-keyframe flag; others have to be respawned.
+    /// Either way it is the producer's business, including rate limiting a
+    /// client that asks repeatedly — the cost of honouring a request differs by
+    /// orders of magnitude between the two, so a single policy in the pump
+    /// would be wrong for one of them.
+    async fn request_key_frame(&mut self) -> anyhow::Result<()>;
 
     /// Releases the encoder and any capture session. Failures are logged, not
     /// propagated: the client is already gone by the time this runs.

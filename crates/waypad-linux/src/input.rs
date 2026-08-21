@@ -1,10 +1,9 @@
 use crate::{
-    capability::Capabilities,
     platform::{command_exists, hyprland_ipc_socket_path},
-    protocol::{ButtonState, PointerButton},
     uinput::VirtualInputBackend,
 };
 use anyhow::{Context, bail};
+use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
@@ -15,6 +14,11 @@ use tokio::process::Command;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::Notify;
 use tokio::time::{Duration, timeout};
+use waypad_core::{
+    backend::InputBackend,
+    capability::Capabilities,
+    protocol::{ButtonState, PointerButton},
+};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 #[derive(Debug)]
@@ -62,8 +66,20 @@ impl InputManager {
             },
         }
     }
+}
 
-    pub async fn prepare(&mut self) -> anyhow::Result<serde_json::Value> {
+#[async_trait]
+impl InputBackend for InputManager {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Noop { .. } => "noop",
+            Self::Portal(_) => "wayland-portal",
+            Self::Hyprland(_) => "hyprland-ipc",
+            Self::Uinput(_) => "uinput",
+        }
+    }
+
+    async fn prepare(&mut self) -> anyhow::Result<serde_json::Value> {
         match self {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.prepare().await,
@@ -72,7 +88,7 @@ impl InputManager {
         }
     }
 
-    pub async fn pointer_move(&self, dx: f64, dy: f64) -> anyhow::Result<()> {
+    async fn pointer_move(&self, dx: f64, dy: f64) -> anyhow::Result<()> {
         match self {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.pointer_move(dx, dy).await,
@@ -81,7 +97,7 @@ impl InputManager {
         }
     }
 
-    pub async fn pointer_move_absolute(&self, x: f64, y: f64) -> anyhow::Result<()> {
+    async fn pointer_move_absolute(&self, x: f64, y: f64) -> anyhow::Result<()> {
         match self {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.pointer_move_absolute(x, y).await,
@@ -90,7 +106,7 @@ impl InputManager {
         }
     }
 
-    pub async fn pointer_button(
+    async fn pointer_button(
         &self,
         button: PointerButton,
         state: ButtonState,
@@ -103,7 +119,7 @@ impl InputManager {
         }
     }
 
-    pub async fn scroll(&self, dx: f64, dy: f64, finish: bool) -> anyhow::Result<()> {
+    async fn scroll(&self, dx: f64, dy: f64, finish: bool) -> anyhow::Result<()> {
         match self {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.scroll(dx, dy, finish).await,
@@ -112,7 +128,7 @@ impl InputManager {
         }
     }
 
-    pub async fn key(&self, keysym: u32, state: ButtonState) -> anyhow::Result<()> {
+    async fn key(&self, keysym: u32, state: ButtonState) -> anyhow::Result<()> {
         match self {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.key(keysym, state).await,
@@ -121,7 +137,7 @@ impl InputManager {
         }
     }
 
-    pub async fn text(&self, text: &str) -> anyhow::Result<()> {
+    async fn text(&self, text: &str) -> anyhow::Result<()> {
         match self {
             Self::Noop { reason } => bail!("{reason}"),
             Self::Portal(backend) => backend.text(text).await,
@@ -129,12 +145,14 @@ impl InputManager {
             Self::Uinput(backend) => uinput_text(backend, text).await,
         }
     }
-}
 
-impl InputManager {
     /// Releases any key or button still held, so a dropped session cannot leave
     /// the desktop with a stuck modifier or an unfinished drag.
-    pub fn release_all(&self) {
+    ///
+    /// Only the uinput backend tracks held state; the portal and Hyprland paths
+    /// have no way to enumerate what they pressed, which is one more reason
+    /// uinput is preferred where it is available.
+    fn release_all(&self) {
         if let Self::Uinput(backend) = self
             && let Err(err) = backend.release_all()
         {
@@ -245,7 +263,7 @@ impl HyprlandHyprctlInputBackend {
         }))
     }
 
-    pub async fn pointer_move(&self, dx: f64, dy: f64) -> anyhow::Result<()> {
+    async fn pointer_move(&self, dx: f64, dy: f64) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
         if let Some(error) = state.pointer_last_error.take() {
             bail!("Hyprland pointer dispatch failed: {error}");
@@ -268,7 +286,7 @@ impl HyprlandHyprctlInputBackend {
         Ok(())
     }
 
-    pub async fn pointer_move_absolute(&self, x: f64, y: f64) -> anyhow::Result<()> {
+    async fn pointer_move_absolute(&self, x: f64, y: f64) -> anyhow::Result<()> {
         let mut state = self.state.lock().await;
         if let Some(error) = state.pointer_last_error.take() {
             bail!("Hyprland pointer dispatch failed: {error}");
@@ -292,19 +310,19 @@ impl HyprlandHyprctlInputBackend {
         Ok(())
     }
 
-    pub async fn pointer_button(
+    async fn pointer_button(
         &self,
         button: PointerButton,
         state: ButtonState,
     ) -> anyhow::Result<()> {
         self.flush_pointer().await?;
-        let key = button.hyprland_key();
-        let state = state.hyprland_state();
+        let key = hyprland_key(&button);
+        let state = hyprland_state(&state);
         self.dispatch(&format!("sendkeystate , {key},{state},activewindow"))
             .await
     }
 
-    pub async fn scroll(&self, dx: f64, dy: f64, finish: bool) -> anyhow::Result<()> {
+    async fn scroll(&self, dx: f64, dy: f64, finish: bool) -> anyhow::Result<()> {
         self.flush_pointer().await?;
         let mut state = self.state.lock().await;
         state.scroll_x_remainder += dx;
@@ -338,17 +356,17 @@ impl HyprlandHyprctlInputBackend {
         Ok(())
     }
 
-    pub async fn key(&self, keysym: u32, state: ButtonState) -> anyhow::Result<()> {
+    async fn key(&self, keysym: u32, state: ButtonState) -> anyhow::Result<()> {
         self.flush_pointer().await?;
         let key = keysym_to_hyprland_key(keysym)?;
         self.dispatch(&format!(
             "sendkeystate , {key},{},activewindow",
-            state.hyprland_state()
+            hyprland_state(&state)
         ))
         .await
     }
 
-    pub async fn text(&self, text: &str) -> anyhow::Result<()> {
+    async fn text(&self, text: &str) -> anyhow::Result<()> {
         self.flush_pointer().await?;
         if text.is_empty() {
             return Ok(());
@@ -769,35 +787,33 @@ fn keysym_to_hyprland_key(keysym: u32) -> anyhow::Result<&'static str> {
     Ok(key)
 }
 
-impl PointerButton {
-    fn hyprland_key(&self) -> &'static str {
-        match self {
-            Self::Left => "mouse:272",
-            Self::Right => "mouse:273",
-            Self::Middle => "mouse:274",
-        }
+/// Free functions rather than inherent methods: the protocol types belong to
+/// the core crate and cannot gain methods here.
+fn hyprland_key(button: &PointerButton) -> &'static str {
+    match button {
+        PointerButton::Left => "mouse:272",
+        PointerButton::Right => "mouse:273",
+        PointerButton::Middle => "mouse:274",
     }
 }
 
-impl ButtonState {
-    fn hyprland_state(&self) -> &'static str {
-        match self {
-            Self::Pressed => "down",
-            Self::Released => "up",
-        }
+fn hyprland_state(state: &ButtonState) -> &'static str {
+    match state {
+        ButtonState::Pressed => "down",
+        ButtonState::Released => "up",
     }
 }
 
 impl WaylandPortalInputBackend {
-    pub async fn text(&self, text: &str) -> anyhow::Result<()> {
+    async fn text(&self, text: &str) -> anyhow::Result<()> {
         if text.len() > 4096 {
             bail!("Text input rejected: maximum length is 4096 bytes");
         }
         for ch in text.chars() {
             let keysym = ch as u32;
-            self.key(keysym, crate::protocol::ButtonState::Pressed)
+            self.key(keysym, waypad_core::protocol::ButtonState::Pressed)
                 .await?;
-            self.key(keysym, crate::protocol::ButtonState::Released)
+            self.key(keysym, waypad_core::protocol::ButtonState::Released)
                 .await?;
         }
         Ok(())
@@ -941,7 +957,7 @@ impl WaylandPortalInputBackend {
         }))
     }
 
-    pub async fn pointer_move(&self, dx: f64, dy: f64) -> anyhow::Result<()> {
+    async fn pointer_move(&self, dx: f64, dy: f64) -> anyhow::Result<()> {
         let session = self.session()?;
         self.proxy()
             .await?
@@ -950,7 +966,7 @@ impl WaylandPortalInputBackend {
         Ok(())
     }
 
-    pub async fn pointer_move_absolute(&self, x: f64, y: f64) -> anyhow::Result<()> {
+    async fn pointer_move_absolute(&self, x: f64, y: f64) -> anyhow::Result<()> {
         let session = self.session()?;
         self.proxy()
             .await?
@@ -965,7 +981,7 @@ impl WaylandPortalInputBackend {
         Ok(())
     }
 
-    pub async fn pointer_button(
+    async fn pointer_button(
         &self,
         button: PointerButton,
         state: ButtonState,
@@ -986,7 +1002,7 @@ impl WaylandPortalInputBackend {
         Ok(())
     }
 
-    pub async fn scroll(&self, dx: f64, dy: f64, finish: bool) -> anyhow::Result<()> {
+    async fn scroll(&self, dx: f64, dy: f64, finish: bool) -> anyhow::Result<()> {
         let session = self.session()?;
         let mut options = HashMap::<&str, OwnedValue>::new();
         options.insert("finish", Value::from(finish).try_into()?);
@@ -997,7 +1013,7 @@ impl WaylandPortalInputBackend {
         Ok(())
     }
 
-    pub async fn key(&self, keysym: u32, state: ButtonState) -> anyhow::Result<()> {
+    async fn key(&self, keysym: u32, state: ButtonState) -> anyhow::Result<()> {
         let session = self.session()?;
         self.proxy()
             .await?

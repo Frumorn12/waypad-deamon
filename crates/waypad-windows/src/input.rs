@@ -266,6 +266,14 @@ impl InputBackend for SendInputBackend {
     }
 }
 
+/// Presses and releases one virtual key as a single atomic sequence.
+///
+/// Used for the multimedia keys, which are stateless taps rather than something
+/// a client holds down, so they need none of the held-key tracking above.
+pub fn tap_virtual_key(key: VIRTUAL_KEY) -> anyhow::Result<()> {
+    send(&[key_input(key.0, false), key_input(key.0, true)])
+}
+
 const TAG_LEFT: u8 = 0;
 const TAG_RIGHT: u8 = 1;
 const TAG_MIDDLE: u8 = 2;
@@ -390,6 +398,20 @@ fn virtual_desktop_size() -> anyhow::Result<(i32, i32)> {
 /// Converts a desktop pixel coordinate into the 0..65535 space `SendInput`
 /// wants, clamped so a coordinate off the edge of the desktop parks the pointer
 /// at the edge instead of wrapping.
+///
+/// Accurate to about a pixel, and no better, which is a property of the
+/// platform rather than of this arithmetic: Windows rounds on the way back, and
+/// on a desktop with mixed DPI scaling the scaled coordinate space the metrics
+/// report does not map one-to-one onto physical pixels at all. Measured on a
+/// 1920@100% + 1920@125% pair, every candidate formula lands within one pixel
+/// and none lands exactly.
+///
+/// Two consequences worth knowing before chasing a "wrong position" report.
+/// A target on the seam between two monitors can land on either side, and if
+/// the neighbour is shorter in scaled pixels the pointer is then clamped up to
+/// its bottom edge. And the bounding box is not the desktop: with monitors of
+/// different scaled heights, its corners are dead space no monitor covers, and
+/// Windows silently parks the cursor at the nearest real pixel instead.
 fn to_virtual_desktop_absolute(x: f64, y: f64) -> anyhow::Result<(i32, i32)> {
     let (origin_x, origin_y, width, height) = virtual_desktop()?;
     let normalise = |value: f64, origin: i32, extent: i32| {
@@ -601,6 +623,8 @@ mod live_tests {
     #[tokio::test]
     #[ignore = "moves the mouse of whoever runs it"]
     async fn the_pointer_lands_where_it_was_told_to() {
+        use windows::Win32::UI::WindowsAndMessaging::{SM_CXSCREEN, SM_CYSCREEN};
+
         assert!(
             has_interactive_pointer(),
             concat!(
@@ -613,29 +637,60 @@ mod live_tests {
         );
 
         let backend = SendInputBackend::new();
-        let (origin_x, origin_y, width, height) = virtual_desktop().unwrap();
+        let (origin_x, origin_y, width, _height) = virtual_desktop().unwrap();
+        // SAFETY: GetSystemMetrics reads a global and cannot fail.
+        let (primary_width, primary_height) =
+            unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
         let restore = cursor();
 
+        // Every target has to be a point some monitor actually covers. The
+        // bottom-right of the virtual desktop's bounding box is not: with two
+        // monitors at different DPI scaling the shorter one leaves dead space
+        // below it, and Windows quietly parks the cursor at the nearest real
+        // pixel instead. Asserting against the bounding box therefore fails on
+        // exactly the setups this mapping most needs to be right for.
         for (label, target_x, target_y) in [
-            ("top-left", origin_x, origin_y),
-            ("bottom-right", origin_x + width - 1, origin_y + height - 1),
-            ("centre", origin_x + width / 2, origin_y + height / 2),
+            ("origin", origin_x, origin_y),
+            (
+                "primary centre",
+                origin_x + primary_width / 2,
+                origin_y + primary_height / 2,
+            ),
+            (
+                "primary lower right, off the seam",
+                origin_x + primary_width - 40,
+                origin_y + primary_height - 40,
+            ),
+            // Inset from the far edge for the same reason: the last column
+            // belongs to whichever monitor rounding picks.
+            ("far right, top area", origin_x + width - 40, origin_y + 40),
         ] {
-            backend
-                .pointer_move_absolute(f64::from(target_x), f64::from(target_y))
-                .await
-                .unwrap();
-            // SendInput is asynchronous with respect to the cursor: the move is
-            // queued, so the position is read after the queue has drained.
-            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-            let landed = cursor();
-            // One pixel of slack: the 0..65535 grid is coarser than a large
-            // desktop, so an exact landing is not always representable.
+            // Retried because a human using the machine moves the mouse between
+            // the injection and the readback, which is interference rather than
+            // a failure. Three chances is enough to get one clean landing
+            // without the test hanging around if the mapping is genuinely wrong.
+            let mut landed = POINT::default();
+            let mut ok = false;
+            for _ in 0..3 {
+                backend
+                    .pointer_move_absolute(f64::from(target_x), f64::from(target_y))
+                    .await
+                    .unwrap();
+                // SendInput is asynchronous with respect to the cursor: the move
+                // is queued, so the position is read after the queue drains.
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                landed = cursor();
+                // One pixel of slack: the 0..65535 grid is coarser than a large
+                // desktop, so an exact landing is not always representable.
+                if (landed.x - target_x).abs() <= 1 && (landed.y - target_y).abs() <= 1 {
+                    ok = true;
+                    break;
+                }
+            }
             assert!(
-                (landed.x - target_x).abs() <= 1 && (landed.y - target_y).abs() <= 1,
-                "{label}: asked for ({target_x},{target_y}), landed at ({},{})",
-                landed.x,
-                landed.y
+                ok,
+                "{label}: asked for ({target_x},{target_y}), landed at ({},{}) three times",
+                landed.x, landed.y
             );
         }
 

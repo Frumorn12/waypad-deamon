@@ -16,6 +16,7 @@ pub mod config;
 pub mod crypto;
 pub mod discovery;
 pub mod input;
+pub mod invite;
 pub mod protocol;
 pub mod server;
 pub mod signal;

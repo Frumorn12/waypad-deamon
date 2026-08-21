@@ -13,6 +13,7 @@
 pub mod audio;
 pub mod capability;
 pub mod gamepad;
+pub mod host;
 pub mod input;
 pub mod platform;
 pub mod screen;

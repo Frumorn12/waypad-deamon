@@ -13,6 +13,7 @@ async-trait.workspace = true
 base64.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+qrcode.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true

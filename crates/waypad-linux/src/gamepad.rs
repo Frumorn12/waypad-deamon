@@ -1,4 +1,3 @@
-use crate::protocol::ButtonState;
 use crate::uinput::{
     BUS_USB, EV_ABS, EV_KEY, EV_SYN, InputEvent, SYN_REPORT, UINPUT_PATH, UInputUserDev,
     ioctl_noarg, set_absbit, set_evbit, set_keybit, ui_dev_create, ui_dev_destroy, write_struct,
@@ -11,6 +10,7 @@ use std::{
     path::Path,
 };
 use tracing::{debug, info, warn};
+use waypad_core::{backend::ControllerBackend, protocol::ButtonState};
 
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
@@ -100,36 +100,6 @@ impl ControllerInputManager {
         }
     }
 
-    pub fn device_connected(&mut self, device_id: &str, name: &str) -> anyhow::Result<()> {
-        let backend = self.ensure_backend()?;
-        info!(%device_id, %name, "android controller attached to virtual gamepad");
-        backend.reset()
-    }
-
-    pub fn device_disconnected(&mut self, device_id: &str) -> anyhow::Result<()> {
-        if let Some(backend) = &mut self.backend {
-            info!(%device_id, "android controller detached from virtual gamepad");
-            backend.reset()?;
-        }
-        Ok(())
-    }
-
-    pub fn button(&mut self, button: &str, state: ButtonState) -> anyhow::Result<()> {
-        self.ensure_backend()?.button(button, state)
-    }
-
-    pub fn axis(&mut self, axis: &str, value: f64) -> anyhow::Result<()> {
-        self.ensure_backend()?.axis(axis, value)
-    }
-
-    pub fn flush_pending(&mut self) -> anyhow::Result<()> {
-        if let Some(backend) = &mut self.backend {
-            backend.flush_pending()
-        } else {
-            Ok(())
-        }
-    }
-
     fn ensure_backend(&mut self) -> anyhow::Result<&mut VirtualGamepadBackend> {
         if !self.available {
             bail!("{}", self.unavailable_reason);
@@ -138,6 +108,52 @@ impl ControllerInputManager {
             self.backend = Some(VirtualGamepadBackend::create()?);
         }
         Ok(self.backend.as_mut().expect("backend just initialized"))
+    }
+}
+
+impl ControllerBackend for ControllerInputManager {
+    fn name(&self) -> &'static str {
+        "linux-uinput"
+    }
+
+    fn available(&self) -> bool {
+        self.available
+    }
+
+    fn reason(&self) -> String {
+        self.unavailable_reason.clone()
+    }
+
+    fn device_connected(&mut self, device_id: &str, name: &str) -> anyhow::Result<()> {
+        let backend = self.ensure_backend()?;
+        info!(%device_id, %name, "android controller attached to virtual gamepad");
+        backend.reset()
+    }
+
+    fn device_disconnected(&mut self, device_id: &str) -> anyhow::Result<()> {
+        // Only resets a device that was actually taken: the phone reports every
+        // unplug, including ones this host never forwarded.
+        if let Some(backend) = &mut self.backend {
+            info!(%device_id, "android controller detached from virtual gamepad");
+            backend.reset()?;
+        }
+        Ok(())
+    }
+
+    fn button(&mut self, button: &str, state: ButtonState) -> anyhow::Result<()> {
+        self.ensure_backend()?.button(button, state)
+    }
+
+    fn axis(&mut self, axis: &str, value: f64) -> anyhow::Result<()> {
+        self.ensure_backend()?.axis(axis, value)
+    }
+
+    fn flush_pending(&mut self) -> anyhow::Result<()> {
+        if let Some(backend) = &mut self.backend {
+            backend.flush_pending()
+        } else {
+            Ok(())
+        }
     }
 }
 

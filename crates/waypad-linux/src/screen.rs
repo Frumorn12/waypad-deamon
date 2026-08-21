@@ -1,230 +1,102 @@
-use crate::{
-    audio::{AudioStreamOptions, AudioStreamStatus, DesktopAudioStream},
-    capability::Capabilities,
-    input::InputManager,
-    platform::{command_exists, command_output},
-};
+//! Screen capture on Linux: XDG ScreenCast portal, Hyprland `grim`, X11 grab.
+//!
+//! The session lifetime, envelope framing and pump live in
+//! `waypad_core::stream`. What is here is only the part that turns a Wayland
+//! desktop into encoded pictures, which is three quite different mechanisms
+//! wearing one interface.
+//!
+//! The fallback order matters and is decided in [`LinuxCaptureBackend::open`]
+//! rather than mid-stream: nothing has been written to the client at that
+//! point, so the codec is still free to change. Once a frame has gone out, the
+//! handshake line has fixed the codec and falling back is no longer possible.
+
+use crate::platform::command_output;
 use anyhow::{Context, bail};
+use async_trait::async_trait;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     os::fd::AsRawFd,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, OnceLock},
+    time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    process::{ChildStderr, ChildStdout, Command},
-    sync::{Mutex, RwLock, mpsc, oneshot},
-    task::JoinHandle,
-    time::timeout,
+    io::AsyncReadExt,
+    process::{Child, ChildStderr, ChildStdout, Command},
+    sync::{Mutex, RwLock},
+    time::{Instant, timeout},
 };
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use waypad_core::{
+    backend::{CaptureBackend, EncodedUnit, FrameProducer, StreamEncoding},
+    capability::Capabilities,
+    state::StatePaths,
+    stream::{
+        AnnexBStreamReader, FrameGeometry, JpegStreamReader, ScreenSource, StreamTuning,
+        annexb::AccessUnit, capture_scale, even_dimension, keyframe_interval, resolve_bitrate_kbps,
+        target_dimensions,
+    },
+};
 use zbus::zvariant::{OwnedFd, OwnedObjectPath, OwnedValue, Value};
 
-const STREAM_MAGIC_V1: &[u8] = b"WAYPAD_STREAM_V1\n";
-const STREAM_MAGIC_V2: &[u8] = b"WAYPAD_STREAM_V2\n";
+/// How long a freshly spawned pipeline gets to produce its first picture before
+/// it is written off and the fallback takes over. Portal approval has already
+/// happened by then, so this only covers encoder negotiation.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The stream socket, shared by the video producer and the optional desktop
-/// audio producer.
-///
-/// Both write whole envelopes under the same lock, so the two producers
-/// interleave on the wire without ever cutting each other's frames — which is
-/// what lets audio ride the existing connection instead of opening a second one.
-/// Audio waits only briefly for the lock and drops its packet otherwise, so it
-/// can never delay a video frame.
-#[derive(Debug)]
-pub struct StreamSocket {
-    socket: Mutex<TcpStream>,
-    magic_sent: AtomicBool,
-}
+/// Encoder respawns are cheap but not free, so a client that asks for keyframes
+/// repeatedly cannot make the pipeline thrash.
+const KEYFRAME_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
-impl StreamSocket {
-    pub fn new(socket: TcpStream) -> Self {
-        Self {
-            socket: Mutex::new(socket),
-            magic_sent: AtomicBool::new(false),
-        }
-    }
+/// `grim` screenshots the whole monitor per frame and is far slower than the
+/// PipeWire path, so the fallback caps resolution hard rather than trying and
+/// delivering two frames a second.
+const GRIM_MAX_SCALE: f64 = 0.4;
+/// Above this the screenshot cost dominates; the fallback is about staying
+/// usable, not about looking good.
+const GRIM_MAX_QUALITY: u8 = 35;
 
-    /// True once the handshake line naming the payload codec has been written.
-    /// Nothing may be sent before it: a client cannot frame what it cannot
-    /// identify.
-    pub fn handshake_sent(&self) -> bool {
-        self.magic_sent.load(Ordering::Acquire)
-    }
-
-    pub(crate) async fn send_magic(&self, magic: &[u8]) -> anyhow::Result<()> {
-        if self.handshake_sent() {
-            return Ok(());
-        }
-        let mut socket = self.socket.lock().await;
-        if self.handshake_sent() {
-            return Ok(());
-        }
-        socket.write_all(magic).await?;
-        self.magic_sent.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    async fn write_all(&self, buf: &[u8], deadline: Duration) -> anyhow::Result<()> {
-        let mut socket = self.socket.lock().await;
-        timeout(deadline, socket.write_all(buf))
-            .await
-            .context("screen stream client stalled while receiving a frame")??;
-        Ok(())
-    }
-
-    /// Writes an envelope only if the socket is free, reporting `false` when the
-    /// other producer held it for longer than `lock_timeout`.
-    ///
-    /// Once the lock is taken the envelope is written whole: a partial write
-    /// would desynchronise the framing for the rest of the session.
-    pub async fn try_write_envelope(
-        &self,
-        header: &str,
-        payload: &[u8],
-        lock_timeout: Duration,
-        write_timeout: Duration,
-    ) -> anyhow::Result<bool> {
-        let Ok(mut socket) = timeout(lock_timeout, self.socket.lock()).await else {
-            return Ok(false);
-        };
-        let buf = frame_envelope(header, payload);
-        timeout(write_timeout, socket.write_all(&buf))
-            .await
-            .context("screen stream client stalled while receiving an audio packet")??;
-        Ok(true)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ScreenSource {
-    pub id: String,
-    pub label: String,
-    pub kind: String,
-    pub backend: String,
-    pub width: u32,
-    pub height: u32,
-    pub x: i32,
-    pub y: i32,
-    pub scale: f64,
-    pub focused: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StreamStartOptions {
-    pub source_id: Option<String>,
-    pub max_fps: Option<u32>,
-    pub jpeg_quality: Option<u8>,
-    pub bitrate_kbps: Option<u32>,
-    pub max_width: Option<u32>,
-    pub max_height: Option<u32>,
-    /// Whether desktop audio rides along on the same socket. Absent means yes,
-    /// so a client that never learned about audio still gets it.
-    pub audio: Option<bool>,
-    pub audio_bitrate_kbps: Option<u32>,
-    pub audio_frame_ms: Option<u32>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct StreamStartResponse {
-    pub session_id: String,
-    pub stream_port: u16,
-    pub token: String,
-    pub codec: String,
-    pub transport: String,
-    pub source: ScreenSource,
-    pub actual_fps: u32,
-    pub actual_quality: u8,
-    pub actual_bitrate_kbps: u32,
-    /// Why the fast PipeWire pipeline last fell back to the slow `grim`
-    /// screenshot backend. Surfaced so a broken fast path cannot sit unnoticed
-    /// behind a fallback that merely looks slow.
-    pub portal_last_error: Option<String>,
-    /// What the session will do about desktop audio. `running` only turns true
-    /// once a client attaches, because the audio producer is bound to the
-    /// stream socket.
-    pub audio: AudioStreamStatus,
-}
-
-/// Encoder knobs the Android client negotiates per session.
-#[derive(Clone, Copy, Debug)]
-struct StreamTuning {
-    fps: u32,
-    quality: u8,
-    bitrate_kbps: Option<u32>,
-    max_width: Option<u32>,
-    max_height: Option<u32>,
-}
-
-#[derive(Debug)]
-pub struct ScreenManager {
+pub struct LinuxCaptureBackend {
     capabilities: Arc<RwLock<Capabilities>>,
-    stream_port: u16,
-    sessions: Arc<Mutex<HashMap<String, StreamSession>>>,
-    paths: Arc<super::state::StatePaths>,
-    last_portal_error: Arc<Mutex<Option<String>>>,
+    paths: Arc<StatePaths>,
+    /// Why the portal pipeline last fell back. Surfaced through the control
+    /// channel so a permanently broken fast path cannot hide behind a fallback
+    /// that merely looks slow.
+    last_error: Mutex<Option<String>>,
 }
 
-#[derive(Debug)]
-enum StreamSession {
-    Pending(PendingStream),
-    Running(RunningStream),
+impl std::fmt::Debug for LinuxCaptureBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinuxCaptureBackend")
+            .finish_non_exhaustive()
+    }
 }
 
-#[derive(Debug)]
-struct PendingStream {
-    token: String,
-    source: ScreenSource,
-    tuning: StreamTuning,
-    audio: bool,
-    audio_options: AudioStreamOptions,
-}
-
-#[derive(Debug)]
-struct RunningStream {
-    stop: oneshot::Sender<()>,
-    keyframe: mpsc::Sender<()>,
-    task: JoinHandle<()>,
-    /// Kept so audio can be started, stopped, or muted after the fact without
-    /// disturbing the video producer that is already writing to it.
-    socket: Arc<StreamSocket>,
-    audio: Option<DesktopAudioStream>,
-    audio_options: AudioStreamOptions,
-}
-
-impl ScreenManager {
-    pub fn new(
-        capabilities: Arc<RwLock<Capabilities>>,
-        stream_port: u16,
-        paths: super::state::StatePaths,
-    ) -> Self {
+impl LinuxCaptureBackend {
+    pub fn new(capabilities: Arc<RwLock<Capabilities>>, paths: StatePaths) -> Self {
         Self {
             capabilities,
-            stream_port,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
             paths: Arc::new(paths),
-            last_portal_error: Arc::new(Mutex::new(None)),
+            last_error: Mutex::new(None),
         }
     }
+}
 
-    pub async fn list_sources(&self) -> anyhow::Result<Vec<ScreenSource>> {
+#[async_trait]
+impl CaptureBackend for LinuxCaptureBackend {
+    fn name(&self) -> &'static str {
+        "linux-screencast"
+    }
+
+    async fn list_sources(&self) -> anyhow::Result<Vec<ScreenSource>> {
         let capabilities = self.capabilities.read().await.clone();
         let portal_available = capabilities.capture.portal_screencast_available
             && capabilities.capture.pipewire_runtime_available
             && capabilities.capture.gstreamer_pipewire_available;
-        let _has_restore_token = crate::state::load_portal_restore_token(&self.paths).is_some();
 
         let mut sources = Vec::new();
-
         if portal_available {
             sources.push(ScreenSource {
                 id: "portal:chooser".into(),
@@ -244,901 +116,582 @@ impl ScreenManager {
                 warn!(%err, "failed to enumerate Hyprland monitors");
                 Vec::new()
             });
-            for (i, mut monitor) in monitors.into_iter().enumerate() {
-                monitor.focused = i == 0 && sources.iter().all(|s| !s.focused);
+            for (index, mut monitor) in monitors.into_iter().enumerate() {
+                monitor.focused = index == 0 && sources.iter().all(|source| !source.focused);
                 sources.push(monitor);
             }
         }
-        // X11 ffmpeg backend — high performance, no portal approval needed
-        if std::env::var("DISPLAY").is_ok() && command_exists("xrandr") && command_exists("ffmpeg")
+        // The X11 grab path needs no portal approval and is fast, so it is
+        // offered whenever the tools for it exist.
+        if std::env::var("DISPLAY").is_ok()
+            && crate::platform::command_exists("xrandr")
+            && crate::platform::command_exists("ffmpeg")
         {
             match list_x11_monitors().await {
                 Ok(monitors) => {
-                    for (i, mut monitor) in monitors.into_iter().enumerate() {
-                        monitor.focused = i == 0 && sources.iter().all(|s| !s.focused);
+                    for (index, mut monitor) in monitors.into_iter().enumerate() {
+                        monitor.focused =
+                            index == 0 && sources.iter().all(|source| !source.focused);
                         sources.push(monitor);
                     }
                 }
-                Err(err) => {
-                    warn!(%err, "failed to enumerate X11 monitors");
-                }
+                Err(err) => warn!(%err, "failed to enumerate X11 monitors"),
             }
-        }
-        if sources.is_empty() {
-            bail!(
-                "{}",
-                capabilities
-                    .capture
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "Screen capture unavailable on this host".into())
-            );
         }
         Ok(sources)
     }
 
-    pub async fn source_by_id(
+    async fn open(
         &self,
-        source_id: Option<&str>,
-    ) -> anyhow::Result<Option<ScreenSource>> {
-        if source_id.is_none_or(str::is_empty) {
-            return Ok(None);
+        source: &ScreenSource,
+        tuning: StreamTuning,
+    ) -> anyhow::Result<Box<dyn FrameProducer>> {
+        match source.backend.as_str() {
+            "wayland-screencast-portal" => {
+                match PortalProducer::start(tuning, self.paths.as_ref()).await {
+                    Ok(producer) => {
+                        *self.last_error.lock().await = None;
+                        Ok(Box::new(producer))
+                    }
+                    Err(err) => {
+                        let detail = format!("{err:#}");
+                        *self.last_error.lock().await = Some(detail.clone());
+                        // Loud on purpose: the grim fallback still produces a
+                        // picture, so a permanently broken fast path is
+                        // invisible unless the reason is reported.
+                        error!(
+                            error = %detail,
+                            "portal screen pipeline failed; falling back to the grim screenshot backend, which caps out near 6 FPS"
+                        );
+                        Ok(Box::new(GrimProducer::start(source.clone(), tuning)))
+                    }
+                }
+            }
+            "x11-ffmpeg" => Ok(Box::new(X11Producer::start(source.clone(), tuning).await?)),
+            _ => Ok(Box::new(GrimProducer::start(source.clone(), tuning))),
         }
-        self.select_source(source_id).await.map(Some)
     }
 
-    pub async fn start_stream(
-        &self,
-        options: StreamStartOptions,
-    ) -> anyhow::Result<StreamStartResponse> {
-        let source = self.select_source(options.source_id.as_deref()).await?;
+    async fn last_error(&self) -> Option<String> {
+        self.last_error.lock().await.clone()
+    }
 
-        let _is_grim = source.backend == "hyprland-grim";
-        let tuning = StreamTuning {
-            fps: options.max_fps.unwrap_or(30).clamp(1, 60),
-            quality: options.jpeg_quality.unwrap_or(70).clamp(35, 92),
-            bitrate_kbps: options.bitrate_kbps,
-            max_width: options.max_width.map(|value| value.clamp(480, 3840)),
-            max_height: options.max_height.map(|value| value.clamp(480, 3840)),
-        };
-        let session_id = Uuid::new_v4().to_string();
-        let token = Uuid::new_v4().to_string();
-        let audio_options =
-            AudioStreamOptions::new(options.audio_bitrate_kbps, options.audio_frame_ms);
-        let audio_capability = self.capabilities.read().await.audio_capture.clone();
-        // Audio is opt-out rather than opt-in: it costs a fraction of the video
-        // bandwidth and a client that never heard of it still gets sound.
-        let audio_requested = options.audio.unwrap_or(true) && audio_capability.supported;
-        let audio_reason = if options.audio == Some(false) {
-            Some("Desktop audio was disabled by the client for this session".into())
-        } else {
-            audio_capability.reason.clone()
-        };
+    async fn announced_codec(&self, source: &ScreenSource) -> String {
         // Hardware H.264 only rides on the PipeWire pipeline; the grim and X11
         // fallbacks stay on JPEG, so the announced codec follows the backend.
         let h264 = source.backend == "wayland-screencast-portal" && detect_h264_encoder().is_some();
+        if h264 { "h264".into() } else { "jpeg".into() }
+    }
+
+    fn source_origin(&self, source: &ScreenSource) -> Option<(i32, i32)> {
+        // `grim -o <output>` captures one monitor, so its frames are in that
+        // monitor's own coordinates and need the origin added back. The portal
+        // and X11 paths already deliver desktop coordinates.
+        (source.backend == "hyprland-grim").then_some((source.x, source.y))
+    }
+}
+
+/// The PipeWire pipeline behind the ScreenCast portal.
+///
+/// Owns the portal session for its whole life: the PipeWire file descriptor has
+/// to stay open so the encoder can be respawned for a keyframe request without
+/// asking the user to approve anything again.
+struct PortalProducer {
+    portal: PortalScreenCastSession,
+    fps: u32,
+    encoding: PipelineEncoding,
+    target: (Option<u32>, Option<u32>),
+    geometry: FrameGeometry,
+    child: Child,
+    stdout: ChildStdout,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+    producer_error: ProducerError,
+    annexb: AnnexBStreamReader,
+    jpeg: JpegStreamReader,
+    pending: VecDeque<EncodedUnit>,
+    /// A decoder joining on a P-frame shows nothing until the next IDR, so the
+    /// leading non-IDR frames of a fresh pipeline are dropped rather than sent.
+    waiting_for_keyframe: bool,
+    last_start: Instant,
+    /// Half a frame interval, bounded, so the pipe is unambiguously idle before
+    /// a buffered picture is released early.
+    flush_idle: Duration,
+}
+
+impl PortalProducer {
+    async fn start(tuning: StreamTuning, paths: &StatePaths) -> anyhow::Result<Self> {
+        let restore_token = waypad_core::state::load_portal_restore_token(paths);
+        let portal = match PortalScreenCastSession::start(restore_token).await {
+            Ok(portal) => portal,
+            Err(first_err) => {
+                // A stale restore token is worth one retry without it, but only
+                // if there was one: otherwise this would just ask twice.
+                if waypad_core::state::load_portal_restore_token(paths).is_some() {
+                    warn!(%first_err, "portal restore failed; retrying without restore token");
+                    PortalScreenCastSession::start(None).await?
+                } else {
+                    return Err(first_err);
+                }
+            }
+        };
+        if let Some(ref token) = portal.restore_token
+            && let Err(err) = waypad_core::state::save_portal_restore_token(paths, token)
+        {
+            warn!(%err, "failed to save portal restore token");
+        }
+
+        let source_width = portal.width.unwrap_or(0);
+        let source_height = portal.height.unwrap_or(0);
+        let (mut target_width, mut target_height) = target_dimensions(
+            source_width,
+            source_height,
+            tuning.max_width,
+            tuning.max_height,
+        );
+        let encoding = match detect_h264_encoder() {
+            Some(encoder) => {
+                // H.264 macroblocks are 16x16 and chroma is subsampled, so both
+                // dimensions have to stay even or the encoder refuses to
+                // negotiate.
+                target_width = target_width.map(even_dimension);
+                target_height = target_height.map(even_dimension);
+                PipelineEncoding::H264 {
+                    encoder,
+                    bitrate_kbps: resolve_bitrate_kbps(
+                        tuning.bitrate_kbps,
+                        target_width.unwrap_or(source_width),
+                        target_height.unwrap_or(source_height),
+                        tuning.fps,
+                        tuning.quality,
+                    ),
+                    gop_size: keyframe_interval(tuning.fps),
+                }
+            }
+            None => PipelineEncoding::Jpeg {
+                quality: tuning.quality,
+            },
+        };
+        let geometry = FrameGeometry {
+            width: target_width.unwrap_or(source_width),
+            height: target_height.unwrap_or(source_height),
+            source_width,
+            source_height,
+        };
+        info!(
+            encoder = encoding.label(),
+            codec = encoding.codec(),
+            bitrate_kbps = encoding.bitrate_kbps(),
+            width = geometry.width,
+            height = geometry.height,
+            "portal stream started"
+        );
+
+        let producer_error: ProducerError = Arc::new(std::sync::Mutex::new(None));
+        let target = (target_width, target_height);
+        let pipeline = spawn_pipeline(&portal, tuning.fps, encoding, target, &producer_error)?;
+        let mut producer = Self {
+            portal,
+            fps: tuning.fps,
+            encoding,
+            target,
+            geometry,
+            child: pipeline.child,
+            stdout: pipeline.stdout,
+            stderr_task: pipeline.stderr_task,
+            producer_error,
+            annexb: AnnexBStreamReader::new(),
+            jpeg: JpegStreamReader::new(),
+            pending: VecDeque::new(),
+            waiting_for_keyframe: matches!(encoding, PipelineEncoding::H264 { .. }),
+            last_start: Instant::now(),
+            flush_idle: Duration::from_millis((500 / u64::from(tuning.fps.max(1))).clamp(4, 12)),
+        };
+
+        // Prove the pipeline actually produces before reporting success. A
+        // pipeline that dies during negotiation must fall back to grim, and
+        // that decision can only be made before anything reaches the client.
+        match timeout(FIRST_FRAME_TIMEOUT, producer.pull_unit()).await {
+            Ok(Ok(Some(unit))) => {
+                producer.pending.push_front(unit);
+                Ok(producer)
+            }
+            Ok(Ok(None)) | Err(_) | Ok(Err(_)) => {
+                let detail = producer
+                    .producer_error
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone());
+                producer.kill_child().await;
+                match detail {
+                    Some(detail) => {
+                        bail!("Portal GStreamer pipeline produced no frames: {detail}")
+                    }
+                    None => bail!(
+                        "Portal GStreamer pipeline produced no frames (PipeWire format may be incompatible)"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Starts a fresh `gst-launch-1.0`, leaving the portal session untouched.
+    ///
+    /// Keeping the portal alive across the restart is the whole reason the
+    /// session is owned here: reopening it would be far slower and, without a
+    /// restore token, would ask the user to approve sharing all over again.
+    async fn respawn(&mut self) -> anyhow::Result<()> {
+        self.kill_child().await;
+        let pipeline = spawn_pipeline(
+            &self.portal,
+            self.fps,
+            self.encoding,
+            self.target,
+            &self.producer_error,
+        )?;
+        self.child = pipeline.child;
+        self.stdout = pipeline.stdout;
+        self.stderr_task = pipeline.stderr_task;
+        self.annexb = AnnexBStreamReader::new();
+        self.jpeg = JpegStreamReader::new();
+        self.waiting_for_keyframe = matches!(self.encoding, PipelineEncoding::H264 { .. });
+        self.last_start = Instant::now();
+        Ok(())
+    }
+
+    async fn kill_child(&mut self) {
+        let _ = self.child.kill().await;
+        // Killing the child closes the stderr pipe, so draining it now costs
+        // almost nothing and makes the producer's own diagnostic available.
+        if let Some(task) = self.stderr_task.take() {
+            let _ = timeout(Duration::from_millis(500), task).await;
+        }
+    }
+
+    fn push_access_unit(&mut self, unit: AccessUnit) {
+        if self.waiting_for_keyframe {
+            if !unit.key_frame {
+                return;
+            }
+            self.waiting_for_keyframe = false;
+        }
+        self.pending.push_back(EncodedUnit {
+            data: unit.data,
+            key_frame: unit.key_frame,
+            parameter_sets: unit.parameter_sets,
+            geometry: self.geometry,
+        });
+    }
+
+    /// Reads until at least one unit is available, or the pipeline ends.
+    async fn pull_unit(&mut self) -> anyhow::Result<Option<EncodedUnit>> {
+        let is_h264 = matches!(self.encoding, PipelineEncoding::H264 { .. });
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            if let Some(unit) = self.pending.pop_front() {
+                return Ok(Some(unit));
+            }
+            let flushed = tokio::select! {
+                // Draining the pipe always wins over the idle flush, so a stall
+                // in this task can never cut an access unit that has arrived.
+                biased;
+                read = self.stdout.read(&mut buffer) => {
+                    let n = read.context("failed to read the screen encoder pipe")?;
+                    if n == 0 {
+                        return Ok(None);
+                    }
+                    if is_h264 {
+                        for unit in self.annexb.push(&buffer[..n]) {
+                            self.push_access_unit(unit);
+                        }
+                    } else {
+                        for frame in self.jpeg.push(&buffer[..n]) {
+                            self.pending.push_back(EncodedUnit {
+                                data: frame,
+                                key_frame: true,
+                                parameter_sets: None,
+                                geometry: self.geometry,
+                            });
+                        }
+                    }
+                    None
+                }
+                _ = tokio::time::sleep(self.flush_idle),
+                    if is_h264 && self.annexb.has_pending_picture() =>
+                {
+                    self.annexb.flush_pending()
+                }
+            };
+            if let Some(unit) = flushed {
+                self.push_access_unit(unit);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl FrameProducer for PortalProducer {
+    fn encoding(&self) -> StreamEncoding {
+        match self.encoding {
+            PipelineEncoding::H264 { .. } => StreamEncoding::H264,
+            PipelineEncoding::Jpeg { .. } => StreamEncoding::Jpeg,
+        }
+    }
+
+    async fn next_unit(&mut self) -> anyhow::Result<Option<EncodedUnit>> {
+        self.pull_unit().await
+    }
+
+    async fn request_key_frame(&mut self) -> anyhow::Result<()> {
+        // Every JPEG frame is already a keyframe.
+        if matches!(self.encoding, PipelineEncoding::Jpeg { .. }) {
+            return Ok(());
+        }
+        // Driving GStreamer through gst-launch-1.0 leaves no way to push a
+        // force-key-unit event into a running pipeline, so the keyframe is
+        // served by respawning the encoder: a fresh pipeline always opens on an
+        // IDR with its parameter sets.
+        if self.last_start.elapsed() < KEYFRAME_RESTART_MIN_INTERVAL {
+            debug!("keyframe request ignored; the encoder just restarted");
+            return Ok(());
+        }
+        info!("restarting encoder pipeline to serve a keyframe request");
+        self.respawn().await
+    }
+
+    async fn shutdown(mut self: Box<Self>) {
+        self.kill_child().await;
+    }
+}
+
+/// Whole-monitor screenshots through `grim`, one per frame.
+///
+/// The slow path, used when the portal pipeline is unavailable or broken. Every
+/// frame is an independent JPEG, so it needs no keyframe machinery at all.
+struct GrimProducer {
+    source: ScreenSource,
+    quality: u8,
+    scale: f64,
+    interval: Duration,
+    geometry: FrameGeometry,
+    next_frame: Instant,
+}
+
+impl GrimProducer {
+    fn start(source: ScreenSource, tuning: StreamTuning) -> Self {
+        let requested = capture_scale(
+            source.width,
+            source.height,
+            tuning.max_width,
+            tuning.max_height,
+        );
+        let scale = requested.min(GRIM_MAX_SCALE);
+        let quality = tuning.quality.min(GRIM_MAX_QUALITY);
+        info!(
+            source_id = %source.id,
+            fps = tuning.fps,
+            quality,
+            scale,
+            requested_scale = requested,
+            "grim stream started"
+        );
+        Self {
+            geometry: FrameGeometry::unscaled(source.width, source.height),
+            source,
+            quality,
+            scale,
+            interval: Duration::from_secs_f64(1.0 / f64::from(tuning.fps.max(1))),
+            next_frame: Instant::now(),
+        }
+    }
+}
+
+#[async_trait]
+impl FrameProducer for GrimProducer {
+    fn encoding(&self) -> StreamEncoding {
+        StreamEncoding::Jpeg
+    }
+
+    async fn next_unit(&mut self) -> anyhow::Result<Option<EncodedUnit>> {
+        tokio::time::sleep_until(self.next_frame).await;
+        let jpeg = capture_grim_frame(&self.source, self.quality, self.scale).await?;
+        // Paced from now rather than from the last deadline: a capture slower
+        // than the frame interval must not build a backlog of missed ticks.
+        self.next_frame = Instant::now() + self.interval;
+        Ok(Some(EncodedUnit {
+            data: jpeg,
+            key_frame: true,
+            parameter_sets: None,
+            geometry: self.geometry,
+        }))
+    }
+
+    async fn request_key_frame(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(self: Box<Self>) {}
+}
+
+/// `ffmpeg -f x11grab`, emitting MJPEG on a pipe.
+struct X11Producer {
+    child: Child,
+    stdout: ChildStdout,
+    reader: JpegStreamReader,
+    pending: VecDeque<Vec<u8>>,
+    geometry: FrameGeometry,
+}
+
+impl X11Producer {
+    async fn start(source: ScreenSource, tuning: StreamTuning) -> anyhow::Result<Self> {
+        let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
         let (target_width, target_height) = target_dimensions(
             source.width,
             source.height,
             tuning.max_width,
             tuning.max_height,
         );
-        let bitrate_kbps = resolve_bitrate_kbps(
-            tuning.bitrate_kbps,
-            target_width.unwrap_or(source.width),
-            target_height.unwrap_or(source.height),
-            tuning.fps,
-            tuning.quality,
-        );
-        // Save the selected source for future sessions
-        if let Err(err) = crate::state::save_preferred_source(&self.paths, &source.id) {
-            warn!(%err, source_id = %source.id, "failed to save preferred source");
-        }
-        self.sessions.lock().await.insert(
-            session_id.clone(),
-            StreamSession::Pending(PendingStream {
-                token: token.clone(),
-                source: source.clone(),
-                tuning,
-                audio: audio_requested,
-                audio_options,
-            }),
-        );
+        let capture_width = target_width.unwrap_or(source.width);
+        let capture_height = target_height.unwrap_or(source.height);
         info!(
-            %session_id,
-            stream_port = self.stream_port,
             source_id = %source.id,
-            backend = %source.backend,
-            requested_fps = options.max_fps,
-            actual_fps = tuning.fps,
-            actual_quality = tuning.quality,
-            actual_bitrate_kbps = bitrate_kbps,
-            codec = if h264 { "h264" } else { "jpeg" },
-            max_width = ?tuning.max_width,
-            max_height = ?tuning.max_height,
-            audio = audio_requested,
-            "screen stream session pending client attach"
+            fps = tuning.fps,
+            quality = tuning.quality,
+            capture_width,
+            capture_height,
+            "x11 stream starting with ffmpeg"
         );
-        Ok(StreamStartResponse {
-            session_id,
-            stream_port: self.stream_port,
-            token,
-            codec: if h264 { "h264".into() } else { "jpeg".into() },
-            transport: "waypad-control-port-stream-v2".into(),
-            source,
-            actual_fps: tuning.fps,
-            actual_quality: tuning.quality,
-            actual_bitrate_kbps: bitrate_kbps,
-            portal_last_error: self.last_portal_error.lock().await.clone(),
-            audio: crate::audio::idle_status(audio_options, audio_reason),
+
+        let input_spec = format!("{}.0+{},{}", display, source.x, source.y);
+        let mut command = Command::new("ffmpeg");
+        command.args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "x11grab",
+            "-framerate",
+            &tuning.fps.to_string(),
+            "-video_size",
+            &format!("{capture_width}x{capture_height}"),
+            "-i",
+            &input_spec,
+        ]);
+        if target_width.is_some() || target_height.is_some() {
+            command.args(["-vf", &format!("scale={capture_width}:{capture_height}")]);
+        }
+        command
+            .args([
+                "-c:v",
+                "mjpeg",
+                "-q:v",
+                &tuning.quality.to_string(),
+                "-f",
+                "mjpeg",
+                "pipe:1",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+
+        let mut child = command
+            .spawn()
+            .context("failed to spawn ffmpeg for X11 capture")?;
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(log_child_stderr(
+                "x11".to_string(),
+                "ffmpeg",
+                stderr,
+                Arc::new(std::sync::Mutex::new(None)),
+            ));
+        }
+        let stdout = child.stdout.take().context("ffmpeg stdout unavailable")?;
+        Ok(Self {
+            child,
+            stdout,
+            reader: JpegStreamReader::new(),
+            pending: VecDeque::new(),
+            geometry: FrameGeometry::unscaled(source.width, source.height),
         })
     }
+}
 
-    pub async fn stop_stream(&self, session_id: &str) -> anyhow::Result<()> {
-        let Some(session) = self.sessions.lock().await.remove(session_id) else {
-            debug!(%session_id, "screen stream stop ignored because session is already closed");
-            return Ok(());
-        };
-        match session {
-            StreamSession::Pending(_) => {
-                info!(%session_id, "pending screen stream session stopped before client attach");
+#[async_trait]
+impl FrameProducer for X11Producer {
+    fn encoding(&self) -> StreamEncoding {
+        StreamEncoding::Jpeg
+    }
+
+    async fn next_unit(&mut self) -> anyhow::Result<Option<EncodedUnit>> {
+        let mut buffer = vec![0u8; 32 * 1024];
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                return Ok(Some(EncodedUnit {
+                    data: frame,
+                    key_frame: true,
+                    parameter_sets: None,
+                    geometry: self.geometry,
+                }));
             }
-            StreamSession::Running(mut running) => {
-                info!(%session_id, "screen stream stop requested");
-                let _ = running.stop.send(());
-                match timeout(Duration::from_secs(2), &mut running.task).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) if err.is_cancelled() => {}
-                    Ok(Err(err)) => {
-                        warn!(%session_id, %err, "screen stream task ended with join error")
-                    }
-                    Err(_) => {
-                        warn!(%session_id, "screen stream task did not stop gracefully; aborting");
-                        running.task.abort();
-                    }
-                }
+            let n = self
+                .stdout
+                .read(&mut buffer)
+                .await
+                .context("failed to read the ffmpeg pipe")?;
+            if n == 0 {
+                return Ok(None);
             }
+            self.pending.extend(self.reader.push(&buffer[..n]));
         }
+    }
+
+    async fn request_key_frame(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 
-    pub async fn attach_stream_client(&self, token: &str, socket: TcpStream) -> anyhow::Result<()> {
-        let (session_id, pending) = {
-            let mut sessions = self.sessions.lock().await;
-            let session_id = sessions
-                .iter()
-                .find_map(|(session_id, session)| match session {
-                    StreamSession::Pending(pending) if pending.token == token => {
-                        Some(session_id.clone())
-                    }
-                    _ => None,
-                })
-                .context("Unknown or expired screen stream token")?;
-            let Some(StreamSession::Pending(pending)) = sessions.remove(&session_id) else {
-                bail!("Screen stream token is not pending");
-            };
-            (session_id, pending)
-        };
-
-        let peer = socket.peer_addr().ok();
-        info!(
-            %session_id,
-            ?peer,
-            source_id = %pending.source.id,
-            backend = %pending.source.backend,
-            "screen stream client attached"
-        );
-        let (stop_tx, mut stop_rx) = oneshot::channel();
-        // Depth 1: repeated keyframe requests before the encoder restarts are
-        // the same request, so they coalesce instead of queueing restarts.
-        let (keyframe_tx, mut keyframe_rx) = mpsc::channel(1);
-        let task_sessions = self.sessions.clone();
-        let task_session = session_id.clone();
-        let source = pending.source.clone();
-        let task_paths = self.paths.clone();
-        let task_last_error = self.last_portal_error.clone();
-        // The handshake line names the codec, and the codec is only known once a
-        // producer actually emits a frame, so it is written lazily. That also
-        // keeps the grim fallback usable: it may only take over while the socket
-        // is still untouched.
-        let socket = Arc::new(StreamSocket::new(socket));
-        let video_socket = socket.clone();
-        // The registry lock is taken before the producer is spawned and held until the
-        // session is registered. A pipeline that fails instantly would otherwise
-        // deregister a session that has not been registered yet, and the entry
-        // inserted afterwards would never be cleaned up: it owns the audio
-        // producer and the socket, so the encoder would keep capturing for a
-        // stream that no longer exists.
-        let mut sessions = self.sessions.lock().await;
-        let task = tokio::spawn(async move {
-            let socket = video_socket;
-            let result = if source.backend == "wayland-screencast-portal" {
-                let portal_result = run_portal_stream(
-                    &socket,
-                    task_session.clone(),
-                    source.clone(),
-                    pending.tuning,
-                    &mut stop_rx,
-                    &mut keyframe_rx,
-                    task_paths.as_ref().clone(),
-                )
-                .await;
-                match portal_result {
-                    Ok(()) => {
-                        *task_last_error.lock().await = None;
-                        Ok(())
-                    }
-                    Err(portal_err) => {
-                        let detail = format!("{portal_err:#}");
-                        *task_last_error.lock().await = Some(detail.clone());
-                        if is_client_disconnect(&portal_err) || socket.handshake_sent() {
-                            Err(portal_err)
-                        } else {
-                            // Loud on purpose: the grim fallback still produces
-                            // a picture, so a permanently broken fast path is
-                            // invisible unless the reason is reported.
-                            error!(
-                                session_id = %task_session,
-                                error = %detail,
-                                "portal screen pipeline failed; falling back to the grim screenshot backend, which caps out near 6 FPS"
-                            );
-                            // Use grim with the same connection
-                            run_grim_stream_on_open(
-                                &socket,
-                                task_session.clone(),
-                                source,
-                                pending.tuning,
-                                &mut stop_rx,
-                            )
-                            .await
-                        }
-                    }
-                }
-            } else if source.backend == "x11-ffmpeg" {
-                run_x11_stream(
-                    &socket,
-                    task_session.clone(),
-                    source,
-                    pending.tuning,
-                    &mut stop_rx,
-                )
-                .await
-            } else {
-                run_grim_stream_on_open(
-                    &socket,
-                    task_session.clone(),
-                    source,
-                    pending.tuning,
-                    &mut stop_rx,
-                )
-                .await
-            };
-            if let Err(err) = result {
-                if is_client_disconnect(&err) {
-                    info!(session_id = %task_session, %err, "screen stream client disconnected");
-                } else {
-                    warn!(session_id = %task_session, %err, "screen stream stopped with error");
-                }
-            }
-            // Dropping the registry entry also drops the audio handle, which
-            // signals its task to stop and reaps the encoder child.
-            task_sessions.lock().await.remove(&task_session);
-            debug!(session_id = %task_session, "screen stream session removed from registry");
-        });
-        // Audio is spawned in its own task so a failing pipeline can only ever
-        // silence itself: the video producer above never observes an audio
-        // error.
-        let audio = pending.audio.then(|| {
-            DesktopAudioStream::spawn(session_id.clone(), socket.clone(), pending.audio_options)
-        });
-        sessions.insert(
-            session_id,
-            StreamSession::Running(RunningStream {
-                stop: stop_tx,
-                keyframe: keyframe_tx,
-                task,
-                socket,
-                audio,
-                audio_options: pending.audio_options,
-            }),
-        );
-        drop(sessions);
-        Ok(())
+    async fn shutdown(mut self: Box<Self>) {
+        let _ = self.child.kill().await;
     }
-
-    /// Starts desktop audio on a session that is already streaming video, or
-    /// reports the status of the producer that is already running.
-    pub async fn start_audio(
-        &self,
-        session_id: &str,
-        options: Option<AudioStreamOptions>,
-    ) -> anyhow::Result<AudioStreamStatus> {
-        let supported = self.capabilities.read().await.audio_capture.clone();
-        if !supported.supported {
-            bail!(
-                "{}",
-                supported
-                    .reason
-                    .unwrap_or_else(|| "Desktop audio capture is unavailable on this host".into())
-            );
-        }
-        let mut sessions = self.sessions.lock().await;
-        match sessions.get_mut(session_id) {
-            Some(StreamSession::Running(running)) => {
-                if let Some(audio) = running.audio.as_ref()
-                    && audio.is_running()
-                {
-                    audio.set_muted(false);
-                    return Ok(audio.status());
-                }
-                let options = options.unwrap_or(running.audio_options);
-                running.audio_options = options;
-                let audio = DesktopAudioStream::spawn(
-                    session_id.to_string(),
-                    running.socket.clone(),
-                    options,
-                );
-                let status = audio.status();
-                running.audio = Some(audio);
-                info!(%session_id, "desktop audio started for screen stream session");
-                Ok(status)
-            }
-            // The producer is bound to the socket, so it can only start once a
-            // client attaches; remember the request until then.
-            Some(StreamSession::Pending(pending)) => {
-                pending.audio = true;
-                if let Some(options) = options {
-                    pending.audio_options = options;
-                }
-                Ok(crate::audio::idle_status(
-                    pending.audio_options,
-                    Some("Desktop audio starts as soon as the stream client attaches".into()),
-                ))
-            }
-            None => bail!("Unknown or expired screen stream session"),
-        }
-    }
-
-    pub async fn stop_audio(&self, session_id: &str) -> anyhow::Result<AudioStreamStatus> {
-        let mut sessions = self.sessions.lock().await;
-        match sessions.get_mut(session_id) {
-            Some(StreamSession::Running(running)) => {
-                let options = running.audio_options;
-                match running.audio.take() {
-                    Some(audio) => {
-                        audio.stop().await;
-                        info!(%session_id, "desktop audio stopped for screen stream session");
-                    }
-                    None => debug!(%session_id, "desktop audio stop ignored; no producer running"),
-                }
-                Ok(crate::audio::idle_status(options, None))
-            }
-            Some(StreamSession::Pending(pending)) => {
-                pending.audio = false;
-                Ok(crate::audio::idle_status(pending.audio_options, None))
-            }
-            None => bail!("Unknown or expired screen stream session"),
-        }
-    }
-
-    /// Mutes at the source: the encoder keeps running so unmuting is instant,
-    /// but no envelope leaves the host, so a muted stream costs no bandwidth.
-    pub async fn set_audio_mute(
-        &self,
-        session_id: &str,
-        muted: bool,
-    ) -> anyhow::Result<AudioStreamStatus> {
-        let sessions = self.sessions.lock().await;
-        match sessions.get(session_id) {
-            Some(StreamSession::Running(running)) => match running.audio.as_ref() {
-                Some(audio) => {
-                    audio.set_muted(muted);
-                    debug!(%session_id, muted, "desktop audio mute changed");
-                    Ok(audio.status())
-                }
-                None => bail!("Desktop audio is not running for this session"),
-            },
-            Some(StreamSession::Pending(pending)) => Ok(crate::audio::idle_status(
-                pending.audio_options,
-                Some("Desktop audio has not started yet for this session".into()),
-            )),
-            None => bail!("Unknown or expired screen stream session"),
-        }
-    }
-
-    pub async fn audio_status(&self, session_id: &str) -> anyhow::Result<AudioStreamStatus> {
-        let sessions = self.sessions.lock().await;
-        match sessions.get(session_id) {
-            Some(StreamSession::Running(running)) => Ok(running
-                .audio
-                .as_ref()
-                .map(DesktopAudioStream::status)
-                .unwrap_or_else(|| crate::audio::idle_status(running.audio_options, None))),
-            Some(StreamSession::Pending(pending)) => {
-                Ok(crate::audio::idle_status(pending.audio_options, None))
-            }
-            None => bail!("Unknown or expired screen stream session"),
-        }
-    }
-
-    /// Forces an immediate IDR on a running session. Android recreates its
-    /// decoder whenever the app returns to the foreground and the `SurfaceView`
-    /// is rebuilt, and it stays black until it sees SPS/PPS plus an IDR.
-    pub async fn request_key_frame(&self, session_id: &str) -> anyhow::Result<()> {
-        let sessions = self.sessions.lock().await;
-        match sessions.get(session_id) {
-            Some(StreamSession::Running(running)) => {
-                match running.keyframe.try_send(()) {
-                    Ok(()) => debug!(%session_id, "keyframe requested for screen stream"),
-                    // Full means a restart is already pending; the client gets
-                    // its keyframe from that one.
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        debug!(%session_id, "keyframe request coalesced into a pending one")
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        debug!(%session_id, "keyframe request ignored; stream is shutting down")
-                    }
-                }
-                Ok(())
-            }
-            // The producer has not started yet, and it always opens on an IDR.
-            Some(StreamSession::Pending(_)) => Ok(()),
-            None => bail!("Unknown or expired screen stream session"),
-        }
-    }
-
-    async fn select_source(&self, requested: Option<&str>) -> anyhow::Result<ScreenSource> {
-        let sources = self.list_sources().await?;
-        if let Some(id) = requested.filter(|value| !value.is_empty()) {
-            sources
-                .into_iter()
-                .find(|source| source.id == id)
-                .with_context(|| format!("Screen source not found: {id}"))
-        } else {
-            // Try preferred source first, then focused, then first
-            let preferred = crate::state::load_preferred_source(&self.paths);
-            if let Some(ref pref_id) = preferred
-                && let Some(source) = sources.iter().find(|s| s.id == *pref_id)
-            {
-                info!(source_id = %pref_id, "restored preferred screen source");
-                return Ok(source.clone());
-            }
-            sources
-                .iter()
-                .find(|source| source.focused)
-                .cloned()
-                .or_else(|| sources.first().cloned())
-                .context("No screen sources available")
-        }
-    }
-}
-
-pub async fn pointer_move_absolute(
-    input: &InputManager,
-    source: Option<ScreenSource>,
-    x: f64,
-    y: f64,
-) -> anyhow::Result<()> {
-    if !x.is_finite()
-        || !y.is_finite()
-        || x < -100_000.0
-        || y < -100_000.0
-        || x > 100_000.0
-        || y > 100_000.0
-    {
-        bail!("Absolute pointer coordinate rejected as invalid");
-    }
-    match source {
-        Some(source) if source.backend == "hyprland-grim" => {
-            input
-                .pointer_move_absolute(source.x as f64 + x, source.y as f64 + y)
-                .await
-        }
-        _ => input.pointer_move_absolute(x, y).await,
-    }
-}
-
-async fn run_grim_stream_on_open(
-    socket: &StreamSocket,
-    session_id: String,
-    source: ScreenSource,
-    tuning: StreamTuning,
-    stop_rx: &mut oneshot::Receiver<()>,
-) -> anyhow::Result<()> {
-    run_grim_stream_impl(socket, session_id, source, tuning, stop_rx).await
-}
-
-async fn run_grim_stream_impl(
-    socket: &StreamSocket,
-    session_id: String,
-    source: ScreenSource,
-    tuning: StreamTuning,
-    stop_rx: &mut oneshot::Receiver<()>,
-) -> anyhow::Result<()> {
-    let StreamTuning {
-        fps,
-        quality,
-        max_width,
-        max_height,
-        ..
-    } = tuning;
-    let target_interval = Duration::from_secs_f64(1.0 / f64::from(fps.max(1)));
-    let mut seq = 0u64;
-    // Force aggressive scale for grim (screenshot tool is slow at full res)
-    let requested_scale = capture_scale(source.width, source.height, max_width, max_height);
-    let scale = requested_scale.min(0.4); // Never capture above 40% resolution for grim
-    info!(%session_id, source_id = %source.id, fps, quality, scale, requested_scale, "grim stream started");
-    let mut frame_count = 0u64;
-    let mut throughput_start = tokio::time::Instant::now();
-    loop {
-        let frame_start = tokio::time::Instant::now();
-        tokio::select! {
-            _ = &mut *stop_rx => break,
-            jpeg = capture_grim_frame(&source, quality, scale) => {
-                let jpeg = jpeg?;
-                socket.send_magic(STREAM_MAGIC_V1).await?;
-                send_frame_grim(socket, seq, source.width, source.height, &jpeg).await?;
-                seq += 1;
-                frame_count += 1;
-                let elapsed = throughput_start.elapsed().as_secs_f64();
-                if elapsed >= 2.0 {
-                    let measured = frame_count as f64 / elapsed;
-                    info!(%session_id, fps_measured = measured, fps_target = fps, frames = frame_count, "grim stream throughput");
-                    frame_count = 0;
-                    throughput_start = tokio::time::Instant::now();
-                }
-                // Sleep remaining time to hit target fps
-                let capture_elapsed = frame_start.elapsed();
-                if let Some(remaining) = target_interval.checked_sub(capture_elapsed) {
-                    tokio::select! {
-                        _ = &mut *stop_rx => break,
-                        _ = tokio::time::sleep(remaining) => {}
-                    }
-                }
-            }
-        }
-    }
-    debug!(%session_id, "grim stream stopped");
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_portal_stream(
-    socket: &StreamSocket,
-    session_id: String,
-    _selected_source: ScreenSource,
-    tuning: StreamTuning,
-    stop_rx: &mut oneshot::Receiver<()>,
-    keyframe_rx: &mut mpsc::Receiver<()>,
-    paths: super::state::StatePaths,
-) -> anyhow::Result<()> {
-    let StreamTuning {
-        fps,
-        quality,
-        max_width,
-        max_height,
-        ..
-    } = tuning;
-    info!(%session_id, fps, quality, "portal stream client connected; starting ScreenCast approval");
-
-    let restore_token = crate::state::load_portal_restore_token(&paths);
-    let portal = match PortalScreenCastSession::start(restore_token).await {
-        Ok(portal) => portal,
-        Err(first_err) => {
-            let had_restore = crate::state::load_portal_restore_token(&paths).is_some();
-            if had_restore {
-                warn!(%session_id, %first_err, "portal restore failed; retrying without restore token");
-                PortalScreenCastSession::start(None).await?
-            } else {
-                return Err(first_err);
-            }
-        }
-    };
-    if let Some(ref token) = portal.restore_token
-        && let Err(err) = crate::state::save_portal_restore_token(&paths, token)
-    {
-        warn!(%session_id, %err, "failed to save portal restore token");
-    }
-    let source = ScreenSource {
-        id: format!("portal:stream:{}", portal.stream_id),
-        label: "Portal-selected source".into(),
-        kind: "portal-stream".into(),
-        backend: "wayland-screencast-portal".into(),
-        width: portal.width.unwrap_or(0),
-        height: portal.height.unwrap_or(0),
-        x: portal.position.0,
-        y: portal.position.1,
-        scale: 1.0,
-        focused: true,
-    };
-    let (mut target_width, mut target_height) =
-        target_dimensions(source.width, source.height, max_width, max_height);
-    let encoding = match detect_h264_encoder() {
-        Some(encoder) => {
-            // H.264 macroblocks are 16x16 and chroma is subsampled, so both
-            // dimensions have to stay even or the encoder refuses to negotiate.
-            target_width = target_width.map(even_dimension);
-            target_height = target_height.map(even_dimension);
-            PipelineEncoding::H264 {
-                encoder,
-                bitrate_kbps: resolve_bitrate_kbps(
-                    tuning.bitrate_kbps,
-                    target_width.unwrap_or(source.width),
-                    target_height.unwrap_or(source.height),
-                    fps,
-                    quality,
-                ),
-                gop_size: keyframe_interval(fps),
-            }
-        }
-        None => PipelineEncoding::Jpeg { quality },
-    };
-    let width = target_width.unwrap_or(source.width);
-    let height = target_height.unwrap_or(source.height);
-    info!(
-        %session_id,
-        source_id = %source.id,
-        encoder = encoding.label(),
-        codec = encoding.codec(),
-        bitrate_kbps = encoding.bitrate_kbps(),
-        width,
-        height,
-        "portal stream started"
-    );
-    let producer_error: ProducerError = Arc::new(std::sync::Mutex::new(None));
-    let mut counters = StreamCounters::default();
-    // Restart loop. Shelling out to gst-launch leaves no way to push a
-    // force-key-unit event into a running pipeline, so an on-demand keyframe is
-    // served by respawning the encoder: a fresh pipeline always opens on an IDR
-    // with its parameter sets.
-    let pumped = loop {
-        let mut child =
-            spawn_gstreamer_pipewire(&portal, fps, encoding, target_width, target_height)?;
-        let stderr_task = child.stderr.take().map(|stderr| {
-            tokio::spawn(log_child_stderr(
-                session_id.clone(),
-                "gstreamer",
-                stderr,
-                producer_error.clone(),
-            ))
-        });
-        let mut stdout = child
-            .stdout
-            .take()
-            .context("GStreamer stdout unavailable")?;
-        let pumped = match encoding {
-            PipelineEncoding::H264 { .. } => {
-                pump_h264_stream(
-                    socket,
-                    &mut stdout,
-                    stop_rx,
-                    keyframe_rx,
-                    &mut counters,
-                    &session_id,
-                    FrameGeometry {
-                        width,
-                        height,
-                        source_width: source.width,
-                        source_height: source.height,
-                    },
-                    fps,
-                )
-                .await
-            }
-            PipelineEncoding::Jpeg { .. } => {
-                // Every JPEG frame is already a keyframe, so this path ignores
-                // the request channel and never restarts.
-                pump_jpeg_stream(
-                    socket,
-                    &mut stdout,
-                    stop_rx,
-                    &mut counters,
-                    &session_id,
-                    source.width,
-                    source.height,
-                    fps,
-                    "portal",
-                )
-                .await
-                .map(|()| PumpOutcome::Finished)
-            }
-        };
-        let _ = child.kill().await;
-        // Killing the child closes the stderr pipe, so draining it now costs
-        // almost nothing and makes the producer's own diagnostic available.
-        if let Some(task) = stderr_task {
-            let _ = timeout(Duration::from_millis(500), task).await;
-        }
-        match pumped {
-            Ok(PumpOutcome::KeyFrameRequested) => {
-                info!(%session_id, "restarting encoder pipeline to serve a keyframe request");
-                continue;
-            }
-            other => break other,
-        }
-    };
-    pumped?;
-    let frames = counters.frames;
-    if frames == 0 {
-        // GStreamer pipeline failed before producing any frames. Return an error
-        // so the grim fallback can take over, carrying the real reason instead
-        // of a guess.
-        let detail = producer_error.lock().ok().and_then(|slot| slot.clone());
-        match detail {
-            Some(detail) => {
-                anyhow::bail!("Portal GStreamer pipeline produced no frames: {detail}")
-            }
-            None => anyhow::bail!(
-                "Portal GStreamer pipeline produced no frames (PipeWire format may be incompatible)"
-            ),
-        }
-    }
-    debug!(%session_id, frames, "portal stream stopped");
-    Ok(())
-}
-
-/// Envelope counters that survive an encoder restart, so `seq` stays monotonic
-/// across a keyframe-driven respawn.
-#[derive(Debug, Default)]
-struct StreamCounters {
-    seq: u64,
-    frames: u64,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum PumpOutcome {
-    Finished,
-    KeyFrameRequested,
-}
-
-/// Encoder restarts are cheap but not free, so a client that asks repeatedly
-/// cannot make the pipeline thrash.
-const KEYFRAME_RESTART_MIN_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Reads Annex-B access units off the encoder pipe and forwards them as
-/// `WAYPAD_STREAM_V2` frames.
-#[allow(clippy::too_many_arguments)]
-async fn pump_h264_stream(
-    socket: &StreamSocket,
-    stdout: &mut ChildStdout,
-    stop_rx: &mut oneshot::Receiver<()>,
-    keyframe_rx: &mut mpsc::Receiver<()>,
-    counters: &mut StreamCounters,
-    session_id: &str,
-    geometry: FrameGeometry,
-    fps: u32,
-) -> anyhow::Result<PumpOutcome> {
-    let mut reader = AnnexBStreamReader::new();
-    let mut buffer = vec![0u8; 64 * 1024];
-    let mut frame_count = 0u64;
-    let mut throughput_start = tokio::time::Instant::now();
-    let started = tokio::time::Instant::now();
-    // A decoder that joins on a P-frame shows nothing until the next IDR, so
-    // nothing is forwarded before the first keyframe of the fresh pipeline.
-    let mut waiting_for_keyframe = true;
-    let mut keyframe_channel_open = true;
-    // Half a frame interval, bounded so the pipe is unambiguously idle before
-    // the buffered picture is released early.
-    let flush_idle = Duration::from_millis((500 / u64::from(fps.max(1))).clamp(4, 12));
-    loop {
-        let units = tokio::select! {
-            // Draining the pipe always wins over the idle flush, so a stall in
-            // this task can never cut an access unit that has already arrived.
-            biased;
-            _ = &mut *stop_rx => break,
-            read = stdout.read(&mut buffer) => {
-                let n = read?;
-                if n == 0 {
-                    warn!(%session_id, "portal stream producer closed stdout");
-                    break;
-                }
-                reader.push(&buffer[..n])
-            }
-            request = keyframe_rx.recv(), if keyframe_channel_open => {
-                if request.is_none() {
-                    // Sender dropped: the session is being torn down and
-                    // stop_rx is about to fire.
-                    keyframe_channel_open = false;
-                } else if started.elapsed() >= KEYFRAME_RESTART_MIN_INTERVAL {
-                    return Ok(PumpOutcome::KeyFrameRequested);
-                } else {
-                    debug!(%session_id, "keyframe request ignored; the encoder just restarted");
-                }
-                Vec::new()
-            }
-            _ = tokio::time::sleep(flush_idle), if reader.has_pending_picture() => {
-                reader.flush_pending().into_iter().collect()
-            }
-        };
-        for unit in units {
-            if waiting_for_keyframe {
-                if !unit.key_frame {
-                    continue;
-                }
-                waiting_for_keyframe = false;
-            }
-            socket.send_magic(STREAM_MAGIC_V2).await?;
-            if let Some(parameter_sets) = unit.parameter_sets.as_deref() {
-                send_h264_frame(socket, counters.seq, geometry, parameter_sets, false, true)
-                    .await?;
-                counters.seq += 1;
-                counters.frames += 1;
-            }
-            send_h264_frame(
-                socket,
-                counters.seq,
-                geometry,
-                &unit.data,
-                unit.key_frame,
-                false,
-            )
-            .await?;
-            counters.seq += 1;
-            counters.frames += 1;
-            frame_count += 1;
-        }
-        let elapsed = throughput_start.elapsed().as_secs_f64();
-        if elapsed >= 2.0 {
-            let measured = frame_count as f64 / elapsed;
-            debug!(%session_id, fps_measured = measured, fps_target = fps, frames = frame_count, "h264 stream throughput");
-            frame_count = 0;
-            throughput_start = tokio::time::Instant::now();
-        }
-    }
-    Ok(PumpOutcome::Finished)
-}
-
-/// Reads concatenated JPEG frames off a producer pipe and forwards them as
-/// `WAYPAD_STREAM_V1` frames.
-#[allow(clippy::too_many_arguments)]
-async fn pump_jpeg_stream(
-    socket: &StreamSocket,
-    stdout: &mut ChildStdout,
-    stop_rx: &mut oneshot::Receiver<()>,
-    counters: &mut StreamCounters,
-    session_id: &str,
-    width: u32,
-    height: u32,
-    fps: u32,
-    producer: &'static str,
-) -> anyhow::Result<()> {
-    let mut reader = JpegStreamReader::new();
-    let mut buffer = [0u8; 32 * 1024];
-    let mut frame_count = 0u64;
-    let mut throughput_start = tokio::time::Instant::now();
-    loop {
-        tokio::select! {
-            _ = &mut *stop_rx => break,
-            read = stdout.read(&mut buffer) => {
-                let n = read?;
-                if n == 0 {
-                    warn!(%session_id, producer, "jpeg stream producer closed stdout");
-                    break;
-                }
-                for frame in reader.push(&buffer[..n]) {
-                    socket.send_magic(STREAM_MAGIC_V1).await?;
-                    send_frame(socket, counters.seq, width, height, &frame).await?;
-                    counters.seq += 1;
-                    counters.frames += 1;
-                    frame_count += 1;
-                }
-                let elapsed = throughput_start.elapsed().as_secs_f64();
-                if elapsed >= 2.0 {
-                    let measured = frame_count as f64 / elapsed;
-                    debug!(%session_id, producer, fps_measured = measured, fps_target = fps, frames = frame_count, "jpeg stream throughput");
-                    frame_count = 0;
-                    throughput_start = tokio::time::Instant::now();
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Producer stderr is both logged and kept, so a pipeline that dies before its
-/// first frame can report why instead of silently degrading to the fallback.
+/// first frame can report why instead of silently degrading to the fallback
+/// with no explanation anywhere.
 type ProducerError = Arc<std::sync::Mutex<Option<String>>>;
 
+/// A running encoder pipeline and the pipes attached to it.
+struct SpawnedPipeline {
+    child: Child,
+    stdout: ChildStdout,
+    stderr_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+fn spawn_pipeline(
+    portal: &PortalScreenCastSession,
+    fps: u32,
+    encoding: PipelineEncoding,
+    target: (Option<u32>, Option<u32>),
+    producer_error: &ProducerError,
+) -> anyhow::Result<SpawnedPipeline> {
+    let mut child = spawn_gstreamer_pipewire(portal, fps, encoding, target.0, target.1)?;
+    let stderr_task = child.stderr.take().map(|stderr| {
+        tokio::spawn(log_child_stderr(
+            "portal".to_string(),
+            "gstreamer",
+            stderr,
+            producer_error.clone(),
+        ))
+    });
+    let stdout = child
+        .stdout
+        .take()
+        .context("GStreamer stdout unavailable")?;
+    Ok(SpawnedPipeline {
+        child,
+        stdout,
+        stderr_task,
+    })
+}
 async fn log_child_stderr(
     session_id: String,
     label: &'static str,
@@ -1178,190 +731,6 @@ async fn log_child_stderr(
 fn slot_has_error(slot: &Option<String>) -> bool {
     slot.as_deref().is_some_and(|text| text.contains("ERROR"))
 }
-
-const SEND_FRAME_DEADLINE_MS: u64 = 12;
-const H264_SEND_TIMEOUT_SECS: u64 = 10;
-/// Grim frames are sent at TCP speed; the bound only exists so a wedged client
-/// cannot hold the shared socket lock forever.
-const GRIM_SEND_TIMEOUT_SECS: u64 = 30;
-
-fn frame_envelope(header: &str, payload: &[u8]) -> Vec<u8> {
-    let header = header.as_bytes();
-    let mut buf = Vec::with_capacity(4 + 4 + header.len() + payload.len());
-    buf.extend_from_slice(&(header.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(header);
-    buf.extend_from_slice(payload);
-    buf
-}
-
-/// Encoded size of the picture together with the size of the desktop it came from.
-///
-/// The two differ whenever the client asks for a smaller stream. Only the encoded
-/// size describes the pixels on the wire, but the client maps touches onto desktop
-/// coordinates, so it needs the source size too: mapping against the encoded size
-/// would confine the pointer to a corner of the screen, silently and with no error.
-#[derive(Debug, Clone, Copy)]
-pub struct FrameGeometry {
-    pub width: u32,
-    pub height: u32,
-    pub source_width: u32,
-    pub source_height: u32,
-}
-
-impl FrameGeometry {
-    fn header_fields(&self) -> serde_json::Map<String, serde_json::Value> {
-        let mut fields = serde_json::Map::new();
-        fields.insert("width".into(), self.width.into());
-        fields.insert("height".into(), self.height.into());
-        fields.insert("source_width".into(), self.source_width.into());
-        fields.insert("source_height".into(), self.source_height.into());
-        fields
-    }
-}
-
-async fn send_h264_frame(
-    socket: &StreamSocket,
-    seq: u64,
-    geometry: FrameGeometry,
-    payload: &[u8],
-    key_frame: bool,
-    config: bool,
-) -> anyhow::Result<()> {
-    let mut header_object = geometry.header_fields();
-    header_object.insert("seq".into(), seq.into());
-    header_object.insert("timestamp_ms".into(), json!(now_millis()));
-    header_object.insert("codec".into(), "h264".into());
-    header_object.insert("key_frame".into(), key_frame.into());
-    header_object.insert("config".into(), config.into());
-    let header = serde_json::Value::Object(header_object).to_string();
-    let buf = frame_envelope(&header, payload);
-    // Unlike JPEG, an H.264 frame is referenced by everything that follows it,
-    // so partial or dropped writes would corrupt the rest of the session:
-    // frames are always written whole and only a wedged client aborts.
-    socket
-        .write_all(&buf, Duration::from_secs(H264_SEND_TIMEOUT_SECS))
-        .await
-        .context("screen stream client stalled while receiving an H.264 frame")?;
-    Ok(())
-}
-
-async fn send_frame(
-    socket: &StreamSocket,
-    seq: u64,
-    width: u32,
-    height: u32,
-    jpeg: &[u8],
-) -> anyhow::Result<()> {
-    send_frame_deadline(socket, seq, width, height, jpeg, SEND_FRAME_DEADLINE_MS).await
-}
-
-async fn send_frame_grim(
-    socket: &StreamSocket,
-    seq: u64,
-    width: u32,
-    height: u32,
-    jpeg: &[u8],
-) -> anyhow::Result<()> {
-    // Grim frames are large JPEG screenshots — no deadline, send at TCP speed
-    let buf = frame_envelope(&jpeg_frame_header(seq, width, height), jpeg);
-    socket
-        .write_all(&buf, Duration::from_secs(GRIM_SEND_TIMEOUT_SECS))
-        .await?;
-    Ok(())
-}
-
-/// The JPEG path reports the source size as the frame size: the picture may be
-/// downscaled on the wire, but the client only ever needs desktop coordinates.
-fn jpeg_frame_header(seq: u64, width: u32, height: u32) -> String {
-    json!({
-        "seq": seq,
-        "timestamp_ms": now_millis(),
-        "codec": "jpeg",
-        "width": width,
-        "height": height,
-        "source_width": width,
-        "source_height": height
-    })
-    .to_string()
-}
-
-async fn send_frame_deadline(
-    socket: &StreamSocket,
-    seq: u64,
-    width: u32,
-    height: u32,
-    jpeg: &[u8],
-    deadline_ms: u64,
-) -> anyhow::Result<()> {
-    let buf = frame_envelope(&jpeg_frame_header(seq, width, height), jpeg);
-
-    match socket
-        .write_all(&buf, Duration::from_millis(deadline_ms))
-        .await
-    {
-        Ok(()) => Ok(()),
-        Err(err) if err.downcast_ref::<std::io::Error>().is_some() => Err(err),
-        Err(_elapsed) => {
-            debug!(seq, "dropping frame: send deadline exceeded");
-            Err(anyhow::anyhow!("frame send deadline exceeded (dropped)"))
-        }
-    }
-}
-
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
-
-fn is_client_disconnect(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
-            matches!(
-                io.kind(),
-                std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::UnexpectedEof
-            )
-        })
-    })
-}
-
-fn capture_scale(width: u32, height: u32, max_width: Option<u32>, max_height: Option<u32>) -> f64 {
-    let width_scale = max_width
-        .filter(|_| width > 0)
-        .map(|value| f64::from(value) / f64::from(width))
-        .unwrap_or(1.0);
-    let height_scale = max_height
-        .filter(|_| height > 0)
-        .map(|value| f64::from(value) / f64::from(height))
-        .unwrap_or(1.0);
-    width_scale.min(height_scale).min(1.0).max(0.1)
-}
-
-fn target_dimensions(
-    width: u32,
-    height: u32,
-    max_width: Option<u32>,
-    max_height: Option<u32>,
-) -> (Option<u32>, Option<u32>) {
-    if width == 0 || height == 0 {
-        return (None, None);
-    }
-    let scale = capture_scale(width, height, max_width, max_height);
-    if scale >= 0.999 {
-        (None, None)
-    } else {
-        (
-            Some((f64::from(width) * scale).round().max(2.0) as u32),
-            Some((f64::from(height) * scale).round().max(2.0) as u32),
-        )
-    }
-}
-
 async fn capture_grim_frame(
     source: &ScreenSource,
     quality: u8,
@@ -1430,6 +799,10 @@ struct PortalScreenCastSession {
     width: Option<u32>,
     height: Option<u32>,
     /// Origin of the captured source on the desktop, for absolute pointing.
+    /// Where the shared stream sits on the desktop. Read from the portal but
+    /// not applied to pointer coordinates: portal streams already arrive in
+    /// desktop space, which is why `source_origin` reports none for them.
+    #[allow(dead_code, reason = "reported by the portal; kept for diagnostics")]
     position: (i32, i32),
     pipewire_fd: OwnedFd,
     restore_token: Option<String>,
@@ -1722,53 +1095,6 @@ impl PipelineEncoding {
         }
     }
 }
-
-const DEFAULT_BITRATE_WIDTH: u32 = 1920;
-const DEFAULT_BITRATE_HEIGHT: u32 = 1080;
-
-/// Resolves the CBR target. `bitrate_kbps` wins when the client sends it;
-/// otherwise the legacy `jpeg_quality` knob is mapped onto bits per pixel so
-/// older clients still get a sane H.264 stream (1080p30 at quality 70 lands
-/// around 7 Mbit/s instead of the 45-90 Mbit/s the MJPEG path used).
-fn resolve_bitrate_kbps(
-    requested: Option<u32>,
-    width: u32,
-    height: u32,
-    fps: u32,
-    quality: u8,
-) -> u32 {
-    if let Some(kbps) = requested {
-        return kbps.clamp(500, 40_000);
-    }
-    let width = if width == 0 {
-        DEFAULT_BITRATE_WIDTH
-    } else {
-        width
-    };
-    let height = if height == 0 {
-        DEFAULT_BITRATE_HEIGHT
-    } else {
-        height
-    };
-    let quality = f64::from(quality.clamp(35, 92));
-    let bits_per_pixel = 0.05 + (quality - 35.0) / 57.0 * 0.11;
-    let bits = f64::from(width) * f64::from(height) * f64::from(fps.max(1)) * bits_per_pixel;
-    ((bits / 1000.0).round() as u32).clamp(800, 25_000)
-}
-
-/// Keyframe every two seconds: short enough that a reconnecting client recovers
-/// quickly, long enough that IDR spikes do not dominate the bitrate.
-fn keyframe_interval(fps: u32) -> u32 {
-    (fps.max(1) * 2).clamp(15, 120)
-}
-
-fn even_dimension(value: u32) -> u32 {
-    value.max(2) & !1
-}
-
-/// Borrows the portal session rather than consuming it: the PipeWire fd has to
-/// stay open for the whole stream so the encoder can be respawned for a
-/// keyframe request, and dropping the session would also close the portal.
 fn spawn_gstreamer_pipewire(
     session: &PortalScreenCastSession,
     fps: u32,
@@ -1912,224 +1238,6 @@ fn libc_dup2(old_fd: i32, new_fd: i32) -> i32 {
     }
     unsafe { dup2(old_fd, new_fd) }
 }
-
-struct JpegStreamReader {
-    buffer: Vec<u8>,
-}
-
-impl JpegStreamReader {
-    fn new() -> Self {
-        Self { buffer: Vec::new() }
-    }
-
-    fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
-        self.buffer.extend_from_slice(chunk);
-        let mut frames = Vec::new();
-        loop {
-            let Some(start) = find_marker(&self.buffer, [0xff, 0xd8], 0) else {
-                self.buffer.clear();
-                break;
-            };
-            if start > 0 {
-                self.buffer.drain(..start);
-            }
-            let Some(end) = find_marker(&self.buffer, [0xff, 0xd9], 2) else {
-                break;
-            };
-            let frame_end = end + 2;
-            frames.push(self.buffer[..frame_end].to_vec());
-            self.buffer.drain(..frame_end);
-        }
-        frames
-    }
-}
-
-fn find_marker(buffer: &[u8], marker: [u8; 2], from: usize) -> Option<usize> {
-    buffer
-        .windows(2)
-        .enumerate()
-        .skip(from)
-        .find_map(|(index, window)| (window == marker).then_some(index))
-}
-
-/// Largest Annex-B payload kept while looking for the next access unit. A 1080p
-/// IDR stays far below this, so hitting the cap means the producer is emitting
-/// something that is not a byte stream and the reader resynchronises.
-const MAX_ANNEX_B_BUFFER: usize = 8 * 1024 * 1024;
-
-#[derive(Debug)]
-struct AccessUnit {
-    data: Vec<u8>,
-    key_frame: bool,
-    /// SPS/PPS copied out of the access unit, sent ahead of it as a config
-    /// frame. They stay inline in `data` as well so a decoder that ignores
-    /// config frames still finds them before the IDR.
-    parameter_sets: Option<Vec<u8>>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct NalRef {
-    /// Offset of the leading byte of the start code, not of the NAL header.
-    start: usize,
-    kind: u8,
-    /// `first_mb_in_slice == 0`, only meaningful for slice NAL units.
-    first_slice: bool,
-}
-
-impl NalRef {
-    fn is_slice(self) -> bool {
-        matches!(self.kind, 1..=5)
-    }
-
-    fn starts_access_unit(self, has_slice: bool) -> bool {
-        match self.kind {
-            // Access unit delimiter: always opens a picture.
-            9 => true,
-            // Parameter sets and SEI belong to the picture that follows them.
-            6 | 7 | 8 | 13 | 14 | 15 => has_slice,
-            // A slice opens a new picture only when it restarts the macroblock
-            // scan, which keeps multi-slice frames (x264 sliced threads) whole.
-            1..=5 => has_slice && self.first_slice,
-            _ => false,
-        }
-    }
-}
-
-/// Splits the encoder's Annex-B byte stream into whole access units. Reads from
-/// the producer pipe land on arbitrary boundaries, so NAL units are only cut
-/// once the start code of the following one has actually been seen.
-struct AnnexBStreamReader {
-    buffer: Vec<u8>,
-    nals: Vec<NalRef>,
-    scan_from: usize,
-}
-
-impl AnnexBStreamReader {
-    fn new() -> Self {
-        Self {
-            buffer: Vec::new(),
-            nals: Vec::new(),
-            scan_from: 0,
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) -> Vec<AccessUnit> {
-        self.buffer.extend_from_slice(chunk);
-        self.scan();
-        let mut units = Vec::new();
-        while let Some(boundary) = self.next_boundary() {
-            units.push(self.take_access_unit(boundary));
-        }
-        if self.buffer.len() > MAX_ANNEX_B_BUFFER {
-            warn!(
-                bytes = self.buffer.len(),
-                "annex-b buffer overflow; resynchronising on the next start code"
-            );
-            self.buffer.clear();
-            self.nals.clear();
-            self.scan_from = 0;
-        }
-        units
-    }
-
-    fn scan(&mut self) {
-        // A start code plus the two bytes needed to classify the NAL span five
-        // bytes, so scanning resumes far enough back to complete a pattern that
-        // was still truncated on the previous read.
-        let mut index = self.scan_from;
-        while index + 5 <= self.buffer.len() {
-            if self.buffer[index] != 0 || self.buffer[index + 1] != 0 || self.buffer[index + 2] != 1
-            {
-                index += 1;
-                continue;
-            }
-            // Four-byte start codes are three-byte ones with a leading zero;
-            // that zero can never be payload because emulation prevention
-            // forbids `00 00 00` inside a NAL.
-            let start = if index > 0 && self.buffer[index - 1] == 0 {
-                index - 1
-            } else {
-                index
-            };
-            self.nals.push(NalRef {
-                start,
-                kind: self.buffer[index + 3] & 0x1f,
-                first_slice: self.buffer[index + 4] & 0x80 != 0,
-            });
-            index += 3;
-        }
-        self.scan_from = self.buffer.len().saturating_sub(4);
-    }
-
-    fn next_boundary(&self) -> Option<usize> {
-        let mut has_slice = false;
-        for (index, nal) in self.nals.iter().enumerate() {
-            if index > 0 && nal.starts_access_unit(has_slice) {
-                return Some(index);
-            }
-            if nal.is_slice() {
-                has_slice = true;
-            }
-        }
-        None
-    }
-
-    fn has_pending_picture(&self) -> bool {
-        self.nals.iter().any(|nal| nal.is_slice())
-    }
-
-    /// Releases the buffered access unit without waiting for the start code of
-    /// the next one, which would otherwise cost a full frame interval of
-    /// latency. Only safe once the producer pipe has gone idle: the encoder
-    /// writes one access unit per pipe write, so an idle pipe means the picture
-    /// is complete.
-    fn flush_pending(&mut self) -> Option<AccessUnit> {
-        if !self.has_pending_picture() {
-            return None;
-        }
-        let end = self.buffer.len();
-        Some(self.take_access_unit_before(self.nals.len(), end))
-    }
-
-    fn take_access_unit(&mut self, boundary: usize) -> AccessUnit {
-        let end = self.nals[boundary].start;
-        self.take_access_unit_before(boundary, end)
-    }
-
-    fn take_access_unit_before(&mut self, boundary: usize, end: usize) -> AccessUnit {
-        let begin = self.nals[0].start;
-        let key_frame = self.nals[..boundary].iter().any(|nal| nal.kind == 5);
-        let mut parameter_sets = Vec::new();
-        for (index, nal) in self.nals[..boundary].iter().enumerate() {
-            if !matches!(nal.kind, 7 | 8) {
-                continue;
-            }
-            let stop = self.nals.get(index + 1).map_or(end, |next| next.start);
-            parameter_sets.extend_from_slice(&self.buffer[nal.start..stop]);
-        }
-        let data = self.buffer[begin..end].to_vec();
-        self.buffer.drain(..end);
-        self.nals.drain(..boundary);
-        for nal in &mut self.nals {
-            nal.start -= end;
-        }
-        self.scan_from = self.scan_from.saturating_sub(end);
-        AccessUnit {
-            data,
-            key_frame,
-            parameter_sets: (!parameter_sets.is_empty()).then_some(parameter_sets),
-        }
-    }
-}
-
-/// Subscribes to a portal request's `Response` before the request exists.
-///
-/// The portal can emit `Response` before the method call that creates the
-/// request has even returned, and does exactly that once a permission has been
-/// persisted and no dialog needs to be shown. Subscribing afterwards misses the
-/// signal and then waits out the full timeout for something that already
-/// happened. The request path is therefore derived from the token up front,
-/// which is the reason the portal API accepts a `handle_token` at all.
 async fn subscribe_portal_request(
     connection: &zbus::Connection,
     token: &str,
@@ -2278,98 +1386,6 @@ async fn list_x11_monitors() -> anyhow::Result<Vec<ScreenSource>> {
     }
     Ok(monitors)
 }
-
-async fn run_x11_stream(
-    socket: &StreamSocket,
-    session_id: String,
-    source: ScreenSource,
-    tuning: StreamTuning,
-    stop_rx: &mut oneshot::Receiver<()>,
-) -> anyhow::Result<()> {
-    let StreamTuning {
-        fps,
-        quality,
-        max_width,
-        max_height,
-        ..
-    } = tuning;
-    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":1".into());
-    let (target_w, target_h) =
-        target_dimensions(source.width, source.height, max_width, max_height);
-    let cap_w = target_w.unwrap_or(source.width);
-    let cap_h = target_h.unwrap_or(source.height);
-
-    info!(%session_id, source_id = %source.id, fps, quality, cap_w, cap_h, "x11 stream starting with ffmpeg");
-
-    // ffmpeg -f x11grab -framerate 60 -video_size 1920x1080 -i :1.0+1920,0
-    //   -vf "scale=W:H" -c:v mjpeg -q:v Q -f mjpeg pipe:1
-    let input_spec = format!("{}.0+{},{}", display, source.x, source.y);
-    let mut cmd = tokio::process::Command::new("ffmpeg");
-    cmd.args([
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "x11grab",
-        "-framerate",
-        &fps.to_string(),
-        "-video_size",
-        &format!("{cap_w}x{cap_h}"),
-        "-i",
-        &input_spec,
-    ]);
-    // Scale if needed
-    if target_w.is_some() || target_h.is_some() {
-        cmd.args(["-vf", &format!("scale={}:{}", cap_w, cap_h)]);
-    }
-    cmd.args([
-        "-c:v",
-        "mjpeg",
-        "-q:v",
-        &quality.to_string(),
-        "-f",
-        "mjpeg",
-        "pipe:1",
-    ])
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped());
-
-    let mut child = cmd
-        .spawn()
-        .context("failed to spawn ffmpeg for X11 capture")?;
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(log_child_stderr(
-            session_id.clone(),
-            "ffmpeg",
-            stderr,
-            Arc::new(std::sync::Mutex::new(None)),
-        ));
-    }
-    let mut stdout = child.stdout.take().context("ffmpeg stdout unavailable")?;
-    let mut counters = StreamCounters::default();
-    let pumped = pump_jpeg_stream(
-        socket,
-        &mut stdout,
-        stop_rx,
-        &mut counters,
-        &session_id,
-        source.width,
-        source.height,
-        fps,
-        "ffmpeg",
-    )
-    .await;
-    let _ = child.kill().await;
-    pumped?;
-    let frames = counters.frames;
-    if frames == 0 {
-        anyhow::bail!("ffmpeg x11 produced no frames");
-    }
-    info!(%session_id, total_frames = frames, "x11 stream stopped");
-    Ok(())
-}
-
 pub async fn authorize_portal() -> anyhow::Result<String> {
     let connection = zbus::Connection::session().await?;
     let proxy = zbus::Proxy::new(
@@ -2455,388 +1471,5 @@ pub async fn authorize_portal() -> anyhow::Result<String> {
                 "Portal authorization completed but restore_token not available. The portal should now be approved for this session. Try streaming immediately."
             )
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        AnnexBStreamReader, FrameGeometry, H264Encoder, JpegStreamReader, PipelineEncoding,
-        capture_scale, even_dimension, find_marker, gstreamer_pipeline_args, is_client_disconnect,
-        jpeg_frame_header, keyframe_interval, resolve_bitrate_kbps, stream_position, stream_size,
-        target_dimensions,
-    };
-    use std::collections::HashMap;
-    use zbus::zvariant::{OwnedValue, Value};
-
-    fn portal_properties(key: &str, pair: (i32, i32)) -> HashMap<String, OwnedValue> {
-        let mut properties = HashMap::new();
-        let value = Value::from((pair.0, pair.1));
-        properties.insert(key.to_string(), OwnedValue::try_from(value).unwrap());
-        properties
-    }
-
-    #[test]
-    fn reads_the_signed_integer_pair_the_screencast_portal_actually_sends() {
-        // The portal declares size and position as (ii). Asking zvariant for
-        // (u32, u32) fails the signature check and silently yields nothing,
-        // which left the client with a 0x0 source and a black picture.
-        let properties = portal_properties("size", (1920, 1080));
-        assert_eq!(stream_size(&properties), (Some(1920), Some(1080)));
-    }
-
-    #[test]
-    fn treats_a_degenerate_portal_size_as_unknown() {
-        assert_eq!(
-            stream_size(&portal_properties("size", (0, 0))),
-            (None, None)
-        );
-        assert_eq!(stream_size(&HashMap::new()), (None, None));
-    }
-
-    #[test]
-    fn reads_the_source_origin_for_absolute_pointing() {
-        // A stream of the second monitor reports a non-zero origin; without it
-        // every absolute touch would land on the first monitor.
-        assert_eq!(
-            stream_position(&portal_properties("position", (1920, 0))),
-            (1920, 0)
-        );
-        assert_eq!(stream_position(&HashMap::new()), (0, 0));
-    }
-
-    #[test]
-    fn frame_header_carries_the_desktop_size_next_to_the_encoded_size() {
-        // A phone asking for a smaller stream still points at desktop pixels, so
-        // both sizes have to travel: mapping touches against the encoded size
-        // would silently confine the pointer to a corner of the screen.
-        let geometry = FrameGeometry {
-            width: 1600,
-            height: 900,
-            source_width: 1920,
-            source_height: 1080,
-        };
-        let fields = geometry.header_fields();
-        assert_eq!(fields["width"], 1600);
-        assert_eq!(fields["height"], 900);
-        assert_eq!(fields["source_width"], 1920);
-        assert_eq!(fields["source_height"], 1080);
-    }
-
-    #[test]
-    fn jpeg_header_reports_the_desktop_size_as_the_source() {
-        let header = jpeg_frame_header(7, 1920, 1080);
-        let parsed: serde_json::Value = serde_json::from_str(&header).unwrap();
-        assert_eq!(parsed["source_width"], 1920);
-        assert_eq!(parsed["source_height"], 1080);
-        assert_eq!(parsed["codec"], "jpeg");
-    }
-
-    fn pipeline(encoding: PipelineEncoding, width: Option<u32>, height: Option<u32>) -> String {
-        gstreamer_pipeline_args(42, 30, encoding, width, height).join(" ")
-    }
-
-    fn h264(encoder: H264Encoder) -> PipelineEncoding {
-        PipelineEncoding::H264 {
-            encoder,
-            bitrate_kbps: 6000,
-            gop_size: 60,
-        }
-    }
-
-    /// A capsfilter constrains but never converts, so every property it pins
-    /// which `videoconvert` cannot change on its own needs its own converter
-    /// upstream. Without `videorate` the framerate constraint alone travels
-    /// back to `pipewiresrc`, which then fails to negotiate with the portal and
-    /// the stream silently degrades to the grim fallback.
-    #[test]
-    fn pipeline_can_convert_everything_the_capsfilter_pins() {
-        let cases = [
-            pipeline(h264(H264Encoder::Nvenc), None, None),
-            pipeline(h264(H264Encoder::Nvenc), Some(1280), Some(720)),
-            pipeline(h264(H264Encoder::X264), Some(1280), Some(720)),
-            pipeline(PipelineEncoding::Jpeg { quality: 70 }, None, None),
-            pipeline(PipelineEncoding::Jpeg { quality: 70 }, Some(960), Some(540)),
-        ];
-        for pipeline in cases {
-            let caps = pipeline
-                .find("video/x-raw")
-                .expect("raw capsfilter is present");
-            let upstream = &pipeline[..caps];
-            for converter in ["videorate", "videoscale", "videoconvert"] {
-                assert!(
-                    upstream.contains(converter),
-                    "{converter} missing upstream of the capsfilter in: {pipeline}"
-                );
-            }
-            // The frame rate is bounded by videorate instead, so pinning it in
-            // the capsfilter would over-constrain the source for nothing.
-            assert!(
-                !pipeline.contains("framerate="),
-                "capsfilter must not pin a framerate: {pipeline}"
-            );
-            assert!(pipeline.contains("max-rate=30"), "{pipeline}");
-            assert!(pipeline.contains("pixel-aspect-ratio=1/1"), "{pipeline}");
-        }
-    }
-
-    #[test]
-    fn h264_pipeline_never_drops_encoded_frames() {
-        let nvenc = pipeline(h264(H264Encoder::Nvenc), None, None);
-        let encoder = nvenc.find("nvh264enc").expect("encoder is present");
-        // Backpressure may only drop raw frames, never encoded ones: a dropped
-        // encoded frame breaks every frame that references it.
-        assert!(nvenc[..encoder].contains("leaky=downstream"), "{nvenc}");
-        assert!(!nvenc[encoder..].contains("leaky="), "{nvenc}");
-        // Annex-B with SPS/PPS ahead of every IDR is what the phone decodes.
-        assert!(nvenc.contains("repeat-sequence-header=true"), "{nvenc}");
-        assert!(nvenc.contains("h264parse config-interval=-1"), "{nvenc}");
-        assert!(
-            nvenc.contains("video/x-h264,stream-format=byte-stream,alignment=au"),
-            "{nvenc}"
-        );
-        assert!(nvenc.contains("bframes=0"), "{nvenc}");
-        assert!(nvenc.contains("format=NV12"), "{nvenc}");
-        assert!(pipeline(h264(H264Encoder::X264), None, None).contains("format=I420"));
-    }
-
-    /// Annex-B NAL unit with a four-byte start code. `header` is the raw NAL
-    /// header byte, `first` the byte after it (its top bit carries
-    /// `first_mb_in_slice == 0` for slices).
-    fn nal(header: u8, first: u8, payload: &[u8]) -> Vec<u8> {
-        let mut unit = vec![0, 0, 0, 1, header, first];
-        unit.extend_from_slice(payload);
-        unit
-    }
-
-    fn short_nal(header: u8, first: u8, payload: &[u8]) -> Vec<u8> {
-        let mut unit = vec![0, 0, 1, header, first];
-        unit.extend_from_slice(payload);
-        unit
-    }
-
-    fn aud() -> Vec<u8> {
-        nal(0x09, 0x10, &[])
-    }
-
-    fn sps() -> Vec<u8> {
-        nal(0x67, 0x64, &[0x00, 0x28])
-    }
-
-    fn pps() -> Vec<u8> {
-        nal(0x68, 0xeb, &[0xe3, 0xcb])
-    }
-
-    fn idr() -> Vec<u8> {
-        nal(0x65, 0x88, &[1, 2, 3, 4])
-    }
-
-    fn slice() -> Vec<u8> {
-        nal(0x41, 0x9a, &[5, 6, 7, 8])
-    }
-
-    #[test]
-    fn splits_annex_b_access_units() {
-        let mut reader = AnnexBStreamReader::new();
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&aud());
-        stream.extend_from_slice(&sps());
-        stream.extend_from_slice(&pps());
-        stream.extend_from_slice(&idr());
-        let keyframe_len = stream.len();
-        stream.extend_from_slice(&aud());
-        stream.extend_from_slice(&slice());
-
-        let units = reader.push(&stream);
-        // The trailing access unit stays buffered until the next one starts.
-        assert_eq!(units.len(), 1);
-        assert!(units[0].key_frame);
-        assert_eq!(units[0].data.len(), keyframe_len);
-        let mut parameter_sets = sps();
-        parameter_sets.extend_from_slice(&pps());
-        assert_eq!(
-            units[0].parameter_sets.as_deref(),
-            Some(&parameter_sets[..])
-        );
-
-        let mut tail = aud();
-        tail.extend_from_slice(&slice());
-        let units = reader.push(&tail);
-        assert_eq!(units.len(), 1);
-        assert!(!units[0].key_frame);
-        assert!(units[0].parameter_sets.is_none());
-    }
-
-    #[test]
-    fn flushes_the_buffered_picture_when_the_producer_goes_idle() {
-        let mut reader = AnnexBStreamReader::new();
-        let mut stream = aud();
-        stream.extend_from_slice(&sps());
-        stream.extend_from_slice(&pps());
-        stream.extend_from_slice(&idr());
-
-        assert!(reader.push(&stream).is_empty());
-        assert!(reader.has_pending_picture());
-        let unit = reader.flush_pending().expect("buffered keyframe");
-        assert!(unit.key_frame);
-        assert_eq!(unit.data, stream);
-        assert!(unit.parameter_sets.is_some());
-
-        // Nothing is left to flush, and a parameter-set-only tail is never
-        // mistaken for a picture.
-        assert!(!reader.has_pending_picture());
-        assert!(reader.flush_pending().is_none());
-        assert!(reader.push(&sps()).is_empty());
-        assert!(!reader.has_pending_picture());
-        assert!(reader.flush_pending().is_none());
-    }
-
-    #[test]
-    fn splits_annex_b_units_across_buffer_reads() {
-        let mut stream = Vec::new();
-        stream.extend_from_slice(&aud());
-        stream.extend_from_slice(&sps());
-        stream.extend_from_slice(&pps());
-        stream.extend_from_slice(&idr());
-        let keyframe = stream.clone();
-        stream.extend_from_slice(&aud());
-        stream.extend_from_slice(&slice());
-        let second = stream[keyframe.len()..].to_vec();
-        stream.extend_from_slice(&aud());
-        stream.extend_from_slice(&slice());
-
-        // Every possible split point must yield the same two access units,
-        // including cuts that land in the middle of a start code.
-        for split in 1..stream.len() {
-            let mut reader = AnnexBStreamReader::new();
-            let mut units = reader.push(&stream[..split]);
-            units.extend(reader.push(&stream[split..]));
-            assert_eq!(units.len(), 2, "split at {split}");
-            assert_eq!(units[0].data, keyframe, "split at {split}");
-            assert!(units[0].key_frame, "split at {split}");
-            assert_eq!(units[1].data, second, "split at {split}");
-            assert!(!units[1].key_frame, "split at {split}");
-        }
-    }
-
-    #[test]
-    fn accepts_three_and_four_byte_start_codes() {
-        let mut reader = AnnexBStreamReader::new();
-        let mut stream = short_nal(0x67, 0x64, &[0x00, 0x28]);
-        stream.extend_from_slice(&short_nal(0x68, 0xeb, &[0xe3, 0xcb]));
-        stream.extend_from_slice(&short_nal(0x65, 0x88, &[1, 2, 3, 4]));
-        let keyframe_len = stream.len();
-        stream.extend_from_slice(&sps());
-        stream.extend_from_slice(&idr());
-
-        let units = reader.push(&stream);
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].data.len(), keyframe_len);
-        assert!(units[0].key_frame);
-        let mut parameter_sets = short_nal(0x67, 0x64, &[0x00, 0x28]);
-        parameter_sets.extend_from_slice(&short_nal(0x68, 0xeb, &[0xe3, 0xcb]));
-        assert_eq!(
-            units[0].parameter_sets.as_deref(),
-            Some(&parameter_sets[..])
-        );
-    }
-
-    #[test]
-    fn keeps_multi_slice_pictures_in_one_access_unit() {
-        let mut reader = AnnexBStreamReader::new();
-        let mut stream = nal(0x41, 0x9a, &[1, 2]);
-        // Second slice of the same picture: first_mb_in_slice != 0.
-        stream.extend_from_slice(&nal(0x41, 0x0a, &[3, 4]));
-        stream.extend_from_slice(&nal(0x41, 0x0a, &[5, 6]));
-        let picture_len = stream.len();
-        stream.extend_from_slice(&nal(0x41, 0x9a, &[7, 8]));
-        stream.extend_from_slice(&nal(0x41, 0x0a, &[9, 10]));
-
-        let units = reader.push(&stream);
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].data.len(), picture_len);
-    }
-
-    #[test]
-    fn ignores_leading_bytes_before_the_first_start_code() {
-        let mut reader = AnnexBStreamReader::new();
-        let mut stream = vec![0xde, 0xad, 0xbe, 0xef];
-        stream.extend_from_slice(&aud());
-        stream.extend_from_slice(&idr());
-        let keyframe = stream[4..].to_vec();
-        stream.extend_from_slice(&aud());
-        stream.extend_from_slice(&slice());
-
-        let units = reader.push(&stream);
-        assert_eq!(units.len(), 1);
-        assert_eq!(units[0].data, keyframe);
-    }
-
-    #[test]
-    fn maps_legacy_quality_and_explicit_bitrate() {
-        assert_eq!(resolve_bitrate_kbps(Some(4500), 1920, 1080, 30, 70), 4500);
-        assert_eq!(
-            resolve_bitrate_kbps(Some(90_000), 1920, 1080, 30, 70),
-            40_000
-        );
-        // Unknown portal geometry falls back to 1080p so the estimate stays sane.
-        assert_eq!(
-            resolve_bitrate_kbps(None, 0, 0, 30, 70),
-            resolve_bitrate_kbps(None, 1920, 1080, 30, 70)
-        );
-        let quality_70 = resolve_bitrate_kbps(None, 1920, 1080, 30, 70);
-        assert!((5_000..=9_000).contains(&quality_70), "{quality_70}");
-        assert!(resolve_bitrate_kbps(None, 1920, 1080, 30, 92) > quality_70);
-        assert!(resolve_bitrate_kbps(None, 1920, 1080, 30, 35) < quality_70);
-    }
-
-    #[test]
-    fn clamps_keyframe_interval_and_dimensions() {
-        assert_eq!(keyframe_interval(30), 60);
-        assert_eq!(keyframe_interval(1), 15);
-        assert_eq!(keyframe_interval(60), 120);
-        assert_eq!(even_dimension(1081), 1080);
-        assert_eq!(even_dimension(1080), 1080);
-        assert_eq!(even_dimension(1), 2);
-    }
-
-    #[test]
-    fn parses_concatenated_jpeg_frames() {
-        let mut reader = JpegStreamReader::new();
-        let frames = reader.push(&[0xff, 0xd8, 1, 2, 0xff, 0xd9, 0xff, 0xd8]);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0], vec![0xff, 0xd8, 1, 2, 0xff, 0xd9]);
-        let frames = reader.push(&[3, 4, 0xff, 0xd9]);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0], vec![0xff, 0xd8, 3, 4, 0xff, 0xd9]);
-    }
-
-    #[test]
-    fn finds_markers_after_offset() {
-        assert_eq!(find_marker(&[0, 0xff, 0xd8], [0xff, 0xd8], 0), Some(1));
-        assert_eq!(find_marker(&[0xff, 0xd8], [0xff, 0xd8], 1), None);
-    }
-
-    #[test]
-    fn classifies_client_disconnect_io_errors() {
-        let broken_pipe = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-        assert!(is_client_disconnect(&broken_pipe));
-
-        let permission =
-            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-        assert!(!is_client_disconnect(&permission));
-    }
-
-    #[test]
-    fn computes_stream_downscale_dimensions() {
-        assert_eq!(capture_scale(3840, 2160, Some(1920), Some(1080)), 0.5);
-        assert_eq!(
-            target_dimensions(3840, 2160, Some(1280), Some(1280)),
-            (Some(1280), Some(720)),
-        );
-        assert_eq!(
-            target_dimensions(1280, 720, Some(2400), Some(2400)),
-            (None, None)
-        );
     }
 }
